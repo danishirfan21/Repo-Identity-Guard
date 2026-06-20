@@ -1,0 +1,87 @@
+{
+  "name": "repo-identity-guard",
+  "displayName": "Repo Identity Guard",
+  "description": "Warn when a repository's local Git identity does not match its remote.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:repoIdentityGuard.scan",
+    "onCommand:repoIdentityGuard.showStatus",
+    "onCommand:repoIdentityGuard.fixIdentity"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test out/test"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "repoIdentityGuard.scan",
+        "title": "Repo Identity Guard: Rescan"
+      },
+      {
+        "command": "repoIdentityGuard.showStatus",
+        "title": "Repo Identity Guard: Show Status"
+      },
+      {
+        "command": "repoIdentityGuard.fixIdentity",
+        "title": "Repo Identity Guard: Fix Local Git Identity"
+      },
+      {
+        "command": "repoIdentityGuard.openSettings",
+        "title": "Repo Identity Guard: Open Settings"
+      }
+    ],
+    "configuration": {
+      "title": "Repo Identity Guard",
+      "properties": {
+        "repoIdentityGuard.rules": {
+          "type": "array",
+          "default": [],
+          "description": "Identity rules matched against normalized Git origin remote URLs. The first matching rule wins.",
+          "items": {
+            "type": "object",
+            "required": [
+              "match",
+              "label",
+              "name",
+              "email"
+            ],
+            "properties": {
+              "match": {
+                "type": "string",
+                "description": "Remote pattern, for example github.com/MyCompany/*."
+              },
+              "label": {
+                "type": "string",
+                "description": "Short status bar label, for example Work."
+              },
+              "name": {
+                "type": "string",
+                "description": "Expected local Git user.name."
+              },
+              "email": {
+                "type": "string",
+                "description": "Expected local Git user.email."
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.5.3"
+  }
+}
