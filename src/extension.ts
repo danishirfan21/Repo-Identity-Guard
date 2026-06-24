@@ -16,14 +16,16 @@ let latestEvaluation: IdentityEvaluation = {
   message: "No repository has been scanned.",
 };
 let scanSequence = 0;
+let gitConfigWatcher: vscode.FileSystemWatcher | undefined;
+let watchedGitConfigRepoRoot: string | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   const statusBar = new IdentityStatusBar();
   context.subscriptions.push(statusBar);
 
-  const scan = async (): Promise<void> => {
+  const scan = async (cwdOverride?: string): Promise<void> => {
     const sequence = ++scanSequence;
-    const cwd = getActiveCwd();
+    const cwd = cwdOverride ?? getActiveCwd();
 
     try {
       const evaluation = await scanIdentity(cwd);
@@ -32,6 +34,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       latestEvaluation = evaluation;
       statusBar.update(evaluation);
+      updateGitConfigWatcher(evaluation.current?.repoRoot, scan);
     } catch (error) {
       if (sequence !== scanSequence) {
         return;
@@ -42,6 +45,7 @@ export function activate(context: vscode.ExtensionContext): void {
         message: `Repo Identity Guard could not scan this repository: ${message}`,
       };
       statusBar.update(latestEvaluation);
+      updateGitConfigWatcher(undefined, scan);
     }
   };
 
@@ -72,13 +76,18 @@ export function activate(context: vscode.ExtensionContext): void {
         void scan();
       }
     }),
+    {
+      dispose: () => {
+        gitConfigWatcher?.dispose();
+      },
+    },
   );
 
   void scan();
 }
 
 export function deactivate(): void {
-  // VS Code disposes registered resources through the extension context.
+  gitConfigWatcher?.dispose();
 }
 
 async function scanIdentity(cwd: string | undefined): Promise<IdentityEvaluation> {
@@ -108,6 +117,31 @@ function getActiveCwd(): string | undefined {
   }
 
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+}
+
+function updateGitConfigWatcher(
+  repoRoot: string | undefined,
+  scan: (cwdOverride?: string) => Promise<void>,
+): void {
+  if (repoRoot === watchedGitConfigRepoRoot) {
+    return;
+  }
+
+  gitConfigWatcher?.dispose();
+  gitConfigWatcher = undefined;
+  watchedGitConfigRepoRoot = repoRoot;
+
+  if (!repoRoot) {
+    return;
+  }
+
+  gitConfigWatcher = vscode.workspace.createFileSystemWatcher(
+    new vscode.RelativePattern(vscode.Uri.file(repoRoot), ".git/config"),
+  );
+
+  gitConfigWatcher.onDidChange(() => void scan(repoRoot));
+  gitConfigWatcher.onDidCreate(() => void scan(repoRoot));
+  gitConfigWatcher.onDidDelete(() => void scan(repoRoot));
 }
 
 async function showStatus(evaluation: IdentityEvaluation): Promise<void> {
@@ -142,7 +176,7 @@ async function showStatus(evaluation: IdentityEvaluation): Promise<void> {
 
 async function fixIdentity(
   evaluation: IdentityEvaluation,
-  scan: () => Promise<void>,
+  scan: (cwdOverride?: string) => Promise<void>,
 ): Promise<void> {
   const { current, rule } = evaluation;
   if (!current || !rule) {
@@ -166,7 +200,7 @@ async function fixIdentity(
     await vscode.window.showInformationMessage(
       `Local Git identity set to ${rule.name} <${rule.email}>.`,
     );
-    await scan();
+    await scan(current.repoRoot);
   } catch (error) {
     await vscode.window.showErrorMessage(
       `Could not set local Git identity: ${getErrorMessage(error)}`,

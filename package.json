@@ -11,10 +11,7 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:repoIdentityGuard.scan",
-    "onCommand:repoIdentityGuard.showStatus",
-    "onCommand:repoIdentityGuard.fixIdentity"
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "scripts": {
