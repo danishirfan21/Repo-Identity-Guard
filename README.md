@@ -44,8 +44,10 @@ The first matching rule wins.
 
 Open a Git repository and look at the left side of the status bar:
 
-- `Repo ID: Work` means the local name and email match.
-- `Repo ID: Wrong` means one or both local values differ.
+- `Repo ID: Work` means the effective name and email match.
+- `Repo ID: Local Needed` means the effective identity matches, but strict
+  local identity mode wants this repo's local Git config pinned too.
+- `Repo ID: Wrong` means the effective identity differs from the matched rule.
 - `Repo ID: Unknown` means the repo has no origin or no rule matched.
 
 Click the status item to see the remote, current identity, expected identity,
@@ -56,6 +58,8 @@ Useful actions:
 - **Fix local Git identity** writes the expected rule identity into this repo.
 - **Add Rule for Current Repo** creates a settings rule from the current remote
   and effective identity.
+- **Copy Diagnostic Report** copies a plain text report with repo, remote,
+  identity, matched rule, and strict-local setting details.
 - **Rescan** refreshes the status.
 
 The fix action writes only:
@@ -66,6 +70,31 @@ git config --local user.email ...
 ```
 
 It never modifies global Git configuration.
+
+## Strict local identity mode
+
+By default, Repo ID checks the effective Git identity because that is what Git
+will use for commits:
+
+```json
+{
+  "repoIdentityGuard.requireLocalIdentity": false
+}
+```
+
+If you want every matched repo to have its own local `user.name` and
+`user.email`, enable:
+
+```json
+{
+  "repoIdentityGuard.requireLocalIdentity": true
+}
+```
+
+When enabled, a repo can show `Repo ID: Local Needed` even when the effective
+identity is currently correct. This means the repo is safe right now only
+because Git is falling back to another config layer. Choose **Set Local
+Identity** to write the expected name/email into this repo's local Git config.
 
 ## Add a rule from the current repo
 
@@ -80,6 +109,15 @@ The command prompts for:
 4. expected Git email.
 
 It appends the new rule to your user setting `repoIdentityGuard.rules`.
+
+## First run
+
+If no rules are configured yet and you open a Git repo, clicking the status bar
+focuses the starter actions:
+
+- **Add Rule**
+- **Settings**
+- **Rescan**
 
 ## Run locally
 

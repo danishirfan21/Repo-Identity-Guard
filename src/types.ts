@@ -18,14 +18,21 @@ export interface CurrentIdentity {
 
 export type IdentityState =
   | "safe"
+  | "localNeeded"
   | "wrong"
   | "unknown"
   | "notGitRepo"
   | "error";
 
+export interface IdentityEvaluationOptions {
+  requireLocalIdentity: boolean;
+}
+
 export interface IdentityEvaluation {
   state: IdentityState;
   rule?: IdentityRule;
   current?: CurrentIdentity;
+  normalizedRemote?: string;
+  requireLocalIdentity: boolean;
   message: string;
 }

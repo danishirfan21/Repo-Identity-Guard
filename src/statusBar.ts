@@ -20,6 +20,12 @@ export class IdentityStatusBar implements vscode.Disposable {
       case "safe":
         this.item.text = `$(shield) Repo ID: ${evaluation.rule?.label ?? "Safe"}`;
         break;
+      case "localNeeded":
+        this.item.text = "$(warning) Repo ID: Local Needed";
+        this.item.backgroundColor = new vscode.ThemeColor(
+          "statusBarItem.warningBackground",
+        );
+        break;
       case "wrong":
         this.item.text = "$(warning) Repo ID: Wrong";
         this.item.backgroundColor = new vscode.ThemeColor(
@@ -66,6 +72,10 @@ function buildTooltip(evaluation: IdentityEvaluation): vscode.MarkdownString {
   if (rule) {
     lines.push(`Expected: \`${rule.name} <${rule.email}>\``);
   }
+
+  lines.push(
+    `Require local identity: \`${evaluation.requireLocalIdentity ? "Enabled" : "Disabled"}\``,
+  );
 
   return new vscode.MarkdownString(lines.join("\n"));
 }

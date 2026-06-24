@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
@@ -11,31 +12,42 @@ import {
   getRepoRoot,
   setLocalGitIdentity,
 } from "./git";
-import { buildExactRuleMatch, evaluateIdentity, loadRules } from "./rules";
+import {
+  buildExactRuleMatch,
+  evaluateIdentity,
+  loadRequireLocalIdentity,
+  loadRules,
+  normalizeRemoteUrl,
+} from "./rules";
 import { IdentityStatusBar } from "./statusBar";
 import { CurrentIdentity, IdentityEvaluation } from "./types";
 
 const ACTION_VIEW_DETAILS = "View Details";
 const ACTION_FIX_IDENTITY = "Fix Local Git Identity";
 const ACTION_ADD_RULE = "Add Rule for Current Repo";
+const ACTION_COPY_REPORT = "Copy Diagnostic Report";
 const ACTION_RESCAN = "Rescan";
 const ACTION_OPEN_SETTINGS = "Open Settings";
 
 const NOTIFICATION_ACTIONS = {
   details: "Details",
   fix: "Fix",
+  setLocal: "Set Local",
   addRule: "Add Rule",
+  copyReport: "Copy Report",
   rescan: "Rescan",
   settings: "Settings",
 } as const;
 
 let latestEvaluation: IdentityEvaluation = {
   state: "notGitRepo",
+  requireLocalIdentity: false,
   message: "No repository has been scanned.",
 };
 let scanSequence = 0;
 let gitConfigWatcher: vscode.FileSystemWatcher | undefined;
 let watchedGitConfigRepoRoot: string | undefined;
+let globalGitConfigWatchers: vscode.FileSystemWatcher[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
   const statusBar = new IdentityStatusBar();
@@ -60,6 +72,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const message = getErrorMessage(error);
       latestEvaluation = {
         state: "error",
+        requireLocalIdentity: loadRequireLocalIdentity(),
         message: `Repo Identity Guard could not scan this repository: ${message}`,
       };
       statusBar.update(latestEvaluation);
@@ -86,6 +99,12 @@ export function activate(context: vscode.ExtensionContext): void {
       },
     ),
     vscode.commands.registerCommand(
+      "repoIdentityGuard.copyDiagnosticReport",
+      async () => {
+        await copyDiagnosticReport(latestEvaluation);
+      },
+    ),
+    vscode.commands.registerCommand(
       "repoIdentityGuard.openSettings",
       () =>
         vscode.commands.executeCommand(
@@ -96,32 +115,41 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.onDidChangeActiveTextEditor(() => void scan()),
     vscode.workspace.onDidChangeWorkspaceFolders(() => void scan()),
     vscode.workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("repoIdentityGuard.rules")) {
+      if (
+        event.affectsConfiguration("repoIdentityGuard.rules") ||
+        event.affectsConfiguration("repoIdentityGuard.requireLocalIdentity")
+      ) {
         void scan();
       }
     }),
     {
       dispose: () => {
         gitConfigWatcher?.dispose();
+        disposeGlobalGitConfigWatchers();
       },
     },
   );
 
+  updateGlobalGitConfigWatchers(scan);
   void scan();
 }
 
 export function deactivate(): void {
   gitConfigWatcher?.dispose();
+  disposeGlobalGitConfigWatchers();
 }
 
 async function scanIdentity(cwd: string | undefined): Promise<IdentityEvaluation> {
+  const rules = loadRules();
+  const requireLocalIdentity = loadRequireLocalIdentity();
+
   if (!cwd) {
-    return evaluateIdentity(null, loadRules());
+    return evaluateIdentity(null, rules, { requireLocalIdentity });
   }
 
   const repoRoot = await getRepoRoot(cwd);
   if (!repoRoot) {
-    return evaluateIdentity(null, loadRules());
+    return evaluateIdentity(null, rules, { requireLocalIdentity });
   }
 
   const [
@@ -152,7 +180,7 @@ async function scanIdentity(cwd: string | undefined): Promise<IdentityEvaluation
     globalEmail,
   };
 
-  return evaluateIdentity(current, loadRules());
+  return evaluateIdentity(current, rules, { requireLocalIdentity });
 }
 
 function getActiveCwd(): string | undefined {
@@ -189,13 +217,42 @@ function updateGitConfigWatcher(
   gitConfigWatcher.onDidDelete(() => void scan(repoRoot));
 }
 
+function updateGlobalGitConfigWatchers(
+  scan: (cwdOverride?: string) => Promise<void>,
+): void {
+  disposeGlobalGitConfigWatchers();
+
+  const home = os.homedir();
+  const configPaths = [
+    path.join(home, ".gitconfig"),
+    path.join(home, ".config", "git", "config"),
+  ];
+
+  globalGitConfigWatchers = configPaths.map((configPath) => {
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(path.dirname(configPath), path.basename(configPath)),
+    );
+    watcher.onDidChange(() => void scan());
+    watcher.onDidCreate(() => void scan());
+    watcher.onDidDelete(() => void scan());
+    return watcher;
+  });
+}
+
+function disposeGlobalGitConfigWatchers(): void {
+  for (const watcher of globalGitConfigWatchers) {
+    watcher.dispose();
+  }
+  globalGitConfigWatchers = [];
+}
+
 async function showStatus(evaluation: IdentityEvaluation): Promise<void> {
   const actions = getNotificationActions(evaluation);
 
   const choice =
-    evaluation.state === "wrong"
+    evaluation.state === "wrong" || evaluation.state === "localNeeded"
       ? await vscode.window.showWarningMessage(
-          "Wrong Git identity for this repo. You may commit with the wrong author.",
+          getShortStatusMessage(evaluation),
           ...actions,
         )
       : await vscode.window.showInformationMessage(
@@ -207,11 +264,22 @@ async function showStatus(evaluation: IdentityEvaluation): Promise<void> {
 }
 
 function getNotificationActions(evaluation: IdentityEvaluation): string[] {
-  if (evaluation.state === "wrong") {
+  if (isFirstRunNoRules(evaluation)) {
+    return [
+      NOTIFICATION_ACTIONS.addRule,
+      NOTIFICATION_ACTIONS.settings,
+      NOTIFICATION_ACTIONS.rescan,
+    ];
+  }
+
+  if (evaluation.state === "wrong" || evaluation.state === "localNeeded") {
     return [
       NOTIFICATION_ACTIONS.details,
-      NOTIFICATION_ACTIONS.fix,
+      evaluation.state === "localNeeded"
+        ? NOTIFICATION_ACTIONS.setLocal
+        : NOTIFICATION_ACTIONS.fix,
       NOTIFICATION_ACTIONS.addRule,
+      NOTIFICATION_ACTIONS.copyReport,
       NOTIFICATION_ACTIONS.rescan,
       NOTIFICATION_ACTIONS.settings,
     ];
@@ -220,12 +288,17 @@ function getNotificationActions(evaluation: IdentityEvaluation): string[] {
   return [
     NOTIFICATION_ACTIONS.details,
     NOTIFICATION_ACTIONS.addRule,
+    NOTIFICATION_ACTIONS.copyReport,
     NOTIFICATION_ACTIONS.rescan,
     NOTIFICATION_ACTIONS.settings,
   ];
 }
 
 function getShortStatusMessage(evaluation: IdentityEvaluation): string {
+  if (isFirstRunNoRules(evaluation)) {
+    return "No identity rules are configured yet. Add a rule for this repo to start using Repo ID.";
+  }
+
   if (evaluation.state === "safe" && evaluation.rule) {
     return `Repo identity is safe for ${evaluation.rule.label}.`;
   }
@@ -241,8 +314,12 @@ async function handleNotificationAction(
     await handleStatusAction(ACTION_VIEW_DETAILS, evaluation);
   } else if (choice === NOTIFICATION_ACTIONS.fix) {
     await handleStatusAction(ACTION_FIX_IDENTITY, evaluation);
+  } else if (choice === NOTIFICATION_ACTIONS.setLocal) {
+    await handleStatusAction(ACTION_FIX_IDENTITY, evaluation);
   } else if (choice === NOTIFICATION_ACTIONS.addRule) {
     await handleStatusAction(ACTION_ADD_RULE, evaluation);
+  } else if (choice === NOTIFICATION_ACTIONS.copyReport) {
+    await handleStatusAction(ACTION_COPY_REPORT, evaluation);
   } else if (choice === NOTIFICATION_ACTIONS.rescan) {
     await handleStatusAction(ACTION_RESCAN, evaluation);
   } else if (choice === NOTIFICATION_ACTIONS.settings) {
@@ -260,6 +337,8 @@ async function handleStatusAction(
     await vscode.commands.executeCommand("repoIdentityGuard.fixIdentity");
   } else if (choice === ACTION_ADD_RULE) {
     await vscode.commands.executeCommand("repoIdentityGuard.addRuleForCurrentRepo");
+  } else if (choice === ACTION_COPY_REPORT) {
+    await vscode.commands.executeCommand("repoIdentityGuard.copyDiagnosticReport");
   } else if (choice === ACTION_RESCAN) {
     await vscode.commands.executeCommand("repoIdentityGuard.scan");
   } else if (choice === ACTION_OPEN_SETTINGS) {
@@ -333,13 +412,21 @@ function buildDetailsItems(
     description: rule ? `${rule.label} — ${rule.match}` : "No rule matched",
   });
 
+  items.push({
+    label: "$(settings) Require local identity",
+    description: evaluation.requireLocalIdentity ? "Enabled" : "Disabled",
+  });
+
   items.push(
     {
       label: "",
       kind: vscode.QuickPickItemKind.Separator,
     },
     {
-      label: "$(tools) Fix Local Git Identity",
+      label:
+        evaluation.state === "localNeeded"
+          ? "$(tools) Set Local Identity"
+          : "$(tools) Fix Local Git Identity",
       detail: "Write the expected name/email to this repo's local Git config.",
       action: ACTION_FIX_IDENTITY,
     },
@@ -347,6 +434,11 @@ function buildDetailsItems(
       label: "$(add) Add Rule for Current Repo",
       detail: "Create a settings rule from this repo's remote and identity.",
       action: ACTION_ADD_RULE,
+    },
+    {
+      label: "$(copy) Copy Diagnostic Report",
+      detail: "Copy a plain text identity report to the clipboard.",
+      action: ACTION_COPY_REPORT,
     },
     {
       label: "$(sync) Rescan",
@@ -361,6 +453,43 @@ function buildDetailsItems(
   );
 
   return items;
+}
+
+async function copyDiagnosticReport(
+  evaluation: IdentityEvaluation,
+): Promise<void> {
+  await vscode.env.clipboard.writeText(buildDiagnosticReport(evaluation));
+  await vscode.window.showInformationMessage(
+    "Repo ID diagnostic report copied to clipboard.",
+  );
+}
+
+function buildDiagnosticReport(evaluation: IdentityEvaluation): string {
+  const { current, rule } = evaluation;
+  const rawRemote = current?.remoteUrl ?? "Not set";
+  const normalizedRemote = current?.remoteUrl
+    ? normalizeRemoteUrl(current.remoteUrl)
+    : "Not set";
+
+  return [
+    "Repo ID Diagnostic Report",
+    "",
+    `Repo root: ${current?.repoRoot ?? "Not in a Git repo"}`,
+    `Normalized remote: ${evaluation.normalizedRemote ?? normalizedRemote}`,
+    `Raw remote: ${rawRemote}`,
+    `Status: ${evaluation.state}`,
+    `Matched rule label: ${rule?.label ?? "None"}`,
+    `Matched rule pattern: ${rule?.match ?? "None"}`,
+    `Effective name: ${current?.effectiveName ?? "Not set"}`,
+    `Effective email: ${current?.effectiveEmail ?? "Not set"}`,
+    `Local name: ${current?.localName ?? "Not set"}`,
+    `Local email: ${current?.localEmail ?? "Not set"}`,
+    `Global name: ${current?.globalName ?? "Not set"}`,
+    `Global email: ${current?.globalEmail ?? "Not set"}`,
+    `Expected name: ${rule?.name ?? "None"}`,
+    `Expected email: ${rule?.email ?? "None"}`,
+    `Require local identity: ${evaluation.requireLocalIdentity}`,
+  ].join("\n");
 }
 
 async function addRuleForCurrentRepo(
@@ -464,6 +593,14 @@ async function fixIdentity(
 
 function formatIdentity(name: string | null, email: string | null): string {
   return `${name ?? "Not set"} <${email ?? "not set"}>`;
+}
+
+function isFirstRunNoRules(evaluation: IdentityEvaluation): boolean {
+  return (
+    evaluation.state === "unknown" &&
+    !!evaluation.current?.remoteUrl &&
+    loadRules().length === 0
+  );
 }
 
 function getErrorMessage(error: unknown): string {

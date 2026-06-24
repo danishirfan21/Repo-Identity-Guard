@@ -92,6 +92,47 @@ test("evaluates effective identity instead of local identity", () => {
   assert.equal(evaluateIdentity(current, [workRule]).state, "safe");
 });
 
+test("evaluates strict local mode as localNeeded when effective identity is safe but local identity is missing", () => {
+  const current = currentIdentity({
+    effectiveName: "Danish Irfan",
+    effectiveEmail: "work@example.com",
+    localName: null,
+    localEmail: null,
+    globalName: "Danish Irfan",
+    globalEmail: "work@example.com",
+  });
+
+  const evaluation = evaluateIdentity(current, [workRule], {
+    requireLocalIdentity: true,
+  });
+
+  assert.equal(evaluation.state, "localNeeded");
+  assert.equal(evaluation.requireLocalIdentity, true);
+});
+
+test("evaluates strict local mode as localNeeded when local identity differs", () => {
+  const current = currentIdentity({
+    effectiveName: "Danish Irfan",
+    effectiveEmail: "work@example.com",
+    localName: "Wrong User",
+    localEmail: "wrong@example.com",
+  });
+
+  assert.equal(
+    evaluateIdentity(current, [workRule], { requireLocalIdentity: true }).state,
+    "localNeeded",
+  );
+});
+
+test("evaluates strict local mode as safe when effective and local identities match", () => {
+  assert.equal(
+    evaluateIdentity(currentIdentity(), [workRule], {
+      requireLocalIdentity: true,
+    }).state,
+    "safe",
+  );
+});
+
 test("evaluates missing or mismatched effective values as wrong", () => {
   const current = currentIdentity({ effectiveEmail: null });
 

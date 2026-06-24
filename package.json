@@ -1,7 +1,7 @@
 {
   "name": "repo-identity-guard",
   "displayName": "Repo ID",
-  "description": "Warn when a repository's local Git identity does not match its remote.",
+  "description": "Warn when a repository's Git identity does not match its remote.",
   "version": "0.0.1",
   "publisher": "local",
   "engines": {
@@ -36,6 +36,10 @@
       {
         "command": "repoIdentityGuard.addRuleForCurrentRepo",
         "title": "Repo Identity Guard: Add Rule for Current Repo"
+      },
+      {
+        "command": "repoIdentityGuard.copyDiagnosticReport",
+        "title": "Repo Identity Guard: Copy Diagnostic Report"
       },
       {
         "command": "repoIdentityGuard.openSettings",
@@ -76,6 +80,11 @@
               }
             }
           }
+        },
+        "repoIdentityGuard.requireLocalIdentity": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, a matched repo is only fully safe if the expected identity is set in local repo Git config, even when the effective identity currently matches."
         }
       }
     }

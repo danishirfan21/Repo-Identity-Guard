@@ -26,6 +26,15 @@ Also check:
   to open the readable Quick Pick details view.
 - If local identity is unset but global identity matches the rule, the repo is
   treated as safe because Git's effective identity matches.
+- Enable `repoIdentityGuard.requireLocalIdentity`, then unset local identity
+  while global identity still matches. Confirm the status shows
+  `Repo ID: Local Needed`, and **Set Local Identity** writes local config.
+- **Repo Identity Guard: Copy Diagnostic Report** copies repo root, raw and
+  normalized remote, status, matched rule, identity layers, expected identity,
+  and the strict-local setting.
+- Remove all `repoIdentityGuard.rules`, click the status item in a Git repo,
+  and confirm the starter actions are **Add Rule**, **Settings**, and
+  **Rescan**.
 - **Repo Identity Guard: Add Rule for Current Repo** appends a new rule to
   `repoIdentityGuard.rules`.
 - A repo with no matching rule shows `Unknown`.

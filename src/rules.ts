@@ -1,6 +1,7 @@
 import {
   CurrentIdentity,
   IdentityEvaluation,
+  IdentityEvaluationOptions,
   IdentityRule,
 } from "./types";
 
@@ -19,6 +20,13 @@ export function loadRules(): IdentityRule[] {
       typeof rule?.name === "string" &&
       typeof rule?.email === "string",
   );
+}
+
+export function loadRequireLocalIdentity(): boolean {
+  const vscode = require("vscode") as typeof import("vscode");
+  return vscode.workspace
+    .getConfiguration("repoIdentityGuard")
+    .get<boolean>("requireLocalIdentity", false);
 }
 
 export function normalizeRemoteUrl(remoteUrl: string): string {
@@ -70,10 +78,12 @@ export function buildExactRuleMatch(remoteUrl: string): string {
 export function evaluateIdentity(
   current: CurrentIdentity | null,
   rules: IdentityRule[],
+  options: IdentityEvaluationOptions = { requireLocalIdentity: false },
 ): IdentityEvaluation {
   if (!current) {
     return {
       state: "notGitRepo",
+      requireLocalIdentity: options.requireLocalIdentity,
       message: "The active workspace is not inside a Git repository.",
     };
   }
@@ -82,15 +92,19 @@ export function evaluateIdentity(
     return {
       state: "unknown",
       current,
+      requireLocalIdentity: options.requireLocalIdentity,
       message: "This repository has no origin remote.",
     };
   }
 
+  const normalizedRemote = normalizeRemoteUrl(current.remoteUrl);
   const rule = matchRule(current.remoteUrl, rules);
   if (!rule) {
     return {
       state: "unknown",
       current,
+      normalizedRemote,
+      requireLocalIdentity: options.requireLocalIdentity,
       message: "No identity rule matched this repository.",
     };
   }
@@ -101,10 +115,32 @@ export function evaluateIdentity(
     rule.email.trim().toLocaleLowerCase();
 
   if (nameMatches && emailMatches) {
+    const localNameMatches = current.localName?.trim() === rule.name.trim();
+    const localEmailMatches =
+      current.localEmail?.trim().toLocaleLowerCase() ===
+      rule.email.trim().toLocaleLowerCase();
+
+    if (
+      options.requireLocalIdentity &&
+      (!localNameMatches || !localEmailMatches)
+    ) {
+      return {
+        state: "localNeeded",
+        current,
+        rule,
+        normalizedRemote,
+        requireLocalIdentity: options.requireLocalIdentity,
+        message:
+          "Effective Git identity matches, but this repo does not have the expected local Git identity set. If global Git config changes later, this repo may become unsafe.",
+      };
+    }
+
     return {
       state: "safe",
       current,
       rule,
+      normalizedRemote,
+      requireLocalIdentity: options.requireLocalIdentity,
       message: `Repo identity is safe for ${rule.label}.`,
     };
   }
@@ -113,6 +149,8 @@ export function evaluateIdentity(
     state: "wrong",
     current,
     rule,
+    normalizedRemote,
+    requireLocalIdentity: options.requireLocalIdentity,
     message:
       "Wrong Git identity for this repo. You may commit with the wrong author.",
   };
