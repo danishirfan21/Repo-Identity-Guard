@@ -71,6 +71,54 @@ export async function getLocalGitUserEmail(
   }
 }
 
+export async function getEffectiveGitUserName(
+  repoRoot: string,
+): Promise<string | null> {
+  try {
+    return (await runGit(repoRoot, ["config", "user.name"])) || null;
+  } catch (error) {
+    if (isExpectedMissingValue(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function getEffectiveGitUserEmail(
+  repoRoot: string,
+): Promise<string | null> {
+  try {
+    return (await runGit(repoRoot, ["config", "user.email"])) || null;
+  } catch (error) {
+    if (isExpectedMissingValue(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function getGlobalGitUserName(): Promise<string | null> {
+  try {
+    return (await runGit(process.cwd(), ["config", "--global", "user.name"])) || null;
+  } catch (error) {
+    if (isExpectedMissingValue(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function getGlobalGitUserEmail(): Promise<string | null> {
+  try {
+    return (await runGit(process.cwd(), ["config", "--global", "user.email"])) || null;
+  } catch (error) {
+    if (isExpectedMissingValue(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 export async function setLocalGitIdentity(
   repoRoot: string,
   name: string,

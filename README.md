@@ -3,8 +3,14 @@
 Never commit to work with your personal Git identity again.
 
 Repo Identity Guard is a tiny VS Code-compatible safety check. It compares the
-current repository's **local** Git `user.name` and `user.email` with a rule based
-on the repository's `origin` remote.
+current repository's effective Git `user.name` and `user.email` with a rule
+based on the repository's `origin` remote.
+
+It also shows where the identity is coming from:
+
+- **Effective**: what Git will use for commits in this repo.
+- **Local**: values from this repo's `.git/config`.
+- **Global**: values from your user-level Git config.
 
 ## Configure identity rules
 
@@ -43,7 +49,16 @@ Open a Git repository and look at the left side of the status bar:
 - `Repo ID: Unknown` means the repo has no origin or no rule matched.
 
 Click the status item to see the remote, current identity, expected identity,
-and available actions. The fix action writes only:
+and available actions.
+
+Useful actions:
+
+- **Fix local Git identity** writes the expected rule identity into this repo.
+- **Add Rule for Current Repo** creates a settings rule from the current remote
+  and effective identity.
+- **Rescan** refreshes the status.
+
+The fix action writes only:
 
 ```text
 git config --local user.name ...
@@ -51,6 +66,20 @@ git config --local user.email ...
 ```
 
 It never modifies global Git configuration.
+
+## Add a rule from the current repo
+
+Run **Repo Identity Guard: Add Rule for Current Repo** from the command palette,
+or click the status bar item and choose **Add Rule for Current Repo**.
+
+The command prompts for:
+
+1. remote match pattern,
+2. status bar label,
+3. expected Git name,
+4. expected Git email.
+
+It appends the new rule to your user setting `repoIdentityGuard.rules`.
 
 ## Run locally
 
@@ -65,7 +94,7 @@ See [TESTING.md](TESTING.md) for the manual MVP checklist.
 
 ## MVP limitations
 
-This version checks only the repository's local Git commit author identity. It
+This version checks only the repository's Git commit author identity. It
 does not inspect or switch GitHub CLI accounts, SSH keys, HTTPS credentials, or
 IDE account sessions. It does not install hooks, change remotes, touch commits,
 push code, authenticate users, or provide a dashboard.

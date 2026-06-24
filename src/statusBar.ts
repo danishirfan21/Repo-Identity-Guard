@@ -57,7 +57,9 @@ function buildTooltip(evaluation: IdentityEvaluation): vscode.MarkdownString {
     lines.push(
       "",
       `Remote: \`${current.remoteUrl ?? "Not configured"}\``,
-      `Current: \`${current.name ?? "Not set"} <${current.email ?? "not set"}>\``,
+      `Effective: \`${current.effectiveName ?? "Not set"} <${current.effectiveEmail ?? "not set"}>\``,
+      `Local: \`${current.localName ?? "Not set"} <${current.localEmail ?? "not set"}>\``,
+      `Global: \`${current.globalName ?? "Not set"} <${current.globalEmail ?? "not set"}>\``,
     );
   }
 

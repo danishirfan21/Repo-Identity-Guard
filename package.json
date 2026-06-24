@@ -34,6 +34,10 @@
         "title": "Repo Identity Guard: Fix Local Git Identity"
       },
       {
+        "command": "repoIdentityGuard.addRuleForCurrentRepo",
+        "title": "Repo Identity Guard: Add Rule for Current Repo"
+      },
+      {
         "command": "repoIdentityGuard.openSettings",
         "title": "Repo Identity Guard: Open Settings"
       }

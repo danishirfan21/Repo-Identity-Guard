@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { evaluateIdentity, matchRule, normalizeRemoteUrl } from "../rules";
+import {
+  buildExactRuleMatch,
+  evaluateIdentity,
+  matchRule,
+  normalizeRemoteUrl,
+} from "../rules";
 import { CurrentIdentity, IdentityRule } from "../types";
 
 const workRule: IdentityRule = {
@@ -9,6 +14,22 @@ const workRule: IdentityRule = {
   name: "Danish Irfan",
   email: "work@example.com",
 };
+
+function currentIdentity(
+  overrides: Partial<CurrentIdentity> = {},
+): CurrentIdentity {
+  return {
+    repoRoot: "C:/repo",
+    remoteUrl: "https://github.com/AcmeSoftware/project.git",
+    effectiveName: "Danish Irfan",
+    effectiveEmail: "work@example.com",
+    localName: "Danish Irfan",
+    localEmail: "work@example.com",
+    globalName: null,
+    globalEmail: null,
+    ...overrides,
+  };
+}
 
 test("normalizes common HTTPS and SSH remote formats", () => {
   assert.equal(
@@ -45,35 +66,46 @@ test("matches wildcard rules against normalized remotes", () => {
   );
 });
 
+test("builds exact rule match from current remote", () => {
+  assert.equal(
+    buildExactRuleMatch("git@github.com:AcmeSoftware/example-project.git"),
+    "github.com/AcmeSoftware/example-project",
+  );
+});
+
 test("evaluates safe identity with case-insensitive email comparison", () => {
-  const current: CurrentIdentity = {
-    repoRoot: "C:/repo",
-    remoteUrl: "https://github.com/AcmeSoftware/project.git",
-    name: "Danish Irfan",
-    email: "WORK@EXAMPLE.COM",
-  };
+  const current = currentIdentity({ effectiveEmail: "WORK@EXAMPLE.COM" });
 
   assert.equal(evaluateIdentity(current, [workRule]).state, "safe");
 });
 
-test("evaluates missing or mismatched local values as wrong", () => {
-  const current: CurrentIdentity = {
-    repoRoot: "C:/repo",
-    remoteUrl: "https://github.com/AcmeSoftware/project.git",
-    name: "Danish Irfan",
-    email: null,
-  };
+test("evaluates effective identity instead of local identity", () => {
+  const current = currentIdentity({
+    effectiveName: "Danish Irfan",
+    effectiveEmail: "work@example.com",
+    localName: null,
+    localEmail: null,
+    globalName: "Danish Irfan",
+    globalEmail: "work@example.com",
+  });
+
+  assert.equal(evaluateIdentity(current, [workRule]).state, "safe");
+});
+
+test("evaluates missing or mismatched effective values as wrong", () => {
+  const current = currentIdentity({ effectiveEmail: null });
 
   assert.equal(evaluateIdentity(current, [workRule]).state, "wrong");
 });
 
 test("evaluates unmatched remotes as unknown", () => {
-  const current: CurrentIdentity = {
-    repoRoot: "C:/repo",
+  const current = currentIdentity({
     remoteUrl: "https://gitlab.com/example/project.git",
-    name: null,
-    email: null,
-  };
+    effectiveName: null,
+    effectiveEmail: null,
+    localName: null,
+    localEmail: null,
+  });
 
   assert.equal(evaluateIdentity(current, [workRule]).state, "unknown");
 });

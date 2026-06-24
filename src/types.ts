@@ -8,8 +8,12 @@ export interface IdentityRule {
 export interface CurrentIdentity {
   repoRoot: string;
   remoteUrl: string | null;
-  name: string | null;
-  email: string | null;
+  effectiveName: string | null;
+  effectiveEmail: string | null;
+  localName: string | null;
+  localEmail: string | null;
+  globalName: string | null;
+  globalEmail: string | null;
 }
 
 export type IdentityState =

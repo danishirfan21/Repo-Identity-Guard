@@ -1,15 +1,33 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
+  getEffectiveGitUserEmail,
+  getEffectiveGitUserName,
+  getGlobalGitUserEmail,
+  getGlobalGitUserName,
   getLocalGitUserEmail,
   getLocalGitUserName,
   getOriginRemote,
   getRepoRoot,
   setLocalGitIdentity,
 } from "./git";
-import { evaluateIdentity, loadRules } from "./rules";
+import { buildExactRuleMatch, evaluateIdentity, loadRules } from "./rules";
 import { IdentityStatusBar } from "./statusBar";
 import { CurrentIdentity, IdentityEvaluation } from "./types";
+
+const ACTION_VIEW_DETAILS = "View Details";
+const ACTION_FIX_IDENTITY = "Fix Local Git Identity";
+const ACTION_ADD_RULE = "Add Rule for Current Repo";
+const ACTION_RESCAN = "Rescan";
+const ACTION_OPEN_SETTINGS = "Open Settings";
+
+const NOTIFICATION_ACTIONS = {
+  details: "Details",
+  fix: "Fix",
+  addRule: "Add Rule",
+  rescan: "Rescan",
+  settings: "Settings",
+} as const;
 
 let latestEvaluation: IdentityEvaluation = {
   state: "notGitRepo",
@@ -62,6 +80,12 @@ export function activate(context: vscode.ExtensionContext): void {
       },
     ),
     vscode.commands.registerCommand(
+      "repoIdentityGuard.addRuleForCurrentRepo",
+      async () => {
+        await addRuleForCurrentRepo(latestEvaluation, scan);
+      },
+    ),
+    vscode.commands.registerCommand(
       "repoIdentityGuard.openSettings",
       () =>
         vscode.commands.executeCommand(
@@ -100,12 +124,33 @@ async function scanIdentity(cwd: string | undefined): Promise<IdentityEvaluation
     return evaluateIdentity(null, loadRules());
   }
 
-  const [remoteUrl, name, email] = await Promise.all([
+  const [
+    remoteUrl,
+    effectiveName,
+    effectiveEmail,
+    localName,
+    localEmail,
+    globalName,
+    globalEmail,
+  ] = await Promise.all([
     getOriginRemote(repoRoot),
+    getEffectiveGitUserName(repoRoot),
+    getEffectiveGitUserEmail(repoRoot),
     getLocalGitUserName(repoRoot),
     getLocalGitUserEmail(repoRoot),
+    getGlobalGitUserName(),
+    getGlobalGitUserEmail(),
   ]);
-  const current: CurrentIdentity = { repoRoot, remoteUrl, name, email };
+  const current: CurrentIdentity = {
+    repoRoot,
+    remoteUrl,
+    effectiveName,
+    effectiveEmail,
+    localName,
+    localEmail,
+    globalName,
+    globalEmail,
+  };
 
   return evaluateIdentity(current, loadRules());
 }
@@ -145,33 +190,242 @@ function updateGitConfigWatcher(
 }
 
 async function showStatus(evaluation: IdentityEvaluation): Promise<void> {
-  const details = formatDetails(evaluation);
-  let actions: string[];
-
-  switch (evaluation.state) {
-    case "wrong":
-      actions = ["Fix local Git identity", "Rescan", "Open Settings"];
-      break;
-    case "safe":
-      actions = ["Rescan", "Open Settings"];
-      break;
-    default:
-      actions = ["Open Settings", "Rescan"];
-      break;
-  }
+  const actions = getNotificationActions(evaluation);
 
   const choice =
     evaluation.state === "wrong"
-      ? await vscode.window.showWarningMessage(details, ...actions)
-      : await vscode.window.showInformationMessage(details, ...actions);
+      ? await vscode.window.showWarningMessage(
+          "Wrong Git identity for this repo. You may commit with the wrong author.",
+          ...actions,
+        )
+      : await vscode.window.showInformationMessage(
+          getShortStatusMessage(evaluation),
+          ...actions,
+        );
 
-  if (choice === "Fix local Git identity") {
+  await handleNotificationAction(choice, evaluation);
+}
+
+function getNotificationActions(evaluation: IdentityEvaluation): string[] {
+  if (evaluation.state === "wrong") {
+    return [
+      NOTIFICATION_ACTIONS.details,
+      NOTIFICATION_ACTIONS.fix,
+      NOTIFICATION_ACTIONS.addRule,
+      NOTIFICATION_ACTIONS.rescan,
+      NOTIFICATION_ACTIONS.settings,
+    ];
+  }
+
+  return [
+    NOTIFICATION_ACTIONS.details,
+    NOTIFICATION_ACTIONS.addRule,
+    NOTIFICATION_ACTIONS.rescan,
+    NOTIFICATION_ACTIONS.settings,
+  ];
+}
+
+function getShortStatusMessage(evaluation: IdentityEvaluation): string {
+  if (evaluation.state === "safe" && evaluation.rule) {
+    return `Repo identity is safe for ${evaluation.rule.label}.`;
+  }
+
+  return evaluation.message;
+}
+
+async function handleNotificationAction(
+  choice: string | undefined,
+  evaluation: IdentityEvaluation,
+): Promise<void> {
+  if (choice === NOTIFICATION_ACTIONS.details) {
+    await handleStatusAction(ACTION_VIEW_DETAILS, evaluation);
+  } else if (choice === NOTIFICATION_ACTIONS.fix) {
+    await handleStatusAction(ACTION_FIX_IDENTITY, evaluation);
+  } else if (choice === NOTIFICATION_ACTIONS.addRule) {
+    await handleStatusAction(ACTION_ADD_RULE, evaluation);
+  } else if (choice === NOTIFICATION_ACTIONS.rescan) {
+    await handleStatusAction(ACTION_RESCAN, evaluation);
+  } else if (choice === NOTIFICATION_ACTIONS.settings) {
+    await handleStatusAction(ACTION_OPEN_SETTINGS, evaluation);
+  }
+}
+
+async function handleStatusAction(
+  choice: string | undefined,
+  evaluation: IdentityEvaluation,
+): Promise<void> {
+  if (choice === ACTION_VIEW_DETAILS) {
+    await showDetailsQuickPick(evaluation);
+  } else if (choice === ACTION_FIX_IDENTITY) {
     await vscode.commands.executeCommand("repoIdentityGuard.fixIdentity");
-  } else if (choice === "Rescan") {
+  } else if (choice === ACTION_ADD_RULE) {
+    await vscode.commands.executeCommand("repoIdentityGuard.addRuleForCurrentRepo");
+  } else if (choice === ACTION_RESCAN) {
     await vscode.commands.executeCommand("repoIdentityGuard.scan");
-  } else if (choice === "Open Settings") {
+  } else if (choice === ACTION_OPEN_SETTINGS) {
     await vscode.commands.executeCommand("repoIdentityGuard.openSettings");
   }
+}
+
+interface DetailQuickPickItem extends vscode.QuickPickItem {
+  action?: string;
+}
+
+async function showDetailsQuickPick(
+  evaluation: IdentityEvaluation,
+): Promise<void> {
+  const picked = await vscode.window.showQuickPick(buildDetailsItems(evaluation), {
+    title: "Repo Identity Guard",
+    placeHolder: "Review identity details or choose an action",
+    matchOnDescription: true,
+    matchOnDetail: true,
+  });
+
+  await handleStatusAction(picked?.action, evaluation);
+}
+
+function buildDetailsItems(
+  evaluation: IdentityEvaluation,
+): DetailQuickPickItem[] {
+  const { current, rule } = evaluation;
+  const items: DetailQuickPickItem[] = [
+    {
+      label: "$(info) Status",
+      description: evaluation.state,
+      detail: evaluation.message,
+    },
+  ];
+
+  if (current) {
+    items.push(
+      {
+        label: "$(repo) Remote",
+        description: current.remoteUrl ?? "Not configured",
+      },
+      {
+        label: "$(person) Effective identity",
+        description: formatIdentity(
+          current.effectiveName,
+          current.effectiveEmail,
+        ),
+        detail: "This is what Git will use for commits in this repo.",
+      },
+      {
+        label: "$(file-code) Local identity",
+        description: formatIdentity(current.localName, current.localEmail),
+        detail: "From this repository's .git/config.",
+      },
+      {
+        label: "$(globe) Global identity",
+        description: formatIdentity(current.globalName, current.globalEmail),
+        detail: "From your user-level Git config.",
+      },
+    );
+  }
+
+  items.push({
+    label: "$(check) Expected identity",
+    description: rule ? formatIdentity(rule.name, rule.email) : "No matched rule",
+  });
+
+  items.push({
+    label: "$(symbol-ruler) Matched rule",
+    description: rule ? `${rule.label} — ${rule.match}` : "No rule matched",
+  });
+
+  items.push(
+    {
+      label: "",
+      kind: vscode.QuickPickItemKind.Separator,
+    },
+    {
+      label: "$(tools) Fix Local Git Identity",
+      detail: "Write the expected name/email to this repo's local Git config.",
+      action: ACTION_FIX_IDENTITY,
+    },
+    {
+      label: "$(add) Add Rule for Current Repo",
+      detail: "Create a settings rule from this repo's remote and identity.",
+      action: ACTION_ADD_RULE,
+    },
+    {
+      label: "$(sync) Rescan",
+      detail: "Refresh the current repo identity status.",
+      action: ACTION_RESCAN,
+    },
+    {
+      label: "$(settings-gear) Open Settings",
+      detail: "Edit repoIdentityGuard.rules.",
+      action: ACTION_OPEN_SETTINGS,
+    },
+  );
+
+  return items;
+}
+
+async function addRuleForCurrentRepo(
+  evaluation: IdentityEvaluation,
+  scan: (cwdOverride?: string) => Promise<void>,
+): Promise<void> {
+  const { current } = evaluation;
+  if (!current) {
+    await vscode.window.showInformationMessage(
+      "Open a Git repository before adding an identity rule.",
+    );
+    return;
+  }
+  if (!current.remoteUrl) {
+    await vscode.window.showInformationMessage(
+      "This repository has no origin remote to match.",
+    );
+    return;
+  }
+
+  const match = await vscode.window.showInputBox({
+    title: "Add Rule for Current Repo",
+    prompt: "Remote match pattern",
+    value: buildExactRuleMatch(current.remoteUrl),
+  });
+  if (!match) {
+    return;
+  }
+
+  const label = await vscode.window.showInputBox({
+    title: "Add Rule for Current Repo",
+    prompt: "Short label shown in the status bar",
+    value: "Personal",
+  });
+  if (!label) {
+    return;
+  }
+
+  const name = await vscode.window.showInputBox({
+    title: "Add Rule for Current Repo",
+    prompt: "Expected Git user.name",
+    value: current.effectiveName ?? current.localName ?? current.globalName ?? "",
+  });
+  if (!name) {
+    return;
+  }
+
+  const email = await vscode.window.showInputBox({
+    title: "Add Rule for Current Repo",
+    prompt: "Expected Git user.email",
+    value: current.effectiveEmail ?? current.localEmail ?? current.globalEmail ?? "",
+  });
+  if (!email) {
+    return;
+  }
+
+  const rules = loadRules();
+  const nextRules = [...rules, { match, label, name, email }];
+  await vscode.workspace
+    .getConfiguration("repoIdentityGuard")
+    .update("rules", nextRules, vscode.ConfigurationTarget.Global);
+  await vscode.window.showInformationMessage(
+    `Added Repo Identity Guard rule for ${label}.`,
+  );
+  await scan(current.repoRoot);
 }
 
 async function fixIdentity(
@@ -208,21 +462,8 @@ async function fixIdentity(
   }
 }
 
-function formatDetails(evaluation: IdentityEvaluation): string {
-  const lines = [evaluation.message];
-  const { current, rule } = evaluation;
-
-  if (current) {
-    lines.push(`Remote: ${current.remoteUrl ?? "Not configured"}`);
-    lines.push(
-      `Current: ${current.name ?? "Not set"} <${current.email ?? "not set"}>`,
-    );
-  }
-  if (rule) {
-    lines.push(`Expected: ${rule.name} <${rule.email}>`);
-  }
-
-  return lines.join("\n");
+function formatIdentity(name: string | null, email: string | null): string {
+  return `${name ?? "Not set"} <${email ?? "not set"}>`;
 }
 
 function getErrorMessage(error: unknown): string {

@@ -63,6 +63,10 @@ export function matchRule(
   return rules.find((rule) => wildcardToRegExp(rule.match).test(normalizedRemote));
 }
 
+export function buildExactRuleMatch(remoteUrl: string): string {
+  return normalizeRemoteUrl(remoteUrl);
+}
+
 export function evaluateIdentity(
   current: CurrentIdentity | null,
   rules: IdentityRule[],
@@ -91,9 +95,9 @@ export function evaluateIdentity(
     };
   }
 
-  const nameMatches = current.name?.trim() === rule.name.trim();
+  const nameMatches = current.effectiveName?.trim() === rule.name.trim();
   const emailMatches =
-    current.email?.trim().toLocaleLowerCase() ===
+    current.effectiveEmail?.trim().toLocaleLowerCase() ===
     rule.email.trim().toLocaleLowerCase();
 
   if (nameMatches && emailMatches) {

@@ -21,6 +21,13 @@
 
 Also check:
 
+- The status details show effective, local, and global identity values.
+- Clicking the status item shows a short notification. Choose **View Details**
+  to open the readable Quick Pick details view.
+- If local identity is unset but global identity matches the rule, the repo is
+  treated as safe because Git's effective identity matches.
+- **Repo Identity Guard: Add Rule for Current Repo** appends a new rule to
+  `repoIdentityGuard.rules`.
 - A repo with no matching rule shows `Unknown`.
 - A repo with no `origin` shows `Unknown`.
 - A non-Git folder hides the status item.
