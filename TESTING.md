@@ -95,16 +95,15 @@ Action rows should include:
 ### Activity Bar panel
 
 Confirm the left Activity Bar has a **Repo ID** icon. Open it and verify the
-native tree view shows:
+card-based sidebar shows:
 
-- Status
-- Matched rule, when available
-- Remote
-- Effective identity
-- Local identity
-- Global identity
-- quick actions for Details, Fix/Set Local, Add Rule, Copy Report, Rescan, and
+- Status card
+- Repository card
+- Matched Rule card
+- Identity card with Effective, Local, and Global sections
+- Actions card with Details, Fix/Set Local, Add Rule, Copy Report, Rescan, and
   Settings
+- custom confirmation modal for Fix/Set Local Identity
 
 ### Copy Diagnostic Report
 

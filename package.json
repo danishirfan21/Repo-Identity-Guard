@@ -38,7 +38,8 @@
       "repoIdentityGuard": [
         {
           "id": "repoIdentityGuard.statusView",
-          "name": "Status"
+          "name": "Status",
+          "type": "webview"
         }
       ]
     },

@@ -51,9 +51,10 @@ will use if you commit right now.
 - `Repo ID: Unknown`: no origin remote exists or no rule matched.
 
 Click the status item to open native VS Code actions. Repo ID also contributes a
-left Activity Bar view with the current status and quick actions. Use
-**Details** to see a readable Quick Pick with remote, effective/local/global
-identities, expected identity, matched rule, and strict-local mode.
+compact Activity Bar webview with cards for the current status, repository,
+matched rule, identities, and quick actions. Use **Details** to see a readable
+Quick Pick with remote, effective/local/global identities, expected identity,
+matched rule, and strict-local mode.
 
 ## Example configuration
 
@@ -157,14 +158,15 @@ Repo ID rescans when rules change, workspace/editor context changes, repo-local
 
 ## Activity Bar view
 
-Repo ID adds a native Activity Bar panel named **Repo ID**. The panel shows:
+Repo ID adds a compact Activity Bar panel named **Repo ID**. The panel shows:
 
-- current status;
-- matched rule;
-- remote;
-- effective/local/global identities;
-- quick actions for details, fix/set local identity, add rule, copy report,
-  rescan, and settings.
+- a status card;
+- repository card;
+- matched rule card;
+- effective/local/global identity card;
+- action buttons for details, fix/set local identity, add rule, copy report,
+  rescan, and settings;
+- an in-sidebar confirmation modal before writing local Git identity.
 
 ## Run locally
 
@@ -191,4 +193,4 @@ It does not:
 - touch commits;
 - push code;
 - authenticate users;
-- provide a webview dashboard.
+- provide a large dashboard.

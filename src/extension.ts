@@ -52,10 +52,22 @@ let globalGitConfigWatchers: vscode.FileSystemWatcher[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
   const statusBar = new IdentityStatusBar();
-  const sidebarProvider = new RepoIdentitySidebarProvider();
+  const sidebarProvider = new RepoIdentitySidebarProvider({
+    showDetails: () => showDetailsQuickPick(latestEvaluation),
+    setLocalIdentity: () => setLocalIdentityFromRule(latestEvaluation, scan),
+    addRule: () => addRuleForCurrentRepo(latestEvaluation, scan),
+    copyReport: () => copyDiagnosticReport(latestEvaluation),
+    rescan: () => scan(),
+    openSettings: async () => {
+      await vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "repoIdentityGuard.rules",
+      );
+    },
+  });
   context.subscriptions.push(statusBar);
   context.subscriptions.push(
-    vscode.window.registerTreeDataProvider(
+    vscode.window.registerWebviewViewProvider(
       "repoIdentityGuard.statusView",
       sidebarProvider,
     ),
@@ -585,6 +597,21 @@ async function fixIdentity(
     "Set Local Identity",
   );
   if (confirmation !== "Set Local Identity") {
+    return;
+  }
+
+  await setLocalIdentityFromRule(evaluation, scan);
+}
+
+async function setLocalIdentityFromRule(
+  evaluation: IdentityEvaluation,
+  scan: (cwdOverride?: string) => Promise<void>,
+): Promise<void> {
+  const { current, rule } = evaluation;
+  if (!current || !rule) {
+    await vscode.window.showInformationMessage(
+      "No matching identity rule is available for this repository.",
+    );
     return;
   }
 
