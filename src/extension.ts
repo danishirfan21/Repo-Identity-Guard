@@ -57,6 +57,8 @@ export function activate(context: vscode.ExtensionContext): void {
     {
       showDetails: () => showDetailsQuickPick(latestEvaluation),
       setLocalIdentity: () => setLocalIdentityFromRule(latestEvaluation, scan),
+      setCustomLocalIdentity: (name, email) =>
+        setCustomLocalIdentity(latestEvaluation, scan, name, email),
       addRule: () => addRuleForCurrentRepo(latestEvaluation, scan),
       copyReport: () => copyDiagnosticReport(latestEvaluation),
       rescan: () => scan(),
@@ -622,6 +624,42 @@ async function setLocalIdentityFromRule(
     await setLocalGitIdentity(current.repoRoot, rule.name, rule.email);
     await vscode.window.showInformationMessage(
       `Local Git identity set to ${rule.name} <${rule.email}>.`,
+    );
+    await scan(current.repoRoot);
+  } catch (error) {
+    await vscode.window.showErrorMessage(
+      `Could not set local Git identity: ${getErrorMessage(error)}`,
+    );
+  }
+}
+
+async function setCustomLocalIdentity(
+  evaluation: IdentityEvaluation,
+  scan: (cwdOverride?: string) => Promise<void>,
+  name: string,
+  email: string,
+): Promise<void> {
+  const { current, rule } = evaluation;
+  if (!current || !rule) {
+    await vscode.window.showInformationMessage(
+      "No matching identity rule is available for this repository.",
+    );
+    return;
+  }
+
+  const trimmedName = name.trim();
+  const trimmedEmail = email.trim();
+  if (!trimmedName || !trimmedEmail) {
+    await vscode.window.showErrorMessage(
+      "Name and email are required to set a local Git identity.",
+    );
+    return;
+  }
+
+  try {
+    await setLocalGitIdentity(current.repoRoot, trimmedName, trimmedEmail);
+    await vscode.window.showInformationMessage(
+      `Local Git identity set to ${trimmedName} <${trimmedEmail}>.`,
     );
     await scan(current.repoRoot);
   } catch (error) {

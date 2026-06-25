@@ -4,6 +4,7 @@ import { IdentityEvaluation, IdentityState } from "./types";
 export interface RepoIdentitySidebarActions {
   showDetails(): Promise<void>;
   setLocalIdentity(): Promise<void>;
+  setCustomLocalIdentity(name: string, email: string): Promise<void>;
   addRule(): Promise<void>;
   copyReport(): Promise<void>;
   rescan(): Promise<void>;
@@ -22,8 +23,12 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
     webviewView.webview.options = { enableScripts: true };
-    webviewView.webview.onDidReceiveMessage((message: { type?: string }) => {
-      void this.handleMessage(message.type);
+    webviewView.webview.onDidReceiveMessage((message: {
+      type?: string;
+      name?: string;
+      email?: string;
+    }) => {
+      void this.handleMessage(message);
     });
     this.render();
   }
@@ -33,13 +38,23 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
     this.render();
   }
 
-  private async handleMessage(type: string | undefined): Promise<void> {
-    switch (type) {
+  private async handleMessage(message: {
+    type?: string;
+    name?: string;
+    email?: string;
+  }): Promise<void> {
+    switch (message.type) {
       case "details":
         await this.actions.showDetails();
         break;
       case "setLocalIdentity":
         await this.actions.setLocalIdentity();
+        break;
+      case "setCustomLocalIdentity":
+        await this.actions.setCustomLocalIdentity(
+          message.name ?? "",
+          message.email ?? "",
+        );
         break;
       case "addRule":
         await this.actions.addRule();
@@ -225,24 +240,8 @@ function getHtml(
 
   <main class="flex flex-1 flex-col gap-lg p-sidebar-padding" id="app"></main>
 
-  <div class="fixed inset-0 z-50 hidden items-end bg-black/50 p-3" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-    <section class="w-full rounded-xl border border-outline-variant bg-surface-container p-md shadow-2xl">
-      <div class="mb-2 flex items-center justify-between gap-2">
-        <div class="text-[15px] font-bold text-on-surface" id="modalTitle">Set Local Identity</div>
-        <button class="rounded px-2 py-1 text-on-surface-variant hover:bg-secondary-container hover:text-on-surface" id="closeModal" aria-label="Close modal">×</button>
-      </div>
-      <div class="text-body-base text-on-surface-variant">
-        This will write the expected name and email to this repository only.
-      </div>
-      <div class="my-3 rounded-lg border border-outline-variant bg-surface-container-lowest p-3">
-        <div class="text-body-bold text-on-surface" id="modalName"></div>
-        <div class="break-all font-code-mono text-code-mono text-on-surface-variant" id="modalEmail"></div>
-      </div>
-      <div class="flex justify-end gap-2">
-        <button class="rounded-lg bg-secondary-container px-3 py-2 text-body-base text-on-surface" id="cancelModal">Cancel</button>
-        <button class="rounded-lg bg-primary px-3 py-2 text-body-bold text-on-primary" id="confirmSet">Set Identity</button>
-      </div>
-    </section>
+  <div class="fixed inset-0 z-50 hidden items-center bg-black/70 p-2.5 backdrop-blur-[1px]" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="w-full" id="modalContent"></div>
   </div>
 
   <script nonce="${nonce}">
@@ -370,8 +369,169 @@ function getHtml(
       </section>
     \`;
 
-    document.getElementById("modalName").textContent = state.expectedName;
-    document.getElementById("modalEmail").textContent = state.expectedEmail;
+    const modalContent = document.getElementById("modalContent");
+    let modalMode = "view";
+
+    const readonlyRow = (label, value, mono = false) => \`
+      <div class="flex items-center justify-between gap-2 p-sm">
+        <div class="flex min-w-0 flex-col">
+          <span class="text-[10px] font-bold uppercase text-outline">\${esc(label)}</span>
+          <span class="\${mono ? "font-code-mono text-code-mono text-primary" : "text-body-bold font-semibold text-on-surface"} break-all">\${esc(value)}</span>
+        </div>
+        <span class="shrink-0 text-outline/60">▣</span>
+      </div>
+    \`;
+
+    const renderViewModal = () => \`
+      <section class="max-h-[calc(100vh-20px)] overflow-hidden rounded-lg border border-outline-variant bg-surface-container shadow-2xl">
+        <div class="space-y-xs p-md">
+          <div class="flex items-center gap-sm">
+            <span class="text-primary">◉</span>
+            <h1 class="m-0 text-headline-lg font-semibold text-on-surface" id="modalTitle">Set Local Identity</h1>
+          </div>
+          <p class="m-0 text-body-base text-on-surface-variant">Pin this repository to the expected Git identity.</p>
+        </div>
+
+        <div class="custom-scrollbar flex max-h-[55vh] flex-col gap-md overflow-y-auto px-md pb-md">
+          <p class="m-0 text-[11px] leading-tight text-on-surface-variant opacity-80">
+            This writes a repo-specific Git identity so future global Git config changes will not make this repository unsafe.
+          </p>
+
+          <div class="space-y-sm">
+            <span class="font-label-caps text-label-caps uppercase text-outline">Expected Identity</span>
+            <div class="divide-y divide-outline-variant rounded border border-outline-variant bg-surface-container-low">
+              \${readonlyRow("Name", state.expectedName)}
+              \${readonlyRow("Email", state.expectedEmail, true)}
+            </div>
+          </div>
+
+          <div class="space-y-xs">
+            <div class="flex items-start justify-between gap-2 py-xs">
+              <span class="text-body-base text-on-surface-variant">Repository</span>
+              <span class="max-w-[62%] break-all rounded bg-surface-variant px-xs text-right font-code-mono text-code-mono text-on-surface">\${esc(state.repoRoot)}</span>
+            </div>
+            <div class="flex items-center justify-between gap-2 py-xs">
+              <span class="text-body-base text-on-surface-variant">Matched rule</span>
+              <span class="flex items-center gap-xs text-body-bold font-semibold text-tertiary">
+                <span class="h-1.5 w-1.5 rounded-full bg-tertiary"></span>
+                \${esc(state.ruleLabel)}
+              </span>
+            </div>
+          </div>
+
+          <div class="flex gap-sm rounded border border-tertiary/20 bg-tertiary/10 p-sm">
+            <span class="shrink-0 text-tertiary">⚠</span>
+            <p class="m-0 text-[11px] leading-tight text-tertiary">
+              Only this repository's local Git config will be changed. Your global Git identity will not be modified.
+            </p>
+          </div>
+        </div>
+
+        <div class="space-y-sm border-t border-outline-variant bg-surface-container-high p-md">
+          <button class="flex h-[28px] w-full items-center justify-center gap-xs rounded bg-primary text-body-bold font-semibold text-on-primary shadow-sm transition-opacity hover:opacity-90" id="confirmSet">
+            Set Local Identity
+          </button>
+          <div class="flex gap-sm">
+            <button class="h-[26px] flex-1 rounded border border-outline-variant text-body-base text-on-surface transition-colors hover:bg-surface-variant" id="editModal">Edit</button>
+            <button class="h-[26px] flex-1 rounded text-body-base text-on-surface-variant transition-colors hover:bg-surface-variant hover:text-on-surface" id="cancelModal">Cancel</button>
+          </div>
+        </div>
+      </section>
+      <div class="mt-md text-center">
+        <p class="m-0 flex items-center justify-center gap-xs text-[10px] font-bold uppercase tracking-widest text-outline opacity-60">
+          <span class="h-1 w-1 animate-pulse rounded-full bg-primary"></span>
+          Ready to Commit
+        </p>
+      </div>
+    \`;
+
+    const renderEditModal = (name = state.expectedName, email = state.expectedEmail, error = "") => \`
+      <section class="max-h-[calc(100vh-20px)] overflow-hidden rounded-xl border border-outline-variant bg-surface-container shadow-2xl">
+        <div class="flex h-[44px] items-center justify-between border-b border-outline-variant bg-surface-container-high px-sidebar-padding">
+          <div class="flex items-center gap-2">
+            <span class="text-primary">◉</span>
+            <h1 class="m-0 text-headline-md font-semibold text-on-surface" id="modalTitle">Edit Local Identity</h1>
+          </div>
+          <button class="rounded px-2 py-1 text-on-surface-variant transition-colors hover:text-on-surface" id="closeModal" aria-label="Close modal">×</button>
+        </div>
+
+        <div class="custom-scrollbar flex max-h-[64vh] flex-col gap-md overflow-y-auto p-md">
+          <div class="flex flex-col gap-md">
+            <label class="flex flex-col gap-xs">
+              <span class="font-label-caps text-label-caps uppercase text-on-surface-variant">Full Name</span>
+              <input class="h-[28px] w-full rounded-md border border-outline-variant bg-surface-container-lowest px-3 py-1.5 text-body-base text-on-surface" id="editName" placeholder="Enter git name" type="text" value="\${esc(name)}" />
+            </label>
+            <label class="flex flex-col gap-xs">
+              <span class="font-label-caps text-label-caps uppercase text-on-surface-variant">Email Address</span>
+              <input class="h-[28px] w-full rounded-md border border-outline-variant bg-surface-container-lowest px-3 py-1.5 font-code-mono text-code-mono text-on-surface" id="editEmail" placeholder="name@example.com" type="email" value="\${esc(email)}" />
+            </label>
+            <p class="m-0 text-[11px] italic leading-[14px] text-on-surface-variant">
+              Editing these values will set a custom local Git identity for this repository.
+            </p>
+            <p class="\${error ? "" : "hidden"} m-0 rounded border border-error/40 bg-error-container/30 p-2 text-[11px] leading-tight text-error" id="modalError">\${esc(error)}</p>
+          </div>
+
+          <div class="h-px w-full bg-outline-variant"></div>
+
+          <div class="flex flex-col gap-sm">
+            <div class="flex items-start justify-between gap-2">
+              <span class="font-label-caps text-label-caps uppercase text-on-surface-variant">Repository</span>
+              <span class="max-w-[62%] break-all text-right font-code-mono text-code-mono text-on-surface">\${esc(state.repoRoot)}</span>
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <span class="font-label-caps text-label-caps uppercase text-on-surface-variant">Matched rule</span>
+              <span class="flex items-center gap-1.5 text-body-bold font-semibold text-on-surface">
+                <span class="h-1.5 w-1.5 rounded-full bg-primary shadow-[0_0_8px_rgba(0,122,204,0.45)]"></span>
+                \${esc(state.ruleLabel)}
+              </span>
+            </div>
+          </div>
+
+          <div class="flex flex-col gap-sm pt-1">
+            <button class="flex h-[32px] w-full items-center justify-center gap-2 rounded-md bg-primary-container text-body-bold font-semibold text-on-primary-container transition-all hover:brightness-110" id="saveCustom">▣ Save Local Identity</button>
+            <div class="grid grid-cols-2 gap-sm">
+              <button class="h-[28px] rounded-md border border-outline-variant bg-surface-variant text-body-base text-on-surface transition-colors hover:bg-secondary-container" id="resetToRule">Reset to Rule</button>
+              <button class="h-[28px] rounded-md text-body-base text-on-surface-variant transition-colors hover:bg-surface-variant hover:text-on-surface" id="cancelModal">Cancel</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2 border-t border-outline-variant bg-surface-container-lowest px-sidebar-padding py-2">
+          <span class="text-[14px] text-outline">▣</span>
+          <span class="font-label-caps text-[9px] uppercase tracking-widest text-outline">Isolated Workspace Security</span>
+        </div>
+      </section>
+    \`;
+
+    const showValidation = (message) => {
+      const nameInput = document.getElementById("editName");
+      const emailInput = document.getElementById("editEmail");
+      renderModal("edit", nameInput?.value ?? state.expectedName, emailInput?.value ?? state.expectedEmail, message);
+      document.getElementById("editName")?.focus();
+    };
+
+    const isEmailish = (email) => /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email);
+
+    const renderModal = (mode = modalMode, name = state.expectedName, email = state.expectedEmail, error = "") => {
+      modalMode = mode;
+      modalContent.innerHTML = mode === "edit"
+        ? renderEditModal(name, email, error)
+        : renderViewModal();
+
+      if (mode === "edit") {
+        const nameInput = document.getElementById("editName");
+        nameInput?.focus();
+        nameInput?.select();
+      } else {
+        document.getElementById("confirmSet")?.focus();
+      }
+    };
+
+    const openModal = () => {
+      modal.classList.remove("hidden");
+      modal.classList.add("flex");
+      renderModal("view");
+    };
 
     document.addEventListener("click", (event) => {
       const button = event.target.closest("button[data-action]");
@@ -380,9 +540,7 @@ function getHtml(
       const action = button.dataset.action;
       if (action === "showSetModal") {
         if (!state.canSetLocal) return;
-        modal.classList.remove("hidden");
-        modal.classList.add("flex");
-        document.getElementById("confirmSet").focus();
+        openModal();
         return;
       }
 
@@ -394,12 +552,58 @@ function getHtml(
       modal.classList.remove("flex");
     };
 
-    document.getElementById("closeModal").addEventListener("click", closeModal);
-    document.getElementById("cancelModal").addEventListener("click", closeModal);
-    document.getElementById("confirmSet").addEventListener("click", () => {
-      closeModal();
-      vscode.postMessage({ type: "setLocalIdentity" });
+    modal.addEventListener("click", (event) => {
+      const target = event.target;
+      if (target === modal) {
+        closeModal();
+        return;
+      }
+
+      if (!(target instanceof Element)) return;
+
+      if (target.closest("#closeModal") || target.closest("#cancelModal")) {
+        closeModal();
+        return;
+      }
+
+      if (target.closest("#confirmSet")) {
+        closeModal();
+        vscode.postMessage({ type: "setLocalIdentity" });
+        return;
+      }
+
+      if (target.closest("#editModal")) {
+        renderModal("edit");
+        return;
+      }
+
+      if (target.closest("#resetToRule")) {
+        renderModal("edit", state.expectedName, state.expectedEmail);
+        return;
+      }
+
+      if (target.closest("#saveCustom")) {
+        const name = document.getElementById("editName")?.value.trim() ?? "";
+        const email = document.getElementById("editEmail")?.value.trim() ?? "";
+
+        if (!name) {
+          showValidation("Name must not be empty.");
+          return;
+        }
+        if (!email) {
+          showValidation("Email must not be empty.");
+          return;
+        }
+        if (!isEmailish(email)) {
+          showValidation("Email should look like name@example.com.");
+          return;
+        }
+
+        closeModal();
+        vscode.postMessage({ type: "setCustomLocalIdentity", name, email });
+      }
     });
+
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") closeModal();
     });
