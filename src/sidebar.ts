@@ -240,8 +240,8 @@ function getHtml(
 
   <main class="flex flex-1 flex-col gap-lg p-sidebar-padding" id="app"></main>
 
-  <div class="fixed inset-0 z-50 hidden items-center bg-black/70 p-2.5 backdrop-blur-[1px]" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-    <div class="w-full" id="modalContent"></div>
+  <div class="fixed inset-0 z-50 hidden items-center bg-black/70 p-4 backdrop-blur-[1px]" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="mx-auto w-full max-w-[320px]" id="modalContent"></div>
   </div>
 
   <script nonce="${nonce}">
@@ -373,12 +373,11 @@ function getHtml(
     let modalMode = "view";
 
     const readonlyRow = (label, value, mono = false) => \`
-      <div class="flex items-center justify-between gap-2 p-sm">
+      <div class="flex items-center gap-2 p-sm">
         <div class="flex min-w-0 flex-col">
           <span class="text-[10px] font-bold uppercase text-outline">\${esc(label)}</span>
           <span class="\${mono ? "font-code-mono text-code-mono text-primary" : "text-body-bold font-semibold text-on-surface"} break-all">\${esc(value)}</span>
         </div>
-        <span class="shrink-0 text-outline/60">▣</span>
       </div>
     \`;
 
@@ -419,9 +418,9 @@ function getHtml(
             </div>
           </div>
 
-          <div class="flex gap-sm rounded border border-tertiary/20 bg-tertiary/10 p-sm">
-            <span class="shrink-0 text-tertiary">⚠</span>
-            <p class="m-0 text-[11px] leading-tight text-tertiary">
+          <div class="flex items-start gap-sm rounded border border-tertiary-fixed-dim/25 bg-tertiary-container/20 p-sm">
+            <span class="mt-[1px] shrink-0 leading-tight text-tertiary-fixed-dim">⚠</span>
+            <p class="m-0 text-[11px] leading-tight text-on-tertiary-container">
               Only this repository's local Git config will be changed. Your global Git identity will not be modified.
             </p>
           </div>
@@ -458,12 +457,12 @@ function getHtml(
         <div class="custom-scrollbar flex max-h-[64vh] flex-col gap-md overflow-y-auto p-md">
           <div class="flex flex-col gap-md">
             <label class="flex flex-col gap-xs">
-              <span class="font-label-caps text-label-caps uppercase text-on-surface-variant">Full Name</span>
-              <input class="h-[28px] w-full rounded-md border border-outline-variant bg-surface-container-lowest px-3 py-1.5 text-body-base text-on-surface" id="editName" placeholder="Enter git name" type="text" value="\${esc(name)}" />
+              <span class="font-label-caps text-label-caps uppercase text-on-surface-variant">Name</span>
+              <input class="h-[28px] w-full rounded-md border border-outline-variant bg-surface-container-lowest px-3 py-1.5 text-body-base text-on-surface outline-none transition-colors focus:border-primary focus:outline focus:outline-1 focus:outline-primary" id="editName" placeholder="Enter git name" type="text" value="\${esc(name)}" />
             </label>
             <label class="flex flex-col gap-xs">
               <span class="font-label-caps text-label-caps uppercase text-on-surface-variant">Email Address</span>
-              <input class="h-[28px] w-full rounded-md border border-outline-variant bg-surface-container-lowest px-3 py-1.5 font-code-mono text-code-mono text-on-surface" id="editEmail" placeholder="name@example.com" type="email" value="\${esc(email)}" />
+              <input class="h-[28px] w-full rounded-md border border-outline-variant bg-surface-container-lowest px-3 py-1.5 font-code-mono text-code-mono text-on-surface outline-none transition-colors focus:border-primary focus:outline focus:outline-1 focus:outline-primary" id="editEmail" placeholder="name@example.com" type="email" value="\${esc(email)}" />
             </label>
             <p class="m-0 text-[11px] italic leading-[14px] text-on-surface-variant">
               Editing these values will set a custom local Git identity for this repository.
