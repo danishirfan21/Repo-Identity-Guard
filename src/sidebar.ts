@@ -212,9 +212,9 @@ function getHtml(
   <title>Repo ID</title>
 </head>
 <body class="custom-scrollbar flex flex-col overflow-y-auto">
-  <header class="flex h-[52px] w-full shrink-0 items-center justify-between border-b border-outline-variant bg-surface-container px-sidebar-padding">
+  <header class="flex h-[46px] w-full shrink-0 items-center justify-between border-b border-outline-variant bg-surface-container px-sidebar-padding">
     <div class="flex flex-col">
-      <span class="text-[18px] font-bold leading-tight text-on-surface">Repo ID</span>
+      <span class="text-[17px] font-bold leading-tight text-on-surface">Repo ID</span>
       <span class="text-[11px] leading-none text-on-surface-variant">Git identity safety</span>
     </div>
     <div class="flex gap-1">
@@ -293,14 +293,14 @@ function getHtml(
           : "";
 
       return \`
-        <div class="vs-card flex flex-col gap-xs rounded-lg p-md \${localCardClasses}">
-          <div class="mb-1.5 flex items-center justify-between">
-            <span class="font-label-caps text-[11px] uppercase tracking-wider \${variantClasses}">\${esc(label)}</span>
-            <span class="text-[18px] leading-none \${indicatorClasses}">\${esc(symbolForIndicator(indicatorKind))}</span>
+        <div class="vs-card flex flex-col gap-xs rounded-lg p-[10px] \${localCardClasses}">
+          <div class="mb-1 flex items-center justify-between">
+            <span class="font-label-caps text-[10px] uppercase tracking-wider \${variantClasses}">\${esc(label)}</span>
+            <span class="text-[16px] leading-none \${indicatorClasses}">\${esc(symbolForIndicator(indicatorKind))}</span>
           </div>
           <div>
-            <div class="break-words text-[16px] font-semibold text-on-surface \${missingClass}">\${esc(name)}</div>
-            <div class="mt-1 break-all font-code-mono text-[13px] text-on-surface-variant \${missingClass}">\${esc(email)}</div>
+            <div class="break-words text-[15px] font-semibold text-on-surface \${missingClass}">\${esc(name)}</div>
+            <div class="mt-0.5 break-all font-code-mono text-[12px] text-on-surface-variant \${missingClass}">\${esc(email)}</div>
           </div>
         </div>
       \`;
@@ -309,64 +309,64 @@ function getHtml(
     const localMissingClass = state.localIndicator === "warn" ? "italic opacity-90" : "";
 
     app.innerHTML = \`
-      <div class="flex items-start gap-md rounded-lg border border-tertiary-fixed-dim/30 bg-tertiary-container/20 p-md shadow-sm">
-        <span class="mt-0.5 text-[20px] leading-none text-tertiary-fixed-dim">\${esc(statusIcon)}</span>
-        <div class="flex min-w-0 flex-col gap-1">
-          <span class="text-[15px] font-semibold text-tertiary-fixed-dim">\${esc(state.statusLabel)}</span>
-          <p class="m-0 text-[13px] leading-[1.5] text-on-surface-variant">\${esc(state.statusMessage)}</p>
+      <div class="flex items-start gap-[10px] rounded-lg border border-tertiary-fixed-dim/30 bg-tertiary-container/20 p-[10px] shadow-sm">
+        <span class="mt-0.5 text-[18px] leading-none text-tertiary-fixed-dim">\${esc(statusIcon)}</span>
+        <div class="flex min-w-0 flex-col gap-0.5">
+          <span class="text-[14px] font-semibold text-tertiary-fixed-dim">\${esc(state.statusLabel)}</span>
+          <p class="m-0 text-[12px] leading-[1.45] text-on-surface-variant">\${esc(state.statusMessage)}</p>
         </div>
       </div>
 
-      <section class="flex flex-col gap-sm">
-        <span class="ml-1 font-label-caps text-label-caps uppercase text-on-surface-variant">Active Identities</span>
+      <section class="flex flex-col gap-2">
+        <span class="ml-1 font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Active Identities</span>
         \${identityCard("effective", "Effective Identity", state.effectiveName, state.effectiveEmail, state.effectiveIndicator)}
         \${identityCard("local", "Repo-Specific (Local)", state.localName, state.localEmail, state.localIndicator, localMissingClass)}
         \${identityCard("global", "Fallback Default (Global)", state.globalName, state.globalEmail, state.globalIndicator)}
       </section>
 
-      <button class="flex w-full flex-col items-center justify-center rounded-lg bg-primary px-4 py-4 text-on-primary shadow-lg transition-all hover:bg-[#0062a3] active:scale-[0.98] \${state.canSetLocal ? "" : "cursor-not-allowed opacity-55"}" data-action="showSetModal" \${state.canSetLocal ? "" : "disabled"}>
-        <span class="text-[16px] font-bold">\${esc(state.primaryAction)}</span>
-        <span class="mt-1 text-[12px] opacity-90">Write expected identity to this repo</span>
+      <button class="flex w-full flex-col items-center justify-center rounded-lg bg-primary px-4 py-2.5 text-on-primary shadow-lg transition-all hover:bg-[#0062a3] active:scale-[0.98] \${state.canSetLocal ? "" : "cursor-not-allowed opacity-55"}" data-action="showSetModal" \${state.canSetLocal ? "" : "disabled"}>
+        <span class="text-[14px] font-bold">\${esc(state.primaryAction)}</span>
+        <span class="mt-0.5 text-[11px] opacity-90">Write expected identity to this repo</span>
       </button>
 
-      <section class="vs-card flex flex-col gap-3 rounded-lg bg-surface-container-lowest/50 p-md">
-        <div class="flex items-start gap-3">
-          <span class="mt-0.5 text-[20px] text-on-surface-variant/70">☁</span>
+      <section class="vs-card flex flex-col gap-2 rounded-lg bg-surface-container-lowest/50 p-md">
+        <div class="flex items-start gap-2">
+          <span class="mt-0.5 text-[18px] text-on-surface-variant/70">☁</span>
           <div class="flex min-w-0 flex-col">
             <span class="font-label-caps text-[11px] uppercase tracking-wider text-on-surface-variant">Remote</span>
-            <span class="mt-0.5 break-all font-code-mono text-[13px] text-on-surface">\${esc(state.normalizedRemote)}</span>
+            <span class="mt-0.5 break-all font-code-mono text-[12px] text-on-surface">\${esc(state.normalizedRemote)}</span>
           </div>
         </div>
-        <div class="flex items-start gap-3">
-          <span class="mt-0.5 text-[20px] text-on-surface-variant/70">□</span>
+        <div class="flex items-start gap-2">
+          <span class="mt-0.5 text-[18px] text-on-surface-variant/70">□</span>
           <div class="flex min-w-0 flex-col">
             <span class="font-label-caps text-[11px] uppercase tracking-wider text-on-surface-variant">Repo root</span>
-            <span class="mt-0.5 break-all font-code-mono text-[13px] text-on-surface">\${esc(state.repoRoot)}</span>
+            <span class="mt-0.5 break-all font-code-mono text-[12px] text-on-surface">\${esc(state.repoRoot)}</span>
           </div>
         </div>
       </section>
 
-      <section class="vs-card flex flex-col gap-2 rounded-lg border-l-4 border-l-primary p-md">
-        <span class="mb-1 font-label-caps text-[11px] uppercase tracking-wider text-primary">Matched Rule: \${esc(state.ruleLabel)}</span>
+      <section class="vs-card flex flex-col gap-1.5 rounded-lg border-l-4 border-l-primary p-md">
+        <span class="mb-0.5 font-label-caps text-[10px] uppercase tracking-wider text-primary">Matched Rule: \${esc(state.ruleLabel)}</span>
         <div class="flex items-center gap-2 text-on-surface-variant">
-          <span class="text-[16px] leading-none">⌘</span>
-          <span class="break-all font-code-mono text-[13px]">\${esc(state.ruleMatch)}</span>
+          <span class="text-[14px] leading-none">⌘</span>
+          <span class="break-all font-code-mono text-[12px]">\${esc(state.ruleMatch)}</span>
         </div>
-        <div class="rounded border border-outline-variant/30 bg-surface-container p-3">
-          <span class="mb-1.5 block text-[11px] uppercase tracking-tight text-on-surface-variant">Expected Identity</span>
-          <span class="break-words text-[14px] font-semibold text-on-surface">
+        <div class="rounded border border-outline-variant/30 bg-surface-container p-2">
+          <span class="mb-1 block text-[10px] uppercase tracking-tight text-on-surface-variant">Expected Identity</span>
+          <span class="break-words text-[13px] font-semibold text-on-surface">
             \${esc(state.expectedName)}
             <span class="font-normal text-on-surface-variant">(\${esc(state.expectedEmail)})</span>
           </span>
         </div>
       </section>
 
-      <section class="mt-auto grid grid-cols-2 gap-3 border-t border-outline-variant/30 pt-4">
-        <button class="vs-button-secondary flex h-10 items-center justify-center gap-2 rounded px-3 text-[13px] transition-colors" data-action="addRule">+ Add Rule</button>
-        <button class="vs-button-secondary flex h-10 items-center justify-center gap-2 rounded px-3 text-[13px] transition-colors" data-action="copyReport">⧉ Copy Report</button>
-        <button class="vs-button-secondary flex h-10 items-center justify-center gap-2 rounded px-3 text-[13px] transition-colors" data-action="rescan">↻ Rescan</button>
-        <button class="vs-button-secondary flex h-10 items-center justify-center gap-2 rounded px-3 text-[13px] transition-colors" data-action="settings">⚙ Settings</button>
-        <button class="vs-button-secondary col-span-2 mt-1 flex h-10 items-center justify-center gap-2 rounded px-3 text-[13px] transition-colors" data-action="details">ⓘ View Full Details</button>
+      <section class="mt-auto grid grid-cols-2 gap-2 border-t border-outline-variant/30 pt-2.5">
+        <button class="vs-button-secondary flex h-8 items-center justify-center gap-1.5 rounded px-2 text-[12px] transition-colors" data-action="addRule">+ Add Rule</button>
+        <button class="vs-button-secondary flex h-8 items-center justify-center gap-1.5 rounded px-2 text-[12px] transition-colors" data-action="copyReport">⧉ Copy Report</button>
+        <button class="vs-button-secondary flex h-8 items-center justify-center gap-1.5 rounded px-2 text-[12px] transition-colors" data-action="rescan">↻ Rescan</button>
+        <button class="vs-button-secondary flex h-8 items-center justify-center gap-1.5 rounded px-2 text-[12px] transition-colors" data-action="settings">⚙ Settings</button>
+        <button class="vs-button-secondary col-span-2 mt-0.5 flex h-8 items-center justify-center gap-1.5 rounded px-2 text-[12px] transition-colors" data-action="details">ⓘ View Full Details</button>
       </section>
     \`;
 
