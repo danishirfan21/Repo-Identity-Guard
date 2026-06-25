@@ -52,19 +52,22 @@ let globalGitConfigWatchers: vscode.FileSystemWatcher[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
   const statusBar = new IdentityStatusBar();
-  const sidebarProvider = new RepoIdentitySidebarProvider({
-    showDetails: () => showDetailsQuickPick(latestEvaluation),
-    setLocalIdentity: () => setLocalIdentityFromRule(latestEvaluation, scan),
-    addRule: () => addRuleForCurrentRepo(latestEvaluation, scan),
-    copyReport: () => copyDiagnosticReport(latestEvaluation),
-    rescan: () => scan(),
-    openSettings: async () => {
-      await vscode.commands.executeCommand(
-        "workbench.action.openSettings",
-        "repoIdentityGuard.rules",
-      );
+  const sidebarProvider = new RepoIdentitySidebarProvider(
+    context.extensionUri,
+    {
+      showDetails: () => showDetailsQuickPick(latestEvaluation),
+      setLocalIdentity: () => setLocalIdentityFromRule(latestEvaluation, scan),
+      addRule: () => addRuleForCurrentRepo(latestEvaluation, scan),
+      copyReport: () => copyDiagnosticReport(latestEvaluation),
+      rescan: () => scan(),
+      openSettings: async () => {
+        await vscode.commands.executeCommand(
+          "workbench.action.openSettings",
+          "repoIdentityGuard.rules",
+        );
+      },
     },
-  });
+  );
   context.subscriptions.push(statusBar);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(

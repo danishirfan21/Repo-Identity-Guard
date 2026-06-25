@@ -20,8 +20,10 @@
   ],
   "main": "./out/extension.js",
   "scripts": {
-    "compile": "tsc -p ./",
+    "build:webview": "tailwindcss -i ./src/webview/sidebar.css -o ./media/sidebar.css --minify",
+    "compile": "npm run build:webview && tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "watch:webview": "tailwindcss -i ./src/webview/sidebar.css -o ./media/sidebar.css --watch",
     "test": "npm run compile && node --test out/test"
   },
   "contributes": {
@@ -115,6 +117,9 @@
   "devDependencies": {
     "@types/node": "^20.14.10",
     "@types/vscode": "^1.85.0",
+    "autoprefixer": "^10.5.2",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^3.4.19",
     "typescript": "^5.5.3"
   }
 }
