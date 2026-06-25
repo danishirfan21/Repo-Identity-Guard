@@ -1,13 +1,18 @@
 {
   "name": "repo-identity-guard",
   "displayName": "Repo ID",
-  "description": "Warn when a repository's Git identity does not match its remote.",
-  "version": "0.0.1",
+  "description": "Warn when Git would commit with the wrong author identity for the current repository.",
+  "version": "0.1.0",
   "publisher": "local",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danishirfan21/Repo-Identity-Guard.git"
+  },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": ">=1.85.0"
   },
   "categories": [
+    "SCM Providers",
     "Other"
   ],
   "activationEvents": [
@@ -20,39 +25,56 @@
     "test": "npm run compile && node --test out/test"
   },
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "repoIdentityGuard",
+          "title": "Repo ID",
+          "icon": "resources/repo-id.svg"
+        }
+      ]
+    },
+    "views": {
+      "repoIdentityGuard": [
+        {
+          "id": "repoIdentityGuard.statusView",
+          "name": "Status"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "repoIdentityGuard.scan",
-        "title": "Repo Identity Guard: Rescan"
+        "title": "Repo ID: Rescan"
       },
       {
         "command": "repoIdentityGuard.showStatus",
-        "title": "Repo Identity Guard: Show Status"
+        "title": "Repo ID: Show Status"
       },
       {
         "command": "repoIdentityGuard.fixIdentity",
-        "title": "Repo Identity Guard: Fix Local Git Identity"
+        "title": "Repo ID: Fix Local Git Identity"
       },
       {
         "command": "repoIdentityGuard.addRuleForCurrentRepo",
-        "title": "Repo Identity Guard: Add Rule for Current Repo"
+        "title": "Repo ID: Add Rule for Current Repo"
       },
       {
         "command": "repoIdentityGuard.copyDiagnosticReport",
-        "title": "Repo Identity Guard: Copy Diagnostic Report"
+        "title": "Repo ID: Copy Diagnostic Report"
       },
       {
         "command": "repoIdentityGuard.openSettings",
-        "title": "Repo Identity Guard: Open Settings"
+        "title": "Repo ID: Open Settings"
       }
     ],
     "configuration": {
-      "title": "Repo Identity Guard",
+      "title": "Repo ID",
       "properties": {
         "repoIdentityGuard.rules": {
           "type": "array",
           "default": [],
-          "description": "Identity rules matched against normalized Git origin remote URLs. The first matching rule wins.",
+          "description": "Git identity rules matched against normalized origin remote URLs. The first matching rule wins.",
           "items": {
             "type": "object",
             "required": [
@@ -64,19 +86,19 @@
             "properties": {
               "match": {
                 "type": "string",
-                "description": "Remote pattern, for example github.com/MyCompany/*."
+                "description": "Normalized remote pattern, for example github.com/MyCompany/* or github-work/MyCompany/*."
               },
               "label": {
                 "type": "string",
-                "description": "Short status bar label, for example Work."
+                "description": "Short status bar label for this identity, for example Work or Personal."
               },
               "name": {
                 "type": "string",
-                "description": "Expected local Git user.name."
+                "description": "Expected Git commit author name for matching repositories."
               },
               "email": {
                 "type": "string",
-                "description": "Expected local Git user.email."
+                "description": "Expected Git commit author email for matching repositories."
               }
             }
           }
@@ -84,7 +106,7 @@
         "repoIdentityGuard.requireLocalIdentity": {
           "type": "boolean",
           "default": false,
-          "description": "When enabled, a matched repo is only fully safe if the expected identity is set in local repo Git config, even when the effective identity currently matches."
+          "description": "Require matched repositories to set the expected identity in local Git config, even when the effective identity currently matches via global config."
         }
       }
     }

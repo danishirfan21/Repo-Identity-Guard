@@ -19,6 +19,7 @@ import {
   loadRules,
   normalizeRemoteUrl,
 } from "./rules";
+import { RepoIdentitySidebarProvider } from "./sidebar";
 import { IdentityStatusBar } from "./statusBar";
 import { CurrentIdentity, IdentityEvaluation } from "./types";
 
@@ -51,7 +52,14 @@ let globalGitConfigWatchers: vscode.FileSystemWatcher[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
   const statusBar = new IdentityStatusBar();
+  const sidebarProvider = new RepoIdentitySidebarProvider();
   context.subscriptions.push(statusBar);
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider(
+      "repoIdentityGuard.statusView",
+      sidebarProvider,
+    ),
+  );
 
   const scan = async (cwdOverride?: string): Promise<void> => {
     const sequence = ++scanSequence;
@@ -64,6 +72,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       latestEvaluation = evaluation;
       statusBar.update(evaluation);
+      sidebarProvider.update(evaluation);
       updateGitConfigWatcher(evaluation.current?.repoRoot, scan);
     } catch (error) {
       if (sequence !== scanSequence) {
@@ -76,6 +85,7 @@ export function activate(context: vscode.ExtensionContext): void {
         message: `Repo Identity Guard could not scan this repository: ${message}`,
       };
       statusBar.update(latestEvaluation);
+      sidebarProvider.update(latestEvaluation);
       updateGitConfigWatcher(undefined, scan);
     }
   };

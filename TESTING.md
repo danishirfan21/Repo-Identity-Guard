@@ -1,44 +1,150 @@
 # Manual testing
 
-1. Open a Git repository in the Extension Development Host.
-2. Add a `repoIdentityGuard.rules` setting that matches its origin remote.
-3. In that repository, set an intentionally wrong local email:
+Run the extension in an Extension Development Host with `F5`, then open a test
+Git repository.
+
+Useful commands:
+
+```powershell
+git remote get-url origin
+git config user.name
+git config user.email
+git config --local user.name
+git config --local user.email
+git config --global user.name
+git config --global user.email
+```
+
+## Scenario matrix
+
+| Scenario | Setup | Expected |
+| --- | --- | --- |
+| Safe personal repo | Rule matches personal remote; effective identity matches personal name/email. | Status shows `Repo ID: Personal` or configured label. |
+| Wrong personal repo | Rule matches personal remote; set local name/email to work or wrong values. | Status shows `Repo ID: Wrong`; **Fix** writes expected local identity. |
+| Safe company repo | Rule matches company remote; effective identity matches company name/email. | Status shows `Repo ID: Work` or configured label. |
+| Wrong company repo | Rule matches company remote; set local name/email to personal or wrong values. | Status shows `Repo ID: Wrong`; warning says you may commit with wrong author. |
+| Strict local identity: local needed | Enable `repoIdentityGuard.requireLocalIdentity`; unset local identity; make global/effective identity match the rule. | Status shows `Repo ID: Local Needed`; **Set Local** writes repo-local name/email. |
+| No rule | Remove matching rules or set `repoIdentityGuard.rules` to `[]`. | Status shows `Repo ID: Unknown`; click shows **Add Rule**, **Settings**, **Rescan**. |
+| No origin | Use a Git repo with no `origin` remote. | Status shows `Repo ID: Unknown`; details say the repo has no origin remote. |
+| SSH alias remote | Set origin like `git@github-work:AcmeSoftware/example-project.git`; add rule `github-work/AcmeSoftware/*`. | Rule matches normalized SSH alias remote. |
+
+## Detailed checks
+
+### Wrong identity fix
+
+1. Add a rule matching the repo remote.
+2. Set a wrong local identity:
 
    ```powershell
-   git config --local user.email personal@example.com
+   git config --local user.name "Wrong User"
+   git config --local user.email "wrong@example.com"
    ```
 
-4. Confirm the status bar shows `Repo ID: Wrong`.
-5. Click the status bar item.
-6. Choose **Fix local Git identity** and confirm the modal.
-7. Verify the repository-local value:
+3. Confirm status shows `Repo ID: Wrong`.
+4. Click the status item.
+5. Choose **Fix** or open **Details** and choose **Fix Local Git Identity**.
+6. Confirm the modal.
+7. Verify local config changed:
 
    ```powershell
+   git config --local user.name
    git config --local user.email
    ```
 
-8. Confirm the status bar now shows the rule label, such as `Repo ID: Work`.
+### Strict local identity
 
-Also check:
+1. Enable:
 
-- The status details show effective, local, and global identity values.
-- Clicking the status item shows a short notification. Choose **View Details**
-  to open the readable Quick Pick details view.
-- If local identity is unset but global identity matches the rule, the repo is
-  treated as safe because Git's effective identity matches.
-- Enable `repoIdentityGuard.requireLocalIdentity`, then unset local identity
-  while global identity still matches. Confirm the status shows
-  `Repo ID: Local Needed`, and **Set Local Identity** writes local config.
-- **Repo Identity Guard: Copy Diagnostic Report** copies repo root, raw and
-  normalized remote, status, matched rule, identity layers, expected identity,
-  and the strict-local setting.
-- Remove all `repoIdentityGuard.rules`, click the status item in a Git repo,
-  and confirm the starter actions are **Add Rule**, **Settings**, and
-  **Rescan**.
-- **Repo Identity Guard: Add Rule for Current Repo** appends a new rule to
-  `repoIdentityGuard.rules`.
-- A repo with no matching rule shows `Unknown`.
-- A repo with no `origin` shows `Unknown`.
-- A non-Git folder hides the status item.
-- Changing `repoIdentityGuard.rules` triggers a rescan.
-- Switching the active editor between repositories triggers a rescan.
+   ```json
+   "repoIdentityGuard.requireLocalIdentity": true
+   ```
+
+2. Make global/effective identity match the rule.
+3. Unset local identity:
+
+   ```powershell
+   git config --local --unset user.name
+   git config --local --unset user.email
+   ```
+
+4. Confirm status shows `Repo ID: Local Needed`.
+5. Choose **Set Local**.
+6. Confirm status returns to the safe label.
+
+### Details Quick Pick
+
+Click the status item, choose **Details**, and confirm rows are readable:
+
+- Status
+- Remote
+- Effective identity
+- Local identity
+- Global identity
+- Expected identity
+- Matched rule
+- Require local identity
+
+Action rows should include:
+
+- Fix Local Git Identity / Set Local Identity
+- Add Rule for Current Repo
+- Copy Diagnostic Report
+- Rescan
+- Open Settings
+
+### Activity Bar panel
+
+Confirm the left Activity Bar has a **Repo ID** icon. Open it and verify the
+native tree view shows:
+
+- Status
+- Matched rule, when available
+- Remote
+- Effective identity
+- Local identity
+- Global identity
+- quick actions for Details, Fix/Set Local, Add Rule, Copy Report, Rescan, and
+  Settings
+
+### Copy Diagnostic Report
+
+Run **Repo ID: Copy Diagnostic Report** from the command palette or choose it in
+the Details Quick Pick. Paste the clipboard contents and confirm it includes:
+
+- repo root
+- normalized remote
+- raw remote
+- status
+- matched rule label and pattern
+- effective name/email
+- local name/email
+- global name/email
+- expected name/email
+- `requireLocalIdentity`
+
+### Add Rule for Current Repo
+
+1. Empty `repoIdentityGuard.rules`.
+2. Click `Repo ID: Unknown`.
+3. Choose **Add Rule**.
+4. Accept or edit the prompted match, label, name, and email.
+5. Confirm the new rule appears in settings and the status rescans.
+
+### Refresh behavior
+
+Confirm status updates after:
+
+- changing `repoIdentityGuard.rules`;
+- changing `repoIdentityGuard.requireLocalIdentity`;
+- editing repo-local Git config with `git config --local`;
+- editing global Git config with `git config --global`;
+- switching the active editor between repositories.
+
+## Automated checks
+
+Run:
+
+```powershell
+npm run compile
+npm test
+```

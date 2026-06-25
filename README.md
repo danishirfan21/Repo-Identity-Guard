@@ -1,20 +1,63 @@
-# Repo Identity Guard
+# Repo ID
 
 Never commit to work with your personal Git identity again.
 
-Repo Identity Guard is a tiny VS Code-compatible safety check. It compares the
-current repository's effective Git `user.name` and `user.email` with a rule
-based on the repository's `origin` remote.
+Repo ID is a small VS Code/Antigravity extension that shows whether the
+repository you have open would commit with the Git identity you expect.
 
-It also shows where the identity is coming from:
+It is built for developers who use one machine for personal, company, and
+client work. In that setup it is easy to open the right repository while Git is
+quietly using the wrong `user.name` or `user.email`.
 
-- **Effective**: what Git will use for commits in this repo.
-- **Local**: values from this repo's `.git/config`.
-- **Global**: values from your user-level Git config.
+## The problem
 
-## Configure identity rules
+Git identity has several layers, and they are easy to mix up:
 
-Open VS Code settings JSON and add:
+- Git commit author: `git config user.name` and `git config user.email`
+- repo-local Git config: `.git/config`
+- global Git config: your user-level Git config
+- GitHub CLI account
+- SSH key or host alias
+- HTTPS credentials
+- IDE account/session
+
+The key insight: **switching GitHub CLI accounts does not change the Git commit
+author identity.** You can be logged into the right GitHub account and still
+create commits authored with the wrong name or email.
+
+Repo ID focuses only on the Git commit author identity for v0.1.
+
+## What Repo ID checks
+
+Repo ID compares the current repo's `origin` remote against your configured
+identity rules. If a rule matches, it checks whether Git would commit with the
+expected name and email.
+
+It shows three identity layers:
+
+- **Effective identity**: what Git will actually use for commits in this repo.
+- **Local identity**: values set in this repo's `.git/config`.
+- **Global identity**: values set in your user-level Git config.
+
+By default, safety is based on the effective identity because that is what Git
+will use if you commit right now.
+
+## Status bar states
+
+- `Repo ID: Personal` / `Repo ID: Work`: effective identity matches the rule.
+- `Repo ID: Wrong`: effective identity does not match the rule.
+- `Repo ID: Local Needed`: effective identity matches, but strict local identity
+  mode requires this repo to have local `user.name` and `user.email` set.
+- `Repo ID: Unknown`: no origin remote exists or no rule matched.
+
+Click the status item to open native VS Code actions. Repo ID also contributes a
+left Activity Bar view with the current status and quick actions. Use
+**Details** to see a readable Quick Pick with remote, effective/local/global
+identities, expected identity, matched rule, and strict-local mode.
+
+## Example configuration
+
+Add rules in Settings JSON:
 
 ```json
 {
@@ -30,51 +73,28 @@ Open VS Code settings JSON and add:
       "label": "Personal",
       "name": "Danish Irfan",
       "email": "personal@example.com"
+    },
+    {
+      "match": "github-work/AcmeSoftware/*",
+      "label": "Work SSH",
+      "name": "Danish Irfan",
+      "email": "work@example.com"
     }
   ]
 }
 ```
 
-Rules support `*` wildcards. Common HTTPS and SSH-style remotes are normalized,
-including SSH host aliases such as `github-work`.
+Rules support `*` wildcards. Repo ID normalizes common remote formats:
+
+- `https://github.com/org/repo.git` → `github.com/org/repo`
+- `git@github.com:org/repo.git` → `github.com/org/repo`
+- `git@github-work:org/repo.git` → `github-work/org/repo`
 
 The first matching rule wins.
 
-## Use it
-
-Open a Git repository and look at the left side of the status bar:
-
-- `Repo ID: Work` means the effective name and email match.
-- `Repo ID: Local Needed` means the effective identity matches, but strict
-  local identity mode wants this repo's local Git config pinned too.
-- `Repo ID: Wrong` means the effective identity differs from the matched rule.
-- `Repo ID: Unknown` means the repo has no origin or no rule matched.
-
-Click the status item to see the remote, current identity, expected identity,
-and available actions.
-
-Useful actions:
-
-- **Fix local Git identity** writes the expected rule identity into this repo.
-- **Add Rule for Current Repo** creates a settings rule from the current remote
-  and effective identity.
-- **Copy Diagnostic Report** copies a plain text report with repo, remote,
-  identity, matched rule, and strict-local setting details.
-- **Rescan** refreshes the status.
-
-The fix action writes only:
-
-```text
-git config --local user.name ...
-git config --local user.email ...
-```
-
-It never modifies global Git configuration.
-
 ## Strict local identity mode
 
-By default, Repo ID checks the effective Git identity because that is what Git
-will use for commits:
+By default:
 
 ```json
 {
@@ -82,8 +102,10 @@ will use for commits:
 }
 ```
 
-If you want every matched repo to have its own local `user.name` and
-`user.email`, enable:
+Repo ID checks the effective identity. This means a repo can be safe because Git
+falls back to your global config.
+
+If you want each matched repo to pin its own local identity, enable:
 
 ```json
 {
@@ -91,48 +113,82 @@ If you want every matched repo to have its own local `user.name` and
 }
 ```
 
-When enabled, a repo can show `Repo ID: Local Needed` even when the effective
-identity is currently correct. This means the repo is safe right now only
-because Git is falling back to another config layer. Choose **Set Local
-Identity** to write the expected name/email into this repo's local Git config.
+When enabled, Repo ID shows `Repo ID: Local Needed` if:
 
-## Add a rule from the current repo
+1. the effective identity matches the expected rule, but
+2. the repo-local `user.name` or `user.email` is missing or different.
 
-Run **Repo Identity Guard: Add Rule for Current Repo** from the command palette,
-or click the status bar item and choose **Add Rule for Current Repo**.
+This is a softer warning than `Wrong`. It means the repo is safe right now, but
+could become unsafe later if your global Git config changes.
 
-The command prompts for:
+Choose **Set Local** / **Set Local Identity** to write only repo-local config:
 
-1. remote match pattern,
-2. status bar label,
-3. expected Git name,
-4. expected Git email.
+```text
+git config --local user.name ...
+git config --local user.email ...
+```
 
-It appends the new rule to your user setting `repoIdentityGuard.rules`.
+Repo ID never modifies global Git config.
 
-## First run
+## Usage flow
 
-If no rules are configured yet and you open a Git repo, clicking the status bar
-focuses the starter actions:
+1. Open a Git repository.
+2. If no rules exist, click `Repo ID: Unknown` and choose **Add Rule**.
+3. Accept or edit the generated remote pattern, label, name, and email.
+4. Watch the status bar:
+   - safe label means Git would commit with the expected author;
+   - `Wrong` means fix before committing;
+   - `Local Needed` means strict local mode wants local config pinned.
+5. Use **Details** for a readable explanation.
+6. Use **Fix** / **Set Local** to write the expected identity to this repo only.
+7. Use **Copy Diagnostic Report** when you need to debug or share the state.
 
-- **Add Rule**
-- **Settings**
-- **Rescan**
+Repo ID rescans when rules change, workspace/editor context changes, repo-local
+`.git/config` changes, or global Git config changes.
+
+## Commands
+
+- **Repo ID: Rescan**
+- **Repo ID: Show Status**
+- **Repo ID: Fix Local Git Identity**
+- **Repo ID: Add Rule for Current Repo**
+- **Repo ID: Copy Diagnostic Report**
+- **Repo ID: Open Settings**
+
+## Activity Bar view
+
+Repo ID adds a native Activity Bar panel named **Repo ID**. The panel shows:
+
+- current status;
+- matched rule;
+- remote;
+- effective/local/global identities;
+- quick actions for details, fix/set local identity, add rule, copy report,
+  rescan, and settings.
 
 ## Run locally
 
 1. Run `npm install`.
 2. Run `npm run compile`.
-3. Open this project in VS Code.
-4. Press `F5` and choose **Run Repo Identity Guard** if prompted.
-5. In the Extension Development Host, open a Git repository and configure a
-   matching `repoIdentityGuard.rules` entry.
+3. Open this project in VS Code or Antigravity.
+4. Press `F5`.
+5. In the Extension Development Host, open a Git repository.
 
-See [TESTING.md](TESTING.md) for the manual MVP checklist.
+See [TESTING.md](TESTING.md) for the manual scenario matrix.
 
-## MVP limitations
+## Limitations in v0.1
 
-This version checks only the repository's Git commit author identity. It
-does not inspect or switch GitHub CLI accounts, SSH keys, HTTPS credentials, or
-IDE account sessions. It does not install hooks, change remotes, touch commits,
-push code, authenticate users, or provide a dashboard.
+Repo ID only checks Git commit author identity.
+
+It does not:
+
+- switch GitHub CLI accounts;
+- switch SSH keys;
+- inspect or change HTTPS credentials;
+- use Windows Credential Manager;
+- install Git hooks;
+- change remotes;
+- touch commits;
+- push code;
+- authenticate users;
+- provide a webview dashboard.
