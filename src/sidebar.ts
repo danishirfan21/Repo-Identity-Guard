@@ -212,9 +212,9 @@ function getHtml(
   <title>Repo ID</title>
 </head>
 <body class="custom-scrollbar flex flex-col overflow-y-auto">
-  <header class="flex h-[46px] w-full shrink-0 items-center justify-between border-b border-outline-variant bg-surface-container px-sidebar-padding">
+  <header class="flex h-[42px] w-full shrink-0 items-center justify-between border-b border-outline-variant bg-surface-container px-sidebar-padding">
     <div class="flex flex-col">
-      <span class="text-[17px] font-bold leading-tight text-on-surface">Repo ID</span>
+      <span class="text-[16px] font-bold leading-tight text-on-surface">Repo ID</span>
       <span class="text-[11px] leading-none text-on-surface-variant">Git identity safety</span>
     </div>
     <div class="flex gap-1">
@@ -293,13 +293,13 @@ function getHtml(
           : "";
 
       return \`
-        <div class="vs-card flex flex-col gap-xs rounded-lg p-[10px] \${localCardClasses}">
-          <div class="mb-1 flex items-center justify-between">
+        <div class="vs-card flex flex-col gap-xs rounded-lg p-2 \${localCardClasses}">
+          <div class="mb-0.5 flex items-center justify-between">
             <span class="font-label-caps text-[10px] uppercase tracking-wider \${variantClasses}">\${esc(label)}</span>
             <span class="text-[16px] leading-none \${indicatorClasses}">\${esc(symbolForIndicator(indicatorKind))}</span>
           </div>
           <div>
-            <div class="break-words text-[15px] font-semibold text-on-surface \${missingClass}">\${esc(name)}</div>
+            <div class="break-words text-[14px] font-semibold text-on-surface \${missingClass}">\${esc(name)}</div>
             <div class="mt-0.5 break-all font-code-mono text-[12px] text-on-surface-variant \${missingClass}">\${esc(email)}</div>
           </div>
         </div>
@@ -309,22 +309,22 @@ function getHtml(
     const localMissingClass = state.localIndicator === "warn" ? "italic opacity-90" : "";
 
     app.innerHTML = \`
-      <div class="flex items-start gap-[10px] rounded-lg border border-tertiary-fixed-dim/30 bg-tertiary-container/20 p-[10px] shadow-sm">
-        <span class="mt-0.5 text-[18px] leading-none text-tertiary-fixed-dim">\${esc(statusIcon)}</span>
+      <div class="flex items-start gap-2 rounded-lg border border-tertiary-fixed-dim/30 bg-tertiary-container/20 p-2.5 shadow-sm">
+        <span class="mt-0.5 text-[17px] leading-none text-tertiary-fixed-dim">\${esc(statusIcon)}</span>
         <div class="flex min-w-0 flex-col gap-0.5">
           <span class="text-[14px] font-semibold text-tertiary-fixed-dim">\${esc(state.statusLabel)}</span>
           <p class="m-0 text-[12px] leading-[1.45] text-on-surface-variant">\${esc(state.statusMessage)}</p>
         </div>
       </div>
 
-      <section class="flex flex-col gap-2">
+      <section class="flex flex-col gap-1.5">
         <span class="ml-1 font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Active Identities</span>
         \${identityCard("effective", "Effective Identity", state.effectiveName, state.effectiveEmail, state.effectiveIndicator)}
         \${identityCard("local", "Repo-Specific (Local)", state.localName, state.localEmail, state.localIndicator, localMissingClass)}
         \${identityCard("global", "Fallback Default (Global)", state.globalName, state.globalEmail, state.globalIndicator)}
       </section>
 
-      <button class="flex w-full flex-col items-center justify-center rounded-lg bg-primary px-4 py-2.5 text-on-primary shadow-lg transition-all hover:bg-[#0062a3] active:scale-[0.98] \${state.canSetLocal ? "" : "cursor-not-allowed opacity-55"}" data-action="showSetModal" \${state.canSetLocal ? "" : "disabled"}>
+      <button class="flex w-full flex-col items-center justify-center rounded-lg bg-primary px-4 py-2 text-on-primary shadow-lg transition-all hover:bg-[#0062a3] active:scale-[0.98] \${state.canSetLocal ? "" : "cursor-not-allowed opacity-55"}" data-action="showSetModal" \${state.canSetLocal ? "" : "disabled"}>
         <span class="text-[14px] font-bold">\${esc(state.primaryAction)}</span>
         <span class="mt-0.5 text-[11px] opacity-90">Write expected identity to this repo</span>
       </button>
@@ -347,7 +347,7 @@ function getHtml(
       </section>
 
       <section class="vs-card flex flex-col gap-1.5 rounded-lg border-l-4 border-l-primary p-md">
-        <span class="mb-0.5 font-label-caps text-[10px] uppercase tracking-wider text-primary">Matched Rule: \${esc(state.ruleLabel)}</span>
+        <span class="mb-0.5 truncate font-label-caps text-[10px] uppercase tracking-wider text-primary" title="Rule: \${esc(state.ruleLabel)}">Rule: \${esc(state.ruleLabel)}</span>
         <div class="flex items-center gap-2 text-on-surface-variant">
           <span class="text-[14px] leading-none">⌘</span>
           <span class="break-all font-code-mono text-[12px]">\${esc(state.ruleMatch)}</span>

@@ -58,13 +58,13 @@ module.exports = {
         full: "9999px",
       },
       spacing: {
-        "sidebar-padding": "10px",
-        lg: "10px",
+        "sidebar-padding": "9px",
+        lg: "9px",
         sm: "8px",
         unit: "4px",
         xs: "4px",
         gutter: "10px",
-        md: "9px",
+        md: "8px",
       },
       fontFamily: {
         "label-caps": ["var(--vscode-font-family)"],
