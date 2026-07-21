@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
-import { IdentityEvaluation, IdentityState } from "./types";
+import { toWebviewState } from "./sidebarState";
+import { IdentityEvaluation } from "./types";
 
 export interface RepoIdentitySidebarActions {
   showDetails(): Promise<void>;
@@ -93,124 +94,6 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
   }
 }
 
-function toWebviewState(evaluation: IdentityEvaluation | undefined) {
-  const current = evaluation?.current;
-  const rule = evaluation?.rule;
-
-  const localName = current?.localName ?? null;
-  const localEmail = current?.localEmail ?? null;
-  const localMissing = !localName || !localEmail;
-
-  const effectiveIndicator = indicatorForEffective(evaluation);
-  const localIndicator = indicatorForLocal(evaluation);
-  const globalIndicator = indicatorForGlobal(evaluation);
-
-  return {
-    state: evaluation?.state ?? "unknown",
-    statusLabel: evaluation ? statusLabel(evaluation.state) : "Not Scanned",
-    statusMessage: evaluation
-      ? statusMessage(evaluation)
-      : "Repo ID has not scanned this workspace yet.",
-
-    normalizedRemote: evaluation?.normalizedRemote ?? "Not set",
-    rawRemote: current?.remoteUrl ?? "Not set",
-    repoRoot: current?.repoRoot ?? "Not in a Git repo",
-
-    ruleLabel: rule?.label ?? "No matched rule",
-    ruleMatch: rule?.match ?? "None",
-    expectedName: rule?.name ?? "Not set",
-    expectedEmail: rule?.email ?? "Not set",
-
-    effectiveName: current?.effectiveName ?? "Not set",
-    effectiveEmail: current?.effectiveEmail ?? "Not set",
-
-    localName: localMissing ? "Not pinned" : localName,
-    localEmail: localMissing ? "Not set locally. Using global Git config" : localEmail,
-
-    globalName: current?.globalName ?? "Not set",
-    globalEmail: current?.globalEmail ?? "Not set",
-
-    effectiveIndicator,
-    localIndicator,
-    globalIndicator,
-
-    primaryAction:
-      evaluation?.state === "localNeeded"
-        ? "Set Local Identity"
-        : "Fix Local Identity",
-
-    canSetLocal: !!current && !!rule,
-  };
-}
-
-function statusLabel(state: IdentityState): string {
-  switch (state) {
-    case "safe":
-      return "Safe";
-    case "wrong":
-      return "Wrong Identity";
-    case "localNeeded":
-      return "Local Needed";
-    case "unknown":
-      return "Unknown";
-    case "notGitRepo":
-      return "Not a Git Repo";
-    case "error":
-      return "Error";
-  }
-}
-
-function statusMessage(evaluation: IdentityEvaluation): string {
-  switch (evaluation.state) {
-    case "safe":
-      return "Git will commit with the expected identity for this repo.";
-    case "wrong":
-      return "Git would commit with an identity that does not match this repo's rule.";
-    case "localNeeded":
-      return "Effective identity matches, but this repo is not pinned locally. If global Git config changes, this repo may become unsafe.";
-    case "unknown":
-      return "No matching identity rule was found for this repo.";
-    default:
-      return evaluation.message;
-  }
-}
-
-function indicatorForEffective(evaluation: IdentityEvaluation | undefined): string {
-  if (!evaluation?.rule || !evaluation.current) {
-    return "neutral";
-  }
-
-  return evaluation.state === "wrong" ? "bad" : "good";
-}
-
-function indicatorForLocal(evaluation: IdentityEvaluation | undefined): string {
-  if (!evaluation?.rule || !evaluation.current) {
-    return "neutral";
-  }
-
-  const nameMatches =
-    evaluation.current.localName?.trim() === evaluation.rule.name.trim();
-  const emailMatches =
-    evaluation.current.localEmail?.trim().toLocaleLowerCase() ===
-    evaluation.rule.email.trim().toLocaleLowerCase();
-
-  return nameMatches && emailMatches ? "good" : "warn";
-}
-
-function indicatorForGlobal(evaluation: IdentityEvaluation | undefined): string {
-  if (!evaluation?.rule || !evaluation.current) {
-    return "neutral";
-  }
-
-  const nameMatches =
-    evaluation.current.globalName?.trim() === evaluation.rule.name.trim();
-  const emailMatches =
-    evaluation.current.globalEmail?.trim().toLocaleLowerCase() ===
-    evaluation.rule.email.trim().toLocaleLowerCase();
-
-  return nameMatches && emailMatches ? "good" : "warn";
-}
-
 function getHtml(
   nonce: string,
   encodedState: string,
@@ -230,7 +113,7 @@ function getHtml(
   <header class="flex h-[42px] w-full shrink-0 items-center justify-between border-b border-outline-variant bg-surface-container px-sidebar-padding">
     <div class="flex flex-col">
       <span class="text-[16px] font-bold leading-tight text-on-surface">Repo ID</span>
-      <span class="text-[11px] leading-none text-on-surface-variant">Git identity safety</span>
+      <span class="text-[11px] leading-none text-on-surface-variant">Git Commit Identity</span>
     </div>
     <div class="flex gap-1">
       <button class="rounded p-1.5 text-on-surface-variant transition-colors hover:bg-secondary-container hover:text-on-surface" data-action="rescan" title="Rescan">↻</button>
@@ -323,10 +206,12 @@ function getHtml(
         \${identityCard("global", "Fallback Default (Global)", state.globalName, state.globalEmail, state.globalIndicator)}
       </section>
 
-      <button class="flex w-full flex-col items-center justify-center rounded-lg bg-primary px-4 py-2 text-on-primary shadow-lg transition-all hover:bg-[#0062a3] active:scale-[0.98] \${state.canSetLocal ? "" : "cursor-not-allowed opacity-55"}" data-action="showSetModal" \${state.canSetLocal ? "" : "disabled"}>
-        <span class="text-[14px] font-bold">\${esc(state.primaryAction)}</span>
-        <span class="mt-0.5 text-[11px] opacity-90">Write expected identity to this repo</span>
-      </button>
+      \${state.primaryAction ? \`
+        <button class="flex w-full flex-col items-center justify-center rounded-lg bg-primary px-4 py-2 text-on-primary shadow-lg transition-all hover:bg-[#0062a3] active:scale-[0.98]" data-action="\${state.primaryAction === "Add Rule" ? "addRule" : "showSetModal"}">
+          <span class="text-[14px] font-bold">\${esc(state.primaryAction)}</span>
+          <span class="mt-0.5 text-[11px] opacity-90">\${state.primaryAction === "Add Rule" ? "Create an identity rule for this repo" : "Write expected identity to this repo"}</span>
+        </button>
+      \` : ""}
 
       <section class="vs-card flex flex-col gap-2 rounded-lg bg-surface-container-lowest/50 p-md">
         <div class="flex items-start gap-2">
@@ -358,6 +243,13 @@ function getHtml(
             <span class="font-normal text-on-surface-variant">(\${esc(state.expectedEmail)})</span>
           </span>
         </div>
+      </section>
+
+      <section class="vs-card rounded-lg bg-surface-container-low/30 p-2">
+        <span class="mb-1 block font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Scope</span>
+        <p class="m-0 text-[11px] leading-tight text-on-surface-variant">
+          Repo ID verifies Git commit identity only. Repository access depends on your GitHub authentication, SSH keys, or stored credentials.
+        </p>
       </section>
 
       <section class="mt-auto grid grid-cols-2 gap-2 border-t border-outline-variant/30 pt-2.5">

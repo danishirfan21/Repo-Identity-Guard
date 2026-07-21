@@ -1,64 +1,104 @@
 # Repo ID
 
-Never commit to work with your personal Git identity again.
+Never commit with the wrong Git author identity.
 
-Repo ID is a small VS Code/Antigravity extension that shows whether the
-repository you have open would commit with the Git identity you expect.
+Repo ID is a VS Code / Google Antigravity extension that helps you avoid
+committing to a repository with the wrong Git author identity.
 
-It is built for developers who use one machine for personal, company, and
-client work. In that setup it is easy to open the right repository while Git is
-quietly using the wrong `user.name` or `user.email`.
+It checks the repository remote, evaluates the Git identity that would actually
+be used for a commit, and gives you a clear Safe / Wrong / Local Needed /
+Unknown signal in the status bar and Activity Bar sidebar.
 
-## The problem
+> Product philosophy: global Git identity is a fallback. Local Git identity is
+> safety.
 
-Git identity has several layers, and they are easy to mix up:
+## Why this matters
 
-- Git commit author: `git config user.name` and `git config user.email`
-- repo-local Git config: `.git/config`
-- global Git config: your user-level Git config
-- GitHub CLI account
-- SSH key or host alias
-- HTTPS credentials
-- IDE account/session
+Developers often use one machine for personal, company, and client work. Git
+does not automatically know which identity belongs to each repository.
 
-The key insight: **switching GitHub CLI accounts does not change the Git commit
-author identity.** You can be logged into the right GitHub account and still
-create commits authored with the wrong name or email.
+It is easy to be in the correct GitHub account, open the correct repository,
+and still create commits authored with the wrong `user.name` or `user.email`.
 
-Repo ID focuses only on the Git commit author identity for v0.1.
+The important distinction:
 
-## What Repo ID checks
+- Switching GitHub CLI accounts does not necessarily change Git commit author
+  identity.
+- Switching SSH keys does not necessarily change Git commit author identity.
+- Changing IDE account/session does not necessarily change Git commit author
+  identity.
 
-Repo ID compares the current repo's `origin` remote against your configured
-identity rules. If a rule matches, it checks whether Git would commit with the
-expected name and email.
+Repo ID focuses on the commit author identity Git will use locally.
 
-It shows three identity layers:
+```text
+Repo ID checks:
+  Git commit author
+  user.name / user.email
+  checked
 
-- **Effective identity**: what Git will actually use for commits in this repo.
-- **Local identity**: values set in this repo's `.git/config`.
-- **Global identity**: values set in your user-level Git config.
+Repo ID does not check:
+  Repository access
+  GitHub CLI / SSH / credentials
+  not checked
+```
 
-By default, safety is based on the effective identity because that is what Git
-will use if you commit right now.
+## What Repo ID shows
 
-## Status bar states
+Repo ID displays three Git identity layers:
 
-- `Repo ID: Personal` / `Repo ID: Work`: effective identity matches the rule.
-- `Repo ID: Wrong`: effective identity does not match the rule.
-- `Repo ID: Local Needed`: effective identity matches, but strict local identity
-  mode requires this repo to have local `user.name` and `user.email` set.
-- `Repo ID: Unknown`: no origin remote exists or no rule matched.
+- **Effective identity**: what Git will use if you commit in this repo now.
+- **Repo-specific local identity**: `user.name` and `user.email` stored in this
+  repo's `.git/config`.
+- **Global fallback identity**: user-level Git config used when the repo has no
+  local identity.
 
-Click the status item to open native VS Code actions. Repo ID also contributes a
-compact Activity Bar webview with cards for the current status, repository,
-matched rule, identities, and quick actions. Use **Details** to see a readable
-Quick Pick with remote, effective/local/global identities, expected identity,
-matched rule, and strict-local mode.
+For v0.1, Repo ID never edits global Git config. It only writes repo-local Git
+identity when you explicitly choose to set or fix it.
 
-## Example configuration
+## States
 
-Add rules in Settings JSON:
+- **Safe**: Git commits will use the expected author identity for this repo.
+  This does not verify repository access, pull, push, or authentication.
+- **Wrong Identity**: Git would commit with a name or email that does not match
+  the repo's rule.
+- **Local Needed**: the effective identity currently matches, but strict local
+  mode requires this repo to pin the expected identity locally.
+- **Unknown**: no matching rule was found, no origin remote exists, or the repo
+  cannot be evaluated yet.
+- **Not a Git Repo**: the current folder is not inside a Git repository.
+- **Error**: Repo ID could not complete the scan.
+
+## Sidebar and modal
+
+Repo ID adds a compact Activity Bar panel named **Repo ID**. The sidebar shows:
+
+- current safety state;
+- effective, local, and global identities;
+- repository remote/path;
+- matched rule;
+- actions for setting identity, adding rules, copying diagnostics, rescanning,
+  opening settings, and viewing details.
+
+When you choose **Set Local Identity** or **Fix Local Git Identity**, Repo ID
+opens an in-sidebar confirmation modal. You can:
+
+- set the matched rule identity exactly;
+- edit name/email before saving a custom repo-local identity;
+- reset the edit form back to the matched rule identity;
+- cancel without changing anything.
+
+All identity writes use:
+
+```text
+git config --local user.name ...
+git config --local user.email ...
+```
+
+## Rules
+
+Rules match normalized `origin` remotes. The first matching rule wins.
+
+Example Settings JSON:
 
 ```json
 {
@@ -85,17 +125,15 @@ Add rules in Settings JSON:
 }
 ```
 
-Rules support `*` wildcards. Repo ID normalizes common remote formats:
+Repo ID supports `*` wildcards and normalizes common remote formats:
 
-- `https://github.com/org/repo.git` → `github.com/org/repo`
-- `git@github.com:org/repo.git` → `github.com/org/repo`
-- `git@github-work:org/repo.git` → `github-work/org/repo`
-
-The first matching rule wins.
+- `https://github.com/org/repo.git` -> `github.com/org/repo`
+- `git@github.com:org/repo.git` -> `github.com/org/repo`
+- `git@github-work:org/repo.git` -> `github-work/org/repo`
 
 ## Strict local identity mode
 
-By default:
+By default, Repo ID evaluates the effective identity:
 
 ```json
 {
@@ -103,10 +141,10 @@ By default:
 }
 ```
 
-Repo ID checks the effective identity. This means a repo can be safe because Git
-falls back to your global config.
+That means a repo can be considered Safe because Git falls back to your global
+identity.
 
-If you want each matched repo to pin its own local identity, enable:
+If you want matched repositories to pin their own local identity, enable:
 
 ```json
 {
@@ -114,38 +152,13 @@ If you want each matched repo to pin its own local identity, enable:
 }
 ```
 
-When enabled, Repo ID shows `Repo ID: Local Needed` if:
+With strict local identity enabled, Repo ID shows **Local Needed** when:
 
-1. the effective identity matches the expected rule, but
-2. the repo-local `user.name` or `user.email` is missing or different.
+1. the effective identity matches the rule, but
+2. repo-local `user.name` or `user.email` is missing or different.
 
-This is a softer warning than `Wrong`. It means the repo is safe right now, but
-could become unsafe later if your global Git config changes.
-
-Choose **Set Local** / **Set Local Identity** to write only repo-local config:
-
-```text
-git config --local user.name ...
-git config --local user.email ...
-```
-
-Repo ID never modifies global Git config.
-
-## Usage flow
-
-1. Open a Git repository.
-2. If no rules exist, click `Repo ID: Unknown` and choose **Add Rule**.
-3. Accept or edit the generated remote pattern, label, name, and email.
-4. Watch the status bar:
-   - safe label means Git would commit with the expected author;
-   - `Wrong` means fix before committing;
-   - `Local Needed` means strict local mode wants local config pinned.
-5. Use **Details** for a readable explanation.
-6. Use **Fix** / **Set Local** to write the expected identity to this repo only.
-7. Use **Copy Diagnostic Report** when you need to debug or share the state.
-
-Repo ID rescans when rules change, workspace/editor context changes, repo-local
-`.git/config` changes, or global Git config changes.
+This is intentionally softer than **Wrong Identity**. The repo is safe right
+now, but it could become unsafe later if global Git config changes.
 
 ## Commands
 
@@ -156,41 +169,64 @@ Repo ID rescans when rules change, workspace/editor context changes, repo-local
 - **Repo ID: Copy Diagnostic Report**
 - **Repo ID: Open Settings**
 
-## Activity Bar view
+## Screenshots
 
-Repo ID adds a compact Activity Bar panel named **Repo ID**. The panel shows:
+Screenshots are not included yet for v0.1 packaging. Suggested screenshots:
 
-- a status card;
-- repository card;
-- matched rule card;
-- effective/local/global identity card;
-- action buttons for details, fix/set local identity, add rule, copy report,
-  rescan, and settings;
-- an in-sidebar confirmation modal before writing local Git identity.
+- status sidebar showing Local Needed;
+- Set Local Identity confirmation modal;
+- Edit Local Identity modal;
+- Wrong Identity state with action buttons.
 
 ## Run locally
 
-1. Run `npm install`.
-2. Run `npm run compile`.
-3. Open this project in VS Code or Antigravity.
-4. Press `F5`.
-5. In the Extension Development Host, open a Git repository.
+```powershell
+npm install
+npm run compile
+```
+
+Then open this folder in VS Code or Antigravity and press `F5` to launch the
+Extension Development Host.
 
 See [TESTING.md](TESTING.md) for the manual scenario matrix.
+
+## Package locally
+
+```powershell
+npx @vscode/vsce package
+```
+
+The packaged VSIX includes the compiled webview CSS at `media/sidebar.css`.
 
 ## Limitations in v0.1
 
 Repo ID only checks Git commit author identity.
 
-It does not:
+It does not switch or manage:
 
 - switch GitHub CLI accounts;
-- switch SSH keys;
-- inspect or change HTTPS credentials;
-- use Windows Credential Manager;
+- GitHub HTTPS credentials or tokens;
+- SSH keys;
+- Git Credential Manager entries;
+- repository permissions;
+- pull/push authentication;
 - install Git hooks;
 - change remotes;
-- touch commits;
-- push code;
+- rewrite commits;
 - authenticate users;
+- edit global Git identity;
 - provide a large dashboard.
+
+If `git pull` or `git push` fails with "Repository not found", your commit
+author identity may be correct, but your GitHub authentication may be using the
+wrong account or credentials.
+
+Authentication systems outside Repo ID v0.1 scope include:
+
+- GitHub CLI;
+- SSH keys;
+- HTTPS credentials;
+- Git Credential Manager.
+
+Repo ID intentionally does not run account switching or credential commands in
+v0.1.

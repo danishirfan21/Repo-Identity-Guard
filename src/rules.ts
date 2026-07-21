@@ -131,7 +131,7 @@ export function evaluateIdentity(
         normalizedRemote,
         requireLocalIdentity: options.requireLocalIdentity,
         message:
-          "Effective Git identity matches, but this repo does not have the expected local Git identity set. If global Git config changes later, this repo may become unsafe.",
+          "Commits are using the expected author identity now, but this repo is not pinned locally. If global Git config changes, future commits may use the wrong author.",
       };
     }
 
@@ -152,6 +152,6 @@ export function evaluateIdentity(
     normalizedRemote,
     requireLocalIdentity: options.requireLocalIdentity,
     message:
-      "Wrong Git identity for this repo. You may commit with the wrong author.",
+      "Git commits would use an author identity that does not match this repo's rule.",
   };
 }

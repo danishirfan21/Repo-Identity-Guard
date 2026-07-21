@@ -28,6 +28,22 @@ git config --global user.email
 | No origin | Use a Git repo with no `origin` remote. | Status shows `Repo ID: Unknown`; details say the repo has no origin remote. |
 | SSH alias remote | Set origin like `git@github-work:AcmeSoftware/example-project.git`; add rule `github-work/AcmeSoftware/*`. | Rule matches normalized SSH alias remote. |
 
+## Safe-state release checks
+
+When the effective identity and repo-local identity both match the rule:
+
+- the sidebar status message should say commits will use the expected author
+  identity;
+- the large primary fix/set identity button should not appear;
+- global identity mismatch should be shown as neutral fallback context, not a
+  warning;
+- **Copy Report**, **Rescan**, **Settings**, and **View Full Details** should
+  remain available.
+
+Remember: Repo ID does not verify pull/push access. If `git pull` or `git push`
+fails with "Repository not found", check GitHub authentication, SSH keys, HTTPS
+credentials, or Git Credential Manager outside Repo ID.
+
 ## Detailed checks
 
 ### Wrong identity fix

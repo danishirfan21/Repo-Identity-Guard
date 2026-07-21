@@ -6,6 +6,7 @@ import {
   matchRule,
   normalizeRemoteUrl,
 } from "../rules";
+import { toWebviewState } from "../sidebarState";
 import { CurrentIdentity, IdentityRule } from "../types";
 
 const workRule: IdentityRule = {
@@ -149,4 +150,55 @@ test("evaluates unmatched remotes as unknown", () => {
   });
 
   assert.equal(evaluateIdentity(current, [workRule]).state, "unknown");
+});
+
+test("safe webview state does not expose a fix identity primary action when local identity is pinned", () => {
+  const evaluation = evaluateIdentity(
+    currentIdentity({
+      globalName: "Wrong Global",
+      globalEmail: "wrong@example.com",
+    }),
+    [workRule],
+  );
+
+  const state = toWebviewState(evaluation);
+
+  assert.equal(evaluation.state, "safe");
+  assert.equal(state.primaryAction, null);
+  assert.equal(state.canSetLocal, false);
+});
+
+test("global mismatch is neutral fallback context when local identity is pinned and effective identity is safe", () => {
+  const evaluation = evaluateIdentity(
+    currentIdentity({
+      globalName: "Wrong Global",
+      globalEmail: "wrong@example.com",
+    }),
+    [workRule],
+  );
+
+  const state = toWebviewState(evaluation);
+
+  assert.equal(state.globalIndicator, "neutral");
+  assert.match(state.globalEmail, /Fallback only/);
+});
+
+test("local needed webview state still exposes set local identity when local identity is missing", () => {
+  const evaluation = evaluateIdentity(
+    currentIdentity({
+      localName: null,
+      localEmail: null,
+      globalName: "Danish Irfan",
+      globalEmail: "work@example.com",
+    }),
+    [workRule],
+    { requireLocalIdentity: true },
+  );
+
+  const state = toWebviewState(evaluation);
+
+  assert.equal(evaluation.state, "localNeeded");
+  assert.equal(state.primaryAction, "Set Local Identity");
+  assert.equal(state.canSetLocal, true);
+  assert.equal(state.localIndicator, "warn");
 });
