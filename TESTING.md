@@ -1,9 +1,9 @@
 # Manual testing
 
 Run the extension in an Extension Development Host with `F5`, then open a test
-Git repository.
+Git repository. Open the **Repo Identity Guard** icon in the Activity Bar.
 
-Useful commands:
+Useful read-only commands to set up scenarios:
 
 ```powershell
 git remote get-url origin
@@ -13,26 +13,32 @@ git config --local user.name
 git config --local user.email
 git config --global user.name
 git config --global user.email
+git branch --show-current
 ```
 
 ## Scenario matrix
 
 | Scenario | Setup | Expected |
 | --- | --- | --- |
-| Safe personal repo | Rule matches personal remote; effective identity matches personal name/email. | Status shows `Repo ID: Personal` or configured label. |
-| Wrong personal repo | Rule matches personal remote; set local name/email to work or wrong values. | Status shows `Repo ID: Wrong`; **Fix** writes expected local identity. |
-| Safe company repo | Rule matches company remote; effective identity matches company name/email. | Status shows `Repo ID: Work` or configured label. |
-| Wrong company repo | Rule matches company remote; set local name/email to personal or wrong values. | Status shows `Repo ID: Wrong`; warning says you may commit with wrong author. |
-| Strict local identity: local needed | Enable `repoIdentityGuard.requireLocalIdentity`; unset local identity; make global/effective identity match the rule. | Status shows `Repo ID: Local Needed`; **Set Local** writes repo-local name/email. |
-| No rule | Remove matching rules or set `repoIdentityGuard.rules` to `[]`. | Status shows `Repo ID: Unknown`; click shows **Add Rule**, **Settings**, **Rescan**. |
-| No origin | Use a Git repo with no `origin` remote. | Status shows `Repo ID: Unknown`; details say the repo has no origin remote. |
-| SSH alias remote | Set origin like `git@github-work:AcmeSoftware/example-project.git`; add rule `github-work/AcmeSoftware/*`. | Rule matches normalized SSH alias remote. |
+| Safe repo | Profile matches remote owner; effective identity, protocol, and branch all match. | Main view shows 🟢 SAFE. |
+| Wrong commit identity | Profile matches; set local/global identity to a different name/email. | 🔴 NOT SAFE; "Wrong commit identity" in Review Details; **Fix Commit Identity** repairs it. |
+| Unknown profile | No profile's `expectedRemoteOwners` matches this repo's remote owner. | 🔴 NOT SAFE; "Repo profile is unknown"; Review Details offers **Add Profile for This Repo**. |
+| HTTPS push, relaxed profile | `strictPushSetup: false`, origin is `https://github.com/...`. | Still SAFE overall; "Push setup is not verified" appears as a non-blocking warning. |
+| HTTPS push, strict profile | `strictPushSetup: true`, origin is `https://github.com/...`. | 🔴 NOT SAFE; "Push setup is not verified" is blocking. |
+| Generic SSH host, strict profile | `strictPushSetup: true`, origin like `git@github.com:org/repo.git`. | 🔴 NOT SAFE; "Repo is not locked to `<Profile>` identity". |
+| SSH host alias | Origin like `git@github-work:AcmeSoftware/repo.git`. | No push-setup issue (treated as a locked, dedicated host). |
+| Protected branch | Check out `main` or `master`. | 🔴 NOT SAFE; "Working directly on main". |
+| Detached HEAD | `git checkout <commit-sha>`. | 🔴 NOT SAFE; "Working in detached HEAD". |
+| Branch pattern mismatch | Profile has `expectedBranchPatterns: ["feature/*"]`; check out `chore/x`. | Non-blocking "Branch does not match repo rules" warning. |
+| Strict local identity | Enable `repoIdentityGuard.requireLocalIdentity`; unset local identity while global/effective still matches. | Non-blocking "Repo is not locked to `<Profile>` identity" (commit identity). |
+| Non-Git folder | Open a plain folder with no `.git`. | ⚪ NOT CHECKED. |
+| No pinned memory | Repo Memory has no pinned note. | Info-only "No pinned repo memory" (never blocks SAFE). |
 
 ## Detailed checks
 
-### Wrong identity fix
+### Fix Commit Identity
 
-1. Add a rule matching the repo remote.
+1. Add a profile matching the repo's remote owner.
 2. Set a wrong local identity:
 
    ```powershell
@@ -40,104 +46,75 @@ git config --global user.email
    git config --local user.email "wrong@example.com"
    ```
 
-3. Confirm status shows `Repo ID: Wrong`.
-4. Click the status item.
-5. Choose **Fix** or open **Details** and choose **Fix Local Git Identity**.
-6. Confirm the modal.
-7. Verify local config changed:
+3. Confirm Main view shows 🔴 NOT SAFE with "Wrong commit identity" as the
+   next fix.
+4. Click **Fix Setup** (or **Fix Commit Identity** in Review Details).
+5. Confirm the modal, then verify:
 
    ```powershell
    git config --local user.name
    git config --local user.email
    ```
 
-### Strict local identity
+   match the profile, and that global config was left untouched.
 
-1. Enable:
+### Review Details
 
-   ```json
-   "repoIdentityGuard.requireLocalIdentity": true
-   ```
+Open **Review Details** and confirm each issue shows, in plain English:
 
-2. Make global/effective identity match the rule.
-3. Unset local identity:
+- Title
+- Why it matters
+- What we expected / what we found
+- A suggested action button
+- An expandable **Technical Details** section with raw Git facts only
 
-   ```powershell
-   git config --local --unset user.name
-   git config --local --unset user.email
-   ```
+### Repo Memory
 
-4. Confirm status shows `Repo ID: Local Needed`.
-5. Choose **Set Local**.
-6. Confirm status returns to the safe label.
+1. Add a note, pin it, confirm it shows as the Main view's pinned memory
+   preview.
+2. Add a second note; confirm pinning it un-pins the first (only one pinned
+   note at a time).
+3. Add a saved command (e.g. label "Start dev server", command `pnpm dev`).
+4. Click **Run** — confirm it opens a visible integrated terminal and runs
+   the command (never silently).
+5. Click **Copy** — confirm the command text is on the clipboard.
+6. Remove a note and a command; confirm they disappear.
+7. Confirm notes/commands are **not** written into any file inside the repo
+   (check `git status` stays clean).
 
-### Details Quick Pick
+### Copy Context for AI
 
-Click the status item, choose **Details**, and confirm rows are readable:
+Click **Copy Context for AI** from the Main view, paste the clipboard
+contents, and confirm it includes:
 
-- Status
-- Remote
-- Effective identity
-- Local identity
-- Global identity
-- Expected identity
-- Matched rule
-- Require local identity
+- Repo name, matched profile, status, branch
+- The open (non-info) issues
+- Pinned memory notes
+- A fixed "Rules for AI" section (no push, don't touch main/master, ask
+  before switching branches, don't change identity/remote/SSH/credentials)
 
-Action rows should include:
+Confirm it does **not** include secrets, tokens, `.env` values, SSH key
+contents, or raw Git config.
 
-- Fix Local Git Identity / Set Local Identity
-- Add Rule for Current Repo
-- Copy Diagnostic Report
-- Rescan
-- Open Settings
+### Settings
 
-### Activity Bar panel
-
-Confirm the left Activity Bar has a **Repo ID** icon. Open it and verify the
-card-based sidebar shows:
-
-- Status card
-- Repository card
-- Matched Rule card
-- Identity card with Effective, Local, and Global sections
-- Actions card with Details, Fix/Set Local, Add Rule, Copy Report, Rescan, and
-  Settings
-- custom confirmation modal for Fix/Set Local Identity
-
-### Copy Diagnostic Report
-
-Run **Repo ID: Copy Diagnostic Report** from the command palette or choose it in
-the Details Quick Pick. Paste the clipboard contents and confirm it includes:
-
-- repo root
-- normalized remote
-- raw remote
-- status
-- matched rule label and pattern
-- effective name/email
-- local name/email
-- global name/email
-- expected name/email
-- `requireLocalIdentity`
-
-### Add Rule for Current Repo
-
-1. Empty `repoIdentityGuard.rules`.
-2. Click `Repo ID: Unknown`.
-3. Choose **Add Rule**.
-4. Accept or edit the prompted match, label, name, and email.
-5. Confirm the new rule appears in settings and the status rescans.
+1. Open the Settings view. Add a profile with label, Git name/email,
+   expected remote owners, expected branch patterns, and strict push setup.
+2. Confirm it's saved to `repoIdentityGuard.profiles` in `settings.json`.
+3. Edit protected branches; confirm it updates
+   `repoIdentityGuard.protectedBranches`.
+4. Toggle "Require identity to be locked locally" and "Shield Mode"; confirm
+   both persist and trigger a rescan.
 
 ### Refresh behavior
 
 Confirm status updates after:
 
-- changing `repoIdentityGuard.rules`;
-- changing `repoIdentityGuard.requireLocalIdentity`;
+- changing profiles, protected branches, or preferences in Settings;
 - editing repo-local Git config with `git config --local`;
 - editing global Git config with `git config --global`;
-- switching the active editor between repositories.
+- switching the active editor between repositories;
+- pinning/unpinning a Repo Memory note.
 
 ## Automated checks
 

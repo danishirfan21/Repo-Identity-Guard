@@ -1,52 +1,31 @@
 import * as vscode from "vscode";
-import { IdentityEvaluation } from "./types";
+import { StatusSummary } from "./types";
 
 export class IdentityStatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
 
   public constructor() {
-    this.item = vscode.window.createStatusBarItem(
-      vscode.StatusBarAlignment.Left,
-      100,
-    );
+    this.item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     this.item.command = "repoIdentityGuard.showStatus";
     this.item.name = "Repo Identity Guard";
   }
 
-  public update(evaluation: IdentityEvaluation): void {
+  public update(summary: StatusSummary): void {
     this.item.backgroundColor = undefined;
 
-    switch (evaluation.state) {
-      case "safe":
-        this.item.text = `$(shield) Repo ID: ${evaluation.rule?.label ?? "Safe"}`;
-        break;
-      case "localNeeded":
-        this.item.text = "$(warning) Repo ID: Local Needed";
-        this.item.backgroundColor = new vscode.ThemeColor(
-          "statusBarItem.warningBackground",
-        );
-        break;
-      case "wrong":
-        this.item.text = "$(warning) Repo ID: Wrong";
-        this.item.backgroundColor = new vscode.ThemeColor(
-          "statusBarItem.warningBackground",
-        );
-        break;
-      case "unknown":
-        this.item.text = "$(question) Repo ID: Unknown";
-        break;
-      case "error":
-        this.item.text = "$(error) Repo ID: Error";
-        this.item.backgroundColor = new vscode.ThemeColor(
-          "statusBarItem.errorBackground",
-        );
-        break;
-      case "notGitRepo":
-        this.item.hide();
-        return;
+    if (summary.level === "not_checked") {
+      this.item.hide();
+      return;
     }
 
-    this.item.tooltip = buildTooltip(evaluation);
+    if (summary.level === "safe") {
+      this.item.text = `$(shield) Safe${summary.matchedProfile ? ` (${summary.matchedProfile.label})` : ""}`;
+    } else {
+      this.item.text = "$(warning) Not Safe";
+      this.item.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+    }
+
+    this.item.tooltip = buildTooltip(summary);
     this.item.show();
   }
 
@@ -55,27 +34,18 @@ export class IdentityStatusBar implements vscode.Disposable {
   }
 }
 
-function buildTooltip(evaluation: IdentityEvaluation): vscode.MarkdownString {
-  const lines = [`**Repo Identity Guard**`, "", evaluation.message];
-  const { current, rule } = evaluation;
+function buildTooltip(summary: StatusSummary): vscode.MarkdownString {
+  const lines = [
+    "**Repo Identity Guard**",
+    "",
+    summary.level === "safe" ? "Safe to work, commit, and push." : "Not safe — see Review Details.",
+    `Repo: \`${summary.repoName ?? "Unknown"}\``,
+    `Profile: \`${summary.matchedProfile?.label ?? "Unknown"}\``,
+  ];
 
-  if (current) {
-    lines.push(
-      "",
-      `Remote: \`${current.remoteUrl ?? "Not configured"}\``,
-      `Effective: \`${current.effectiveName ?? "Not set"} <${current.effectiveEmail ?? "not set"}>\``,
-      `Local: \`${current.localName ?? "Not set"} <${current.localEmail ?? "not set"}>\``,
-      `Global: \`${current.globalName ?? "Not set"} <${current.globalEmail ?? "not set"}>\``,
-    );
+  for (const issue of summary.issues.filter((issue) => issue.severity === "blocking")) {
+    lines.push(`- ${issue.title}`);
   }
-
-  if (rule) {
-    lines.push(`Expected: \`${rule.name} <${rule.email}>\``);
-  }
-
-  lines.push(
-    `Require local identity: \`${evaluation.requireLocalIdentity ? "Enabled" : "Disabled"}\``,
-  );
 
   return new vscode.MarkdownString(lines.join("\n"));
 }

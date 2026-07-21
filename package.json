@@ -1,8 +1,8 @@
 {
   "name": "repo-identity-guard",
-  "displayName": "Repo ID",
-  "description": "Warn when Git would commit with the wrong author identity for the current repository.",
-  "version": "0.1.0",
+  "displayName": "Repo Identity Guard",
+  "description": "Know instantly whether it's safe to work, commit, push, or let an AI agent run commands in this repo.",
+  "version": "0.2.0",
   "publisher": "local",
   "repository": {
     "type": "git",
@@ -24,14 +24,14 @@
     "compile": "npm run build:webview && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "watch:webview": "tailwindcss -i ./src/webview/sidebar.css -o ./media/sidebar.css --watch",
-    "test": "npm run compile && node --test out/test"
+    "test": "npm run compile && node --test out/test/*.test.js"
   },
   "contributes": {
     "viewsContainers": {
       "activitybar": [
         {
           "id": "repoIdentityGuard",
-          "title": "Repo ID",
+          "title": "Repo Identity Guard",
           "icon": "resources/repo-id.svg"
         }
       ]
@@ -48,68 +48,92 @@
     "commands": [
       {
         "command": "repoIdentityGuard.scan",
-        "title": "Repo ID: Rescan"
+        "title": "Repo Identity Guard: Rescan"
       },
       {
         "command": "repoIdentityGuard.showStatus",
-        "title": "Repo ID: Show Status"
+        "title": "Repo Identity Guard: Show Status"
       },
       {
         "command": "repoIdentityGuard.fixIdentity",
-        "title": "Repo ID: Fix Local Git Identity"
+        "title": "Repo Identity Guard: Fix Commit Identity"
       },
       {
         "command": "repoIdentityGuard.addRuleForCurrentRepo",
-        "title": "Repo ID: Add Rule for Current Repo"
+        "title": "Repo Identity Guard: Add Profile for Current Repo"
       },
       {
         "command": "repoIdentityGuard.copyDiagnosticReport",
-        "title": "Repo ID: Copy Diagnostic Report"
+        "title": "Repo Identity Guard: Copy Context for AI"
       },
       {
         "command": "repoIdentityGuard.openSettings",
-        "title": "Repo ID: Open Settings"
+        "title": "Repo Identity Guard: Open Settings"
       }
     ],
     "configuration": {
-      "title": "Repo ID",
+      "title": "Repo Identity Guard",
       "properties": {
-        "repoIdentityGuard.rules": {
+        "repoIdentityGuard.profiles": {
           "type": "array",
           "default": [],
-          "description": "Git identity rules matched against normalized origin remote URLs. The first matching rule wins.",
+          "description": "Profiles (e.g. Work, Personal) matched against a repo's remote owner to determine the expected identity and rules.",
           "items": {
             "type": "object",
             "required": [
-              "match",
+              "id",
               "label",
-              "name",
-              "email"
+              "gitEmail"
             ],
             "properties": {
-              "match": {
+              "id": {
                 "type": "string",
-                "description": "Normalized remote pattern, for example github.com/MyCompany/* or github-work/MyCompany/*."
+                "description": "Stable unique identifier for this profile."
               },
               "label": {
                 "type": "string",
-                "description": "Short status bar label for this identity, for example Work or Personal."
+                "description": "Short display label, for example Work or Personal."
               },
-              "name": {
+              "gitName": {
                 "type": "string",
                 "description": "Expected Git commit author name for matching repositories."
               },
-              "email": {
+              "gitEmail": {
                 "type": "string",
                 "description": "Expected Git commit author email for matching repositories."
+              },
+              "expectedRemoteOwners": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "GitHub owners/orgs (wildcards allowed) whose repos should match this profile."
+              },
+              "expectedBranchPatterns": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Wildcard branch name patterns considered normal for this profile, e.g. feature/*."
+              },
+              "strictPushSetup": {
+                "type": "boolean",
+                "description": "When true, HTTPS remotes and generic SSH hosts are treated as Not Safe until locked to this profile."
               }
             }
           }
+        },
+        "repoIdentityGuard.protectedBranches": {
+          "type": "array",
+          "default": ["main", "master"],
+          "items": { "type": "string" },
+          "description": "Branch names that should never be committed to directly."
         },
         "repoIdentityGuard.requireLocalIdentity": {
           "type": "boolean",
           "default": false,
           "description": "Require matched repositories to set the expected identity in local Git config, even when the effective identity currently matches via global config."
+        },
+        "repoIdentityGuard.agentGuardEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Shield Mode (coming later): opt-in local Git hooks that block unsafe commits/pushes. Currently a preference placeholder only — no hooks are installed."
         }
       }
     }
