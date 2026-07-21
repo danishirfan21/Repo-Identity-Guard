@@ -34,6 +34,11 @@ git branch --show-current
 | Non-Git folder | Open a plain folder with no `.git`. | ⚪ NOT CHECKED. |
 | No pinned memory | Repo Memory has no pinned note. | Info-only "No pinned repo memory" (never blocks SAFE). |
 
+Remember: Repo Identity Guard does not verify pull/push access. If
+`git pull` or `git push` fails with "Repository not found", check GitHub
+authentication, SSH keys, HTTPS credentials, or your Git credential manager
+outside Repo Identity Guard.
+
 ## Detailed checks
 
 ### Fix Commit Identity
