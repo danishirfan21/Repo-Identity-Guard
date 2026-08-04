@@ -2,15 +2,6 @@ export type SafetyLevel = "safe" | "not_safe" | "not_checked";
 
 export type RemoteProtocol = "ssh" | "https" | "unknown";
 
-export type IssueCategory =
-  | "commit_identity"
-  | "push_setup"
-  | "branch_safety"
-  | "agent_guard"
-  | "repo_memory";
-
-export type IssueSeverity = "blocking" | "warning" | "info";
-
 export type InProgressOperation = "merge" | "rebase" | "cherry-pick" | "revert";
 
 export interface RepoFacts {
@@ -79,20 +70,6 @@ export interface Profile {
   strictPushSetup?: boolean;
 }
 
-export interface Issue {
-  id: string;
-  category: IssueCategory;
-  severity: IssueSeverity;
-  title: string;
-  message: string;
-  whyItMatters?: string;
-  whatWeExpected?: string;
-  whatWeFound?: string;
-  suggestedAction?: string;
-  suggestedActionCommand?: SuggestedActionCommand;
-  technicalDetails?: Record<string, unknown>;
-}
-
 export type SuggestedActionCommand =
   | "fixCommitIdentity"
   | "makePushSetupSafer"
@@ -103,13 +80,88 @@ export type SuggestedActionCommand =
   | "enableWorkspaceTrust"
   | "resolveProfileConflict";
 
+/**
+ * Epistemic status of a safety check, independent of whether it blocks
+ * overall safety — see {@link CapabilityResult.blocksOverallSafety}. E.g. an
+ * unverified push account blocks SAFE only when a profile requires strict
+ * push setup; a plain dirty working tree never blocks at all.
+ */
+export type CheckState = "confirmed" | "contradicted" | "unverified" | "warning" | "not_applicable";
+
+/**
+ * The six safety questions Repo Identity Guard evaluates every scan. Each
+ * capability produces exactly one {@link CapabilityResult} per scan — never
+ * zero, never more than one — so Review Details can always show a complete
+ * checklist, not just a list of problems.
+ */
+export type Capability =
+  | "commit_identity"
+  | "push_destination"
+  | "push_account"
+  | "branch_policy"
+  | "repo_operation_state"
+  | "workspace_trust";
+
+/**
+ * A restriction an AI agent should follow, derived from a specific
+ * capability finding (e.g. an in-progress rebase implies `no-branch-switch`
+ * and `no-commit`). Distinct from the fixed baseline rules (never push,
+ * never touch Git/SSH/credential config) that apply regardless of findings.
+ */
+export type AgentRestrictionId =
+  | "no-commit"
+  | "no-branch-switch"
+  | "ask-before-branch-change"
+  | "preserve-changes"
+  | "no-agent-operation"
+  | "no-push"
+  | "no-identity-change";
+
+export interface AgentRestriction {
+  id: AgentRestrictionId;
+  description: string;
+}
+
+export interface CapabilityResult {
+  id: string;
+  capability: Capability;
+  state: CheckState;
+  title: string;
+  summary: string;
+  whyItMatters?: string;
+  whatWeExpected?: string;
+  whatWeFound?: string;
+  technicalDetails?: Record<string, unknown>;
+  /** Whether this specific result should flip overall status to NOT SAFE. Not derivable from `state` alone. */
+  blocksOverallSafety: boolean;
+  /** Restrictions an AI agent should follow as a direct consequence of this finding. */
+  agentRestrictions?: AgentRestriction[];
+  suggestedAction?: string;
+  suggestedActionCommand?: SuggestedActionCommand;
+}
+
+/**
+ * Non-safety information shown alongside capability results — context data
+ * (Repo Memory) or feature-availability metadata (Shield Mode's "coming
+ * soon" state), not a safety verdict. Never affects `blocksOverallSafety`.
+ */
+export interface InfoNote {
+  id: string;
+  category: "repo_memory" | "agent_guard_meta";
+  title: string;
+  message: string;
+  suggestedAction?: string;
+  suggestedActionCommand?: SuggestedActionCommand;
+}
+
 export interface StatusSummary {
   level: SafetyLevel;
   repoName?: string;
   matchedProfile?: Profile;
-  issues: Issue[];
+  capabilityResults: CapabilityResult[];
+  infoNotes: InfoNote[];
   issueCount: number;
-  nextFix?: Issue;
+  nextFix?: CapabilityResult;
   pinnedMemoryPreview?: string;
   facts: RepoFacts;
 }

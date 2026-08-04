@@ -1,12 +1,37 @@
-import { RepoMemory, StatusSummary } from "../types";
+import { AgentRestriction, CapabilityResult, RepoMemory, StatusSummary } from "../types";
 
-const AI_RULES = [
-  "Do not run git push.",
-  "Do not modify main/master.",
-  "Ask before changing branch.",
-  "Preserve existing uncommitted changes — do not reset, stash, or discard them.",
-  "Do not change Git identity, remotes, SSH config, or credential settings.",
+/** Fixed baseline rules that apply regardless of any specific finding this scan — never derived. */
+const BASELINE_RESTRICTIONS: AgentRestriction[] = [
+  { id: "no-push", description: "Do not run `git push`." },
+  { id: "no-identity-change", description: "Do not change Git identity, remotes, SSH config, or credential settings." },
 ];
+
+export interface SourcedText {
+  sourceId: string;
+  text: string;
+}
+
+export interface SourcedRestriction {
+  restriction: AgentRestriction;
+  sourceCapabilityIds: string[];
+}
+
+export interface AiContextModel {
+  checkedAt: Date;
+  repoName?: string;
+  profileLabel?: string;
+  status: StatusSummary["level"];
+  branch?: string;
+  confirmedFacts: SourcedText[];
+  contradictions: SourcedText[];
+  unverifiedFacts: SourcedText[];
+  warnings: SourcedText[];
+  /** Deduplicated agent restrictions derived from this scan's findings, each keeping track of which capability produced it. */
+  derivedRestrictions: SourcedRestriction[];
+  baselineRestrictions: AgentRestriction[];
+  pinnedMemoryIncluded: boolean;
+  pinnedMemoryText?: string;
+}
 
 export interface AiContextOptions {
   /**
@@ -20,45 +45,114 @@ export interface AiContextOptions {
 }
 
 /**
- * Builds a text block for pasting into an AI agent's context. Fields are an
- * explicit allowlist — repo name, matched profile, status, branch, issue
- * titles, and (only when opted in) pinned memory text — never raw remote
- * URLs, tokens, secrets, `.env` values, SSH key contents, or raw Git config.
- * Call sites should let the user preview this exact text before it's used.
+ * Builds the structured model Copy Context for AI is rendered from — the
+ * same `CapabilityResult` objects that drive Review Details, translated
+ * into an operational format for an agent. `not_applicable` results are
+ * omitted entirely (nothing to report). Every `blocksOverallSafety` result
+ * is guaranteed to appear here, either as a contradiction/unverified/
+ * warning entry or via a derived restriction — see the invariant test.
  */
-export function buildAiContext(
+export function buildAiContextModel(
   summary: StatusSummary,
   memory: RepoMemory,
   options: AiContextOptions,
-): string {
-  const lines: string[] = ["[REPO CONTEXT]"];
-  const checkedAt = options.now ?? new Date();
+): AiContextModel {
+  const confirmedFacts: SourcedText[] = [];
+  const contradictions: SourcedText[] = [];
+  const unverifiedFacts: SourcedText[] = [];
+  const warnings: SourcedText[] = [];
+  const restrictionsById = new Map<string, SourcedRestriction>();
 
-  lines.push(`Checked: ${checkedAt.toLocaleString()}`);
-  lines.push(`Repo: ${summary.repoName ?? "Unknown"}`);
-  lines.push(`Profile: ${summary.matchedProfile?.label ?? "Unknown"}`);
-  lines.push(`Status: ${statusLabel(summary.level)}`);
-  if (summary.facts.currentBranch) {
-    lines.push(`Branch: ${summary.facts.currentBranch}`);
-  }
+  for (const result of summary.capabilityResults) {
+    const entry: SourcedText = { sourceId: result.id, text: result.title };
+    switch (result.state) {
+      case "confirmed":
+        confirmedFacts.push(entry);
+        break;
+      case "contradicted":
+        contradictions.push(entry);
+        break;
+      case "unverified":
+        unverifiedFacts.push(entry);
+        break;
+      case "warning":
+        warnings.push(entry);
+        break;
+      case "not_applicable":
+        break;
+    }
 
-  const blockingAndWarningIssues = summary.issues.filter(
-    (issue) => issue.severity !== "info",
-  );
-  if (blockingAndWarningIssues.length > 0) {
-    lines.push("", "Issues:");
-    for (const issue of blockingAndWarningIssues) {
-      lines.push(`- ${issue.title}`);
+    for (const restriction of result.agentRestrictions ?? []) {
+      const existing = restrictionsById.get(restriction.id);
+      if (existing) {
+        if (!existing.sourceCapabilityIds.includes(result.id)) {
+          existing.sourceCapabilityIds.push(result.id);
+        }
+      } else {
+        restrictionsById.set(restriction.id, { restriction, sourceCapabilityIds: [result.id] });
+      }
     }
   }
 
   const pinnedNotes = memory.notes.filter((note) => note.pinned);
-  if (options.includeMemory && pinnedNotes.length > 0) {
+  const pinnedMemoryIncluded = options.includeMemory && pinnedNotes.length > 0;
+
+  return {
+    checkedAt: options.now ?? new Date(),
+    repoName: summary.repoName,
+    profileLabel: summary.matchedProfile?.label,
+    status: summary.level,
+    branch: summary.facts.currentBranch,
+    confirmedFacts,
+    contradictions,
+    unverifiedFacts,
+    warnings,
+    derivedRestrictions: Array.from(restrictionsById.values()),
+    baselineRestrictions: BASELINE_RESTRICTIONS,
+    pinnedMemoryIncluded,
+    pinnedMemoryText: pinnedMemoryIncluded ? pinnedNotes.map((note) => note.text).join(" / ") : undefined,
+  };
+}
+
+/**
+ * Renders the model to the text block that's actually copied/previewed.
+ * Fields are an explicit allowlist — repo name, matched profile, status,
+ * branch, capability titles, and (only when opted in) pinned memory text —
+ * never raw remote URLs, tokens, secrets, `.env` values, SSH key contents,
+ * or raw Git config.
+ */
+export function renderAiContext(model: AiContextModel): string {
+  const lines: string[] = ["[REPO CONTEXT]"];
+
+  lines.push(`Checked: ${model.checkedAt.toLocaleString()}`);
+  lines.push(`Repo: ${model.repoName ?? "Unknown"}`);
+  lines.push(`Profile: ${model.profileLabel ?? "Unknown"}`);
+  lines.push(`Status: ${statusLabel(model.status)}`);
+  if (model.branch) {
+    lines.push(`Branch: ${model.branch}`);
+  }
+
+  if (model.contradictions.length > 0) {
+    lines.push("", "Contradictions:");
+    for (const item of model.contradictions) lines.push(`- ${item.text}`);
+  }
+  if (model.unverifiedFacts.length > 0) {
+    lines.push("", "Unverified facts:");
+    for (const item of model.unverifiedFacts) lines.push(`- ${item.text}`);
+  }
+  if (model.warnings.length > 0) {
+    lines.push("", "Warnings:");
+    for (const item of model.warnings) lines.push(`- ${item.text}`);
+  }
+  if (model.confirmedFacts.length > 0) {
+    lines.push("", "Confirmed facts:");
+    for (const item of model.confirmedFacts) lines.push(`- ${item.text}`);
+  }
+
+  if (model.pinnedMemoryIncluded && model.pinnedMemoryText) {
     lines.push("", "User-approved pinned notes:");
-    for (const note of pinnedNotes) {
-      lines.push(`- ${note.text}`);
-    }
-  } else if (pinnedNotes.length > 0) {
+    lines.push(`- ${model.pinnedMemoryText}`);
+  } else if (!model.pinnedMemoryIncluded) {
     lines.push(
       "",
       "(Pinned memory omitted — enable \"Include Repo Memory in AI context\" in Settings to include it. Notes are free text you wrote and may contain sensitive info.)",
@@ -66,11 +160,22 @@ export function buildAiContext(
   }
 
   lines.push("", "Rules for AI:");
-  for (const rule of AI_RULES) {
-    lines.push(`- ${rule}`);
+  for (const restriction of model.baselineRestrictions) {
+    lines.push(`- ${restriction.description}`);
+  }
+  for (const sourced of model.derivedRestrictions) {
+    lines.push(`- ${sourced.restriction.description}`);
   }
 
   return lines.join("\n");
+}
+
+export function buildAiContext(
+  summary: StatusSummary,
+  memory: RepoMemory,
+  options: AiContextOptions,
+): string {
+  return renderAiContext(buildAiContextModel(summary, memory, options));
 }
 
 function statusLabel(level: StatusSummary["level"]): string {
@@ -82,4 +187,15 @@ function statusLabel(level: StatusSummary["level"]): string {
     case "not_checked":
       return "NOT CHECKED";
   }
+}
+
+/** Exported for the invariant test: every capability result that blocks overall safety must be representable in the AI context. */
+export function isCapabilityRepresentedInModel(result: CapabilityResult, model: AiContextModel): boolean {
+  const inTextSection = [...model.contradictions, ...model.unverifiedFacts, ...model.warnings].some(
+    (entry) => entry.sourceId === result.id,
+  );
+  const inRestrictions = model.derivedRestrictions.some((sourced) =>
+    sourced.sourceCapabilityIds.includes(result.id),
+  );
+  return inTextSection || inRestrictions;
 }

@@ -43,8 +43,8 @@ function buildTooltip(summary: StatusSummary): vscode.MarkdownString {
     `Profile: \`${summary.matchedProfile?.label ?? "Unknown"}\``,
   ];
 
-  for (const issue of summary.issues.filter((issue) => issue.severity === "blocking")) {
-    lines.push(`- ${issue.title}`);
+  for (const result of summary.capabilityResults.filter((result) => result.blocksOverallSafety)) {
+    lines.push(`- ${result.title}`);
   }
 
   return new vscode.MarkdownString(lines.join("\n"));

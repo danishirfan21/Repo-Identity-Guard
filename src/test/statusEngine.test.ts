@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { computeStatus } from "../core/statusEngine";
-import { Profile, RepoFacts, SafetyPreferences } from "../types";
+import { Capability, Profile, RepoFacts, SafetyPreferences } from "../types";
 
 const workProfile: Profile = {
   id: "work",
@@ -17,6 +17,15 @@ const defaultPreferences: SafetyPreferences = {
   requireLocalIdentity: false,
   includeMemoryInAiContext: false,
 };
+
+const ALL_CAPABILITIES: Capability[] = [
+  "commit_identity",
+  "push_destination",
+  "push_account",
+  "branch_policy",
+  "repo_operation_state",
+  "workspace_trust",
+];
 
 function safeFacts(overrides: Partial<RepoFacts> = {}): RepoFacts {
   return {
@@ -63,7 +72,7 @@ function run(
   });
 }
 
-test("non-Git folders are NOT CHECKED, never SAFE or NOT SAFE", () => {
+test("non-Git folders are NOT CHECKED, never SAFE or NOT SAFE, with no capability results", () => {
   const summary = computeStatus({
     facts: { isGitRepo: false },
     profiles: [workProfile],
@@ -71,21 +80,35 @@ test("non-Git folders are NOT CHECKED, never SAFE or NOT SAFE", () => {
     preferences: defaultPreferences,
   });
   assert.equal(summary.level, "not_checked");
-  assert.equal(summary.issues.length, 0);
+  assert.equal(summary.capabilityResults.length, 0);
+  assert.equal(summary.infoNotes.length, 0);
 });
 
-test("a fully matching repo is SAFE", () => {
+test("a Git repo always produces exactly one result per capability, every scan", () => {
+  const summary = run(safeFacts());
+  assert.equal(summary.capabilityResults.length, ALL_CAPABILITIES.length);
+  const capabilities = summary.capabilityResults.map((r) => r.capability).sort();
+  assert.deepEqual(capabilities, [...ALL_CAPABILITIES].sort());
+});
+
+test("a fully matching repo is SAFE, with every capability confirmed", () => {
   const summary = run(safeFacts());
   assert.equal(summary.level, "safe");
   assert.equal(summary.matchedProfile?.id, "work");
+  for (const result of summary.capabilityResults) {
+    assert.equal(result.state, "confirmed", `expected ${result.capability} to be confirmed, got ${result.state}`);
+    assert.equal(result.blocksOverallSafety, false);
+  }
 });
 
-test("wrong effective author identity is NOT SAFE", () => {
+test("wrong effective author identity is NOT SAFE and contradicted", () => {
   const summary = run(safeFacts({ effectiveGitEmail: "personal@example.com" }));
   assert.equal(summary.level, "not_safe");
-  const issue = summary.issues.find((i) => i.title === "Wrong commit identity");
-  assert.ok(issue);
-  assert.match(issue!.whatWeFound ?? "", /Author:/);
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Wrong commit identity");
+  assert.equal(result?.state, "contradicted");
+  assert.equal(result?.blocksOverallSafety, true);
+  assert.match(result?.whatWeFound ?? "", /Author:/);
 });
 
 test("wrong effective committer identity (author matches) is NOT SAFE", () => {
@@ -93,16 +116,33 @@ test("wrong effective committer identity (author matches) is NOT SAFE", () => {
     safeFacts({ effectiveCommitterName: "Someone Else", effectiveCommitterEmail: "someone@example.com" }),
   );
   assert.equal(summary.level, "not_safe");
-  const issue = summary.issues.find((i) => i.title === "Wrong commit identity");
-  assert.ok(issue);
-  assert.match(issue!.whatWeFound ?? "", /Committer:/);
-  assert.doesNotMatch(issue!.whatWeFound ?? "", /Author:/);
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Wrong commit identity");
+  assert.match(result?.whatWeFound ?? "", /Committer:/);
+  assert.doesNotMatch(result?.whatWeFound ?? "", /Author:/);
 });
 
-test("an unmatched/unknown profile is NOT SAFE", () => {
+test("an unmatched/unknown profile is NOT SAFE and unverified", () => {
   const summary = run(safeFacts({ remoteOwner: "someone-else" }));
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Repo profile is unknown"));
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Repo profile is unknown");
+  assert.equal(result?.state, "unverified");
+  assert.equal(result?.blocksOverallSafety, true);
+});
+
+test("dependent capabilities are not_applicable when no profile is resolved", () => {
+  const summary = run(safeFacts({ remoteOwner: "someone-else" }));
+  const pushDestination = summary.capabilityResults.find((r) => r.capability === "push_destination");
+  const pushAccount = summary.capabilityResults.find((r) => r.capability === "push_account");
+  const branchPolicy = summary.capabilityResults.find((r) => r.capability === "branch_policy");
+  assert.equal(pushDestination?.state, "not_applicable");
+  assert.equal(pushAccount?.state, "not_applicable");
+  assert.equal(branchPolicy?.state, "not_applicable");
+  // not_applicable never blocks, even though overall status is still NOT SAFE via commit_identity.
+  assert.equal(pushDestination?.blocksOverallSafety, false);
+  assert.equal(pushAccount?.blocksOverallSafety, false);
+  assert.equal(branchPolicy?.blocksOverallSafety, false);
 });
 
 test("a fork where origin and upstream imply different profiles is NOT SAFE and matchedProfile is unresolved", () => {
@@ -120,7 +160,9 @@ test("a fork where origin and upstream imply different profiles is NOT SAFE and 
   });
   assert.equal(summary.level, "not_safe");
   assert.equal(summary.matchedProfile, undefined);
-  assert.ok(summary.issues.some((issue) => issue.title === "Origin and upstream imply different profiles"));
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Origin and upstream imply different profiles");
+  assert.equal(result?.state, "contradicted");
 });
 
 test("assigning an exact-repo override resolves what would otherwise be a fork conflict", () => {
@@ -148,7 +190,8 @@ test("assigning an exact-repo override resolves what would otherwise be a fork c
     pinnedMemoryNote: "note",
   });
   assert.equal(summary.matchedProfile?.id, "personal");
-  assert.ok(!summary.issues.some((issue) => issue.title === "Origin and upstream imply different profiles"));
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.notEqual(result?.title, "Origin and upstream imply different profiles");
 });
 
 test("a repo matching two profiles (overlapping freelance clients) is NOT SAFE and unresolved", () => {
@@ -174,7 +217,9 @@ test("a repo matching two profiles (overlapping freelance clients) is NOT SAFE a
 
   assert.equal(summary.level, "not_safe");
   assert.equal(summary.matchedProfile, undefined);
-  assert.ok(summary.issues.some((issue) => issue.title === "Multiple profiles match this repo"));
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Multiple profiles match this repo");
+  assert.equal(result?.state, "contradicted");
 });
 
 test("push destination that cannot be resolved at all is always NOT SAFE, even for a relaxed profile", () => {
@@ -186,7 +231,10 @@ test("push destination that cannot be resolved at all is always NOT SAFE, even f
     preferences: defaultPreferences,
   });
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Push destination is not verified" && issue.severity === "blocking"));
+  const result = summary.capabilityResults.find((r) => r.capability === "push_destination");
+  assert.equal(result?.title, "Push destination is not verified");
+  assert.equal(result?.state, "unverified");
+  assert.equal(result?.blocksOverallSafety, true);
 });
 
 test("push destination resolving to a different owner is NOT SAFE (destination mismatch, not just account)", () => {
@@ -198,7 +246,9 @@ test("push destination resolving to a different owner is NOT SAFE (destination m
     }),
   );
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Push destination does not match Work"));
+  const result = summary.capabilityResults.find((r) => r.capability === "push_destination");
+  assert.equal(result?.title, "Push destination does not match Work");
+  assert.equal(result?.state, "contradicted");
 });
 
 test("push destination matching a profile's exact-repo override is confirmed even outside its owner pattern", () => {
@@ -213,10 +263,11 @@ test("push destination matching a profile's exact-repo override is confirmed eve
     protectedBranches: ["main"],
     preferences: defaultPreferences,
   });
-  assert.ok(!summary.issues.some((issue) => issue.category === "push_setup"));
+  const result = summary.capabilityResults.find((r) => r.capability === "push_destination");
+  assert.equal(result?.state, "confirmed");
 });
 
-test("push account is unverified over HTTPS, blocking only when the profile requires strict push setup", () => {
+test("push account is unverified over HTTPS; blocksOverallSafety follows strict push setup, state does not", () => {
   const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
   const strictProfile: Profile = { ...workProfile, strictPushSetup: true };
 
@@ -233,7 +284,10 @@ test("push account is unverified over HTTPS, blocking only when the profile requ
     preferences: defaultPreferences,
   });
   assert.equal(relaxed.level, "safe");
-  assert.ok(relaxed.issues.some((issue) => issue.title === "Push account is unverified" && issue.severity === "warning"));
+  const relaxedResult = relaxed.capabilityResults.find((r) => r.capability === "push_account");
+  assert.equal(relaxedResult?.title, "Push account is unverified");
+  assert.equal(relaxedResult?.state, "unverified");
+  assert.equal(relaxedResult?.blocksOverallSafety, false);
 
   const strict = computeStatus({
     facts: httpsFacts,
@@ -242,7 +296,10 @@ test("push account is unverified over HTTPS, blocking only when the profile requ
     preferences: defaultPreferences,
   });
   assert.equal(strict.level, "not_safe");
-  assert.ok(strict.issues.some((issue) => issue.title === "Push account is unverified" && issue.severity === "blocking"));
+  const strictResult = strict.capabilityResults.find((r) => r.capability === "push_account");
+  assert.equal(strictResult?.title, "Push account is unverified");
+  assert.equal(strictResult?.state, "unverified");
+  assert.equal(strictResult?.blocksOverallSafety, true);
 });
 
 test("push account is unverified over a generic SSH host (no dedicated alias)", () => {
@@ -257,10 +314,11 @@ test("push account is unverified over a generic SSH host (no dedicated alias)", 
     preferences: defaultPreferences,
   });
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Push account is unverified"));
+  const result = summary.capabilityResults.find((r) => r.capability === "push_account");
+  assert.equal(result?.title, "Push account is unverified");
 });
 
-test("a dedicated SSH host alias produces no push account issue", () => {
+test("a dedicated SSH host alias produces a confirmed push account result", () => {
   const strictProfile: Profile = { ...workProfile, strictPushSetup: true };
   const summary = computeStatus({
     facts: safeFacts(),
@@ -269,74 +327,90 @@ test("a dedicated SSH host alias produces no push account issue", () => {
     preferences: defaultPreferences,
   });
   assert.equal(summary.level, "safe");
-  assert.ok(!summary.issues.some((issue) => issue.category === "push_setup"));
+  const result = summary.capabilityResults.find((r) => r.capability === "push_account");
+  assert.equal(result?.state, "confirmed");
 });
 
-test("working directly on a protected branch is NOT SAFE", () => {
+test("working directly on a protected branch is NOT SAFE with agent restrictions", () => {
   const summary = run(safeFacts({ currentBranch: "main" }));
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Working directly on main"));
+  const result = summary.capabilityResults.find((r) => r.capability === "branch_policy");
+  assert.equal(result?.title, "Working directly on main");
+  assert.equal(result?.state, "contradicted");
+  assert.ok(result?.agentRestrictions?.some((r) => r.id === "no-commit"));
 });
 
-test("detached HEAD is NOT SAFE", () => {
+test("detached HEAD is NOT SAFE regardless of profile resolution", () => {
   const summary = run(safeFacts({ currentBranch: undefined, isDetachedHead: true }));
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Working in detached HEAD"));
+  const result = summary.capabilityResults.find((r) => r.capability === "branch_policy");
+  assert.equal(result?.title, "Working in detached HEAD");
 });
 
-test("an in-progress rebase is NOT SAFE, regardless of profile match", () => {
+test("an in-progress rebase is NOT SAFE with no-commit/no-branch-switch restrictions", () => {
   const summary = run(safeFacts({ inProgressOperation: "rebase" }));
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "A rebase is in progress" && issue.severity === "blocking"));
+  const result = summary.capabilityResults.find((r) => r.capability === "repo_operation_state");
+  assert.equal(result?.title, "A rebase is in progress");
+  assert.equal(result?.blocksOverallSafety, true);
+  const restrictionIds = (result?.agentRestrictions ?? []).map((r) => r.id);
+  assert.ok(restrictionIds.includes("no-commit"));
+  assert.ok(restrictionIds.includes("no-branch-switch"));
 });
 
 test("unresolved merge conflicts are NOT SAFE", () => {
   const summary = run(safeFacts({ hasMergeConflicts: true, hasUncommittedChanges: true }));
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Unresolved merge conflicts"));
+  const result = summary.capabilityResults.find((r) => r.capability === "repo_operation_state");
+  assert.equal(result?.title, "Unresolved merge conflicts");
 });
 
-test("ordinary uncommitted changes are only a warning, not a blocker", () => {
+test("ordinary uncommitted changes are only a warning with a preserve-changes restriction, not a blocker", () => {
   const summary = run(safeFacts({ hasUncommittedChanges: true, hasMergeConflicts: false }));
   assert.equal(summary.level, "safe");
-  assert.ok(
-    summary.issues.some((issue) => issue.title === "Uncommitted changes present" && issue.severity === "warning"),
-  );
+  const result = summary.capabilityResults.find((r) => r.capability === "repo_operation_state");
+  assert.equal(result?.title, "Uncommitted changes present");
+  assert.equal(result?.state, "warning");
+  assert.equal(result?.blocksOverallSafety, false);
+  assert.ok(result?.agentRestrictions?.some((r) => r.id === "preserve-changes"));
 });
 
 test("an untrusted workspace is NOT SAFE and blocks agent operation", () => {
   const summary = run(safeFacts(), defaultPreferences, false);
   assert.equal(summary.level, "not_safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Workspace is not trusted"));
+  const result = summary.capabilityResults.find((r) => r.capability === "workspace_trust");
+  assert.equal(result?.title, "Workspace is not trusted");
+  assert.equal(result?.state, "contradicted");
+  assert.equal(result?.blocksOverallSafety, true);
 });
 
-test("a trusted workspace (default) produces no workspace-trust issue", () => {
+test("a trusted workspace (default) produces a confirmed workspace-trust result", () => {
   const summary = run(safeFacts());
-  assert.ok(!summary.issues.some((issue) => issue.title === "Workspace is not trusted"));
+  const result = summary.capabilityResults.find((r) => r.capability === "workspace_trust");
+  assert.equal(result?.state, "confirmed");
 });
 
-test("Agent Guard reports not safe for AI whenever anything else is blocking", () => {
-  const summary = run(safeFacts({ currentBranch: "main" }));
-  assert.ok(summary.issues.some((issue) => issue.title === "Not safe for AI agent"));
-});
-
-test("Shield Mode is always shown as not-yet-built info, with no toggle behind it", () => {
+test("Shield Mode is always shown as an info note, never a capability result", () => {
   const summary = run(safeFacts());
-  const issue = summary.issues.find((i) => i.title === "Shield Mode is not built yet");
-  assert.ok(issue);
-  assert.equal(issue!.severity, "info");
+  const note = summary.infoNotes.find((n) => n.title === "Shield Mode is not built yet");
+  assert.ok(note);
+  assert.equal(note?.category, "agent_guard_meta");
+  assert.ok(!summary.capabilityResults.some((r) => r.title === "Shield Mode is not built yet"));
 });
 
-test("strict local identity mode flags identity that is only safe via global config", () => {
+test("strict local identity mode flags identity that is only safe via global config, as a non-blocking warning", () => {
   const summary = run(
     safeFacts({ localGitName: undefined, localGitEmail: undefined }),
     { requireLocalIdentity: true, includeMemoryInAiContext: false },
   );
   assert.equal(summary.level, "safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "Repo is not locked to Work identity"));
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Repo is not locked to Work identity");
+  assert.equal(result?.state, "warning");
+  assert.equal(result?.blocksOverallSafety, false);
 });
 
-test("missing pinned memory produces an info-level (non-blocking) issue", () => {
+test("missing pinned memory produces an info note, not a capability result", () => {
   const summary = computeStatus({
     facts: safeFacts(),
     profiles: [workProfile],
@@ -344,5 +418,23 @@ test("missing pinned memory produces an info-level (non-blocking) issue", () => 
     preferences: defaultPreferences,
   });
   assert.equal(summary.level, "safe");
-  assert.ok(summary.issues.some((issue) => issue.title === "No pinned repo memory" && issue.severity === "info"));
+  const note = summary.infoNotes.find((n) => n.title === "No pinned repo memory");
+  assert.ok(note);
+  assert.equal(note?.category, "repo_memory");
+});
+
+test("issueCount excludes confirmed and not_applicable results", () => {
+  const summary = run(safeFacts());
+  assert.equal(summary.issueCount, 0);
+
+  const withProblems = run(safeFacts({ currentBranch: "main", hasUncommittedChanges: true }));
+  // branch_policy (contradicted) + repo_operation_state (warning) = 2
+  assert.equal(withProblems.issueCount, 2);
+});
+
+test("nextFix prefers a blocking result over a warning", () => {
+  const summary = run(
+    safeFacts({ currentBranch: "main", hasUncommittedChanges: true }),
+  );
+  assert.equal(summary.nextFix?.blocksOverallSafety, true);
 });

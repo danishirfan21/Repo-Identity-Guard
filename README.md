@@ -21,13 +21,31 @@ it knows lives on your machine.
 
 ## What it checks
 
-| Category | Question it answers |
+Every scan evaluates six **capabilities**. Each one always produces exactly
+one result — never zero, never more than one — so Review Details is always
+a complete checklist, not just a list of problems:
+
+| Capability | Question it answers |
 | --- | --- |
 | **Commit Identity** | Who will appear as the author *and* committer of commits? |
-| **Push Setup** | Where would a plain `git push` actually go, and can the account be trusted? |
-| **Branch Safety** | Is the current branch safe for this repo? |
-| **Agent Guard** | Is this repo safe for an AI coding agent to operate in right now? |
-| **Repo Memory** | What repo-specific notes/commands should I not have to rediscover? |
+| **Push Destination** | Where would a plain `git push` actually go? |
+| **Push Account** | Can the account that authenticates the push be trusted? |
+| **Branch Policy** | Is the current branch safe for this repo? |
+| **Repo State** | Is there an unfinished merge/rebase/conflict, or just ordinary uncommitted changes? |
+| **Workspace Trust** | Is this VS Code workspace trusted to run commands in? |
+
+Repo Memory and Shield Mode are shown too, but as separate **info notes** —
+they're context data and feature-availability metadata, not safety
+verdicts, so they never affect the SAFE/NOT SAFE result.
+
+Each capability result carries one of five states — **Confirmed**,
+**Contradicted**, **Unverified**, **Warning**, or **Not applicable** — plus
+a separate `blocksOverallSafety` flag. The two are intentionally not the
+same thing: an unverified push account only blocks SAFE when its profile
+requires strict push setup, while a contradicted result (like being on a
+protected branch) always blocks. Review Details shows the full state per
+capability; Main only ever shows the binary SAFE/NOT SAFE headline built
+from whichever results actually block.
 
 Commit identity is read from Git's *effective* author/committer identity
 (`git var GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT`), which reflects any
@@ -72,8 +90,9 @@ profile.
 
 - **Main** — compact status, matched profile, issue count, next fix, one
   pinned memory note, and quick actions.
-- **Review Details** — the full issue list in plain English (why it matters,
-  what we expected, what we found), with raw Git facts tucked behind an
+- **Review Details** — the full six-capability checklist in plain English
+  (why it matters, what we expected, what we found, and any agent
+  restrictions that follow from it), with raw Git facts tucked behind an
   expandable "Technical Details" section.
 - **Repo Memory** — pinned notes, general notes, and saved commands (label +
   command + Run/Copy), stored locally and privately.
@@ -132,19 +151,37 @@ answers them separately instead of collapsing them into one claim:
 
 ## Copy Context for AI
 
-One click copies a summary for pasting into an AI agent's context — repo
-name, matched profile, status, branch, open issues — plus a fixed list of
-rules for the agent (no `git push`, don't touch `main`/`master`, ask before
-switching branches, preserve existing uncommitted changes, don't change
-identity/remote/SSH/credential config). It never includes secrets, tokens,
-`.env` values, SSH key contents, or raw Git config — the fields copied are
-an explicit allowlist, not a best-effort filter.
+One click copies a summary for pasting into an AI agent's context, built
+from the *same* capability results Review Details shows — not a separate,
+independently-maintained rule list, so the two can't silently drift apart.
+Each capability's state is translated into an operational section:
 
-The exact text is always opened in a preview tab so you can check it before
-pasting anywhere, in addition to being copied to the clipboard. Your pinned
-Repo Memory note is **not** included by default — it's free text you wrote
-for yourself and may contain sensitive info. Turn on "Include pinned memory
-note in Copy Context for AI" in Settings if you want it included.
+- **Contradictions** — capability results with positive evidence of a
+  problem (wrong identity, wrong push destination, protected branch, etc.)
+- **Unverified facts** — things that couldn't be checked (unknown profile,
+  unresolved push destination, unverified push account)
+- **Warnings** — non-blocking findings (uncommitted changes, identity only
+  safe via global config)
+- **Confirmed facts** — what passed
+- **Rules for AI** — a fixed baseline (no `git push`, no changing Git
+  identity/remotes/SSH/credentials) plus restrictions *derived* from this
+  scan's specific findings (e.g. an in-progress rebase adds "don't switch
+  branches" and "don't commit"; a protected branch adds "ask before
+  committing here"), deduplicated when multiple findings imply the same
+  restriction
+
+`Not applicable` results are omitted entirely. Every finding that blocks
+overall safety is guaranteed to show up here — as an issue or as a derived
+restriction — checked by an automated test, not just by convention.
+
+It never includes secrets, tokens, `.env` values, SSH key contents, or raw
+Git config — the fields copied are an explicit allowlist, not a best-effort
+filter. The exact text is always opened in a preview tab so you can check
+it before pasting anywhere, in addition to being copied to the clipboard.
+Your pinned Repo Memory note is **not** included by default — it's free
+text you wrote for yourself and may contain sensitive info. Turn on
+"Include pinned memory note in Copy Context for AI" in Settings if you want
+it included.
 
 ## Workspace Trust
 

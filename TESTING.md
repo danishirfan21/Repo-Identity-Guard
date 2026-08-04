@@ -47,6 +47,9 @@ git branch --show-current
 | Non-Git folder | Open a plain folder with no `.git`. | ⚪ NOT CHECKED. |
 | No pinned memory | Repo Memory has no pinned note. | Info-only "No pinned repo memory" (never blocks SAFE). |
 | Shield Mode card | Open Settings. | A disabled "Shield Mode — Coming soon" card with no checkbox — never an interactive toggle. |
+| Full checklist on a safe repo | All checks pass. | Review Details shows all 6 capabilities (Commit Identity, Push Destination, Push Account, Branch Policy, Repo State, Workspace Trust) with a **Confirmed** badge each — not just an empty "no issues" list. |
+| Dependent capability shown as Not applicable | No profile resolves for this repo. | Push Destination, Push Account, and Branch Policy each show a **Not applicable** badge (dimmed) rather than being silently omitted, and don't carry a "Blocks Safety" tag. |
+| Blocks Safety tag vs. state | HTTPS push with `strictPushSetup: false` vs. `true`, same repo. | Both show the **Unverified** badge on Push Account; only the `strictPushSetup: true` case also shows a **Blocks Safety** tag. |
 
 Remember: Repo Identity Guard does not verify pull/push access. If
 `git pull` or `git push` fails with "Repository not found", check GitHub
@@ -79,13 +82,25 @@ outside Repo Identity Guard.
 
 ### Review Details
 
-Open **Review Details** and confirm each issue shows, in plain English:
+Open **Review Details** and confirm it always shows all 6 capabilities, in
+a fixed order (Commit Identity, Push Destination, Push Account, Branch
+Policy, Repo State, Workspace Trust) — including ones that passed
+("Confirmed") or don't apply ("Not applicable", shown dimmed) — not just a
+filtered list of problems. Each card shows, in plain English:
 
+- Capability label and state badge (Confirmed / Contradicted / Unverified
+  / Warning / Not applicable)
+- A **Blocks Safety** tag when (and only when) this specific result is
+  the reason overall status is NOT SAFE
 - Title
 - Why it matters
 - What we expected / what we found
+- Any agent restrictions this finding implies
 - A suggested action button
 - An expandable **Technical Details** section with raw Git facts only
+
+A separate "Other Notes" section below the checklist shows info notes
+(Repo Memory reminder, Shield Mode) without a state badge.
 
 ### Repo Memory
 
@@ -107,16 +122,21 @@ Open **Review Details** and confirm each issue shows, in plain English:
    Confirm a preview tab opens with the exact text, and that it's also on
    the clipboard.
 2. Confirm the preview includes: a "Checked:" timestamp, repo name, matched
-   profile, status, branch, the open (non-info) issues, and a fixed "Rules
-   for AI" section (no push, don't touch main/master, ask before switching
-   branches, preserve existing uncommitted changes, don't change
-   identity/remote/SSH/credentials).
-3. Pin a memory note. With "Include pinned memory note in Copy Context for
+   profile, status, branch, sections for Contradictions / Unverified facts
+   / Warnings / Confirmed facts (whichever apply — `Not applicable` results
+   never appear), and a "Rules for AI" section combining the fixed baseline
+   (no push, don't change identity/remote/SSH/credentials) with any
+   restrictions derived from this scan's findings (e.g. an in-progress
+   rebase adds "don't switch branches").
+3. With two findings that imply the same restriction (e.g. detached HEAD
+   and an in-progress rebase, both implying "no commit"), confirm the
+   restriction appears exactly once in the output, not duplicated.
+4. Pin a memory note. With "Include pinned memory note in Copy Context for
    AI" **off** (default), confirm the preview shows a note explaining it
    was omitted, not the note text itself.
-4. Turn the setting **on**, copy again, and confirm the pinned note text
+5. Turn the setting **on**, copy again, and confirm the pinned note text
    now appears under "User-approved pinned notes."
-5. Confirm the output never includes secrets, tokens, `.env` values, SSH
+6. Confirm the output never includes secrets, tokens, `.env` values, SSH
    key contents, or raw Git config regardless of the setting.
 
 ### Settings
@@ -151,3 +171,10 @@ Run:
 npm run compile
 npm test
 ```
+
+`src/test/aiContext.test.ts` includes an automated invariant: for a range
+of fixtures, every capability result with `blocksOverallSafety: true` must
+be representable in the Copy Context model (as an issue entry or a derived
+restriction). If a new blocking check is added to `statusEngine.ts` without
+a corresponding Copy Context representation, that invariant test is the
+one that should fail — extend its fixture list when adding new checks.

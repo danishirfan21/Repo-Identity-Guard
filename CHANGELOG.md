@@ -4,6 +4,39 @@
 
 ### Added
 
+- **New capability-based result model**, replacing the old flat
+  blocking/warning/info `Issue` list. Every scan now evaluates exactly six
+  capabilities (Commit Identity, Push Destination, Push Account, Branch
+  Policy, Repo State, Workspace Trust) and each produces exactly one
+  `CapabilityResult`, always — never omitted when things are fine. Each
+  result carries:
+  - a `state`: `confirmed` / `contradicted` / `unverified` / `warning` /
+    `not_applicable`
+  - an independent `blocksOverallSafety` boolean — deliberately not
+    derived from `state` alone (e.g. an unverified push account only
+    blocks when its profile requires strict push setup, but the state is
+    "unverified" either way)
+  - optional `agentRestrictions`, derived from the specific finding (e.g.
+    an in-progress rebase implies "don't switch branches" + "don't
+    commit")
+  Repo Memory and Shield Mode are now separate `InfoNote`s, not
+  `CapabilityResult`s — they're context data and feature-availability
+  metadata, not safety verdicts, and never affect the overall SAFE/NOT
+  SAFE result.
+- **Review Details now shows the full checklist**, not just problems —
+  every capability appears with its state, including "Confirmed" and "Not
+  applicable" results, so you can see what passed, not only what failed.
+- **Copy Context for AI is now rendered from the same capability results**
+  Review Details shows, translated into Confirmed facts / Contradictions /
+  Unverified facts / Warnings / Derived agent restrictions, instead of
+  maintaining a separate parallel issue/rule list. Derived restrictions
+  are deduplicated when multiple findings imply the same restriction (e.g.
+  detached HEAD and an in-progress rebase both imply "no commit").
+  `not_applicable` results are omitted entirely.
+- New automated invariant test: every capability result with
+  `blocksOverallSafety: true` is verified to appear in the Copy Context
+  model, either as an issue entry or a derived restriction — not just by
+  convention.
 - Exact-repository profile overrides: `Profile.exactRepos` canonicalizes a
   repo as `host/owner/repo` (wildcards allowed) and always takes precedence
   over `expectedRemoteOwners` — pins one specific repo to a profile

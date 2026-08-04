@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { Issue, MemoryNote, Profile, RepoMemory, SafetyPreferences, SavedCommand, StatusSummary } from "../types";
+import { CapabilityResult, InfoNote, Profile, RepoMemory, SafetyPreferences, StatusSummary } from "../types";
 
 export interface SidebarActions {
   rescan(): Promise<void>;
@@ -182,19 +182,8 @@ function getNonce(): string {
 
 // ---- Wire state (data sent to the webview) ----
 
-interface WireIssue {
-  id: string;
-  category: string;
-  severity: string;
-  title: string;
-  message: string;
-  whyItMatters?: string;
-  whatWeExpected?: string;
-  whatWeFound?: string;
-  suggestedAction?: string;
-  suggestedActionCommand?: string;
-  technicalDetails?: Record<string, unknown>;
-}
+type WireCapabilityResult = CapabilityResult;
+type WireInfoNote = InfoNote;
 
 interface WireState {
   level: "safe" | "not_safe" | "not_checked";
@@ -203,18 +192,15 @@ interface WireState {
   profileLabel?: string;
   branch?: string;
   issueCount: number;
-  issues: WireIssue[];
-  nextFix?: WireIssue;
+  capabilityResults: WireCapabilityResult[];
+  infoNotes: WireInfoNote[];
+  nextFix?: WireCapabilityResult;
   pinnedNotePreview?: string;
   canFixIdentity: boolean;
   memory: RepoMemory;
   profiles: Profile[];
   protectedBranches: string[];
   preferences: SafetyPreferences;
-}
-
-function toWireIssue(issue: Issue): WireIssue {
-  return { ...issue };
 }
 
 function toWireState(model: SidebarModel): WireState {
@@ -226,8 +212,9 @@ function toWireState(model: SidebarModel): WireState {
     profileLabel: summary.matchedProfile?.label,
     branch: summary.facts.currentBranch,
     issueCount: summary.issueCount,
-    issues: summary.issues.map(toWireIssue),
-    nextFix: summary.nextFix ? toWireIssue(summary.nextFix) : undefined,
+    capabilityResults: summary.capabilityResults,
+    infoNotes: summary.infoNotes,
+    nextFix: summary.nextFix,
     pinnedNotePreview: summary.pinnedMemoryPreview,
     canFixIdentity: !!summary.matchedProfile,
     memory: model.memory,
@@ -262,15 +249,40 @@ function statusMeta(level) {
   return { label: "NOT CHECKED", icon: "⚪", cls: "text-on-surface-variant" };
 }
 
-function severityBadge(sev) {
-  if (sev === "blocking") return '<span class="rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-error-container text-on-error-container">Blocking</span>';
-  if (sev === "warning") return '<span class="rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-tertiary-container text-on-tertiary-container">Warning</span>';
-  return '<span class="rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-secondary-container text-on-secondary-container">Info</span>';
+const CAPABILITY_LABELS = {
+  commit_identity: "Commit Identity",
+  push_destination: "Push Destination",
+  push_account: "Push Account",
+  branch_policy: "Branch Policy",
+  repo_operation_state: "Repo State",
+  workspace_trust: "Workspace Trust",
+};
+
+const CAPABILITY_ORDER = [
+  "commit_identity",
+  "push_destination",
+  "push_account",
+  "branch_policy",
+  "repo_operation_state",
+  "workspace_trust",
+];
+
+function stateBadge(st) {
+  if (st === "confirmed") return '<span class="rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-secondary-container text-on-secondary-container">Confirmed</span>';
+  if (st === "contradicted") return '<span class="rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-error-container text-on-error-container">Contradicted</span>';
+  if (st === "unverified") return '<span class="rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-tertiary-container text-on-tertiary-container">Unverified</span>';
+  if (st === "warning") return '<span class="rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-tertiary-container text-on-tertiary-container">Warning</span>';
+  return '<span class="rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-surface-container-high text-on-surface-variant">Not applicable</span>';
 }
 
-function actionButtonForIssue(issue) {
-  if (!issue.suggestedAction) return "";
-  return \`<button class="vs-button-secondary mt-2 flex h-7 items-center justify-center rounded px-3 text-[12px]" data-issue-action="\${esc(issue.suggestedActionCommand || "")}">\${esc(issue.suggestedAction)}</button>\`;
+function blocksSafetyTag(result) {
+  if (!result.blocksOverallSafety) return "";
+  return '<span class="ml-1 rounded px-1.5 py-0.5 text-[10px] font-bold uppercase bg-error text-on-error">Blocks Safety</span>';
+}
+
+function actionButtonForIssue(item) {
+  if (!item.suggestedAction) return "";
+  return \`<button class="vs-button-secondary mt-2 flex h-7 items-center justify-center rounded px-3 text-[12px]" data-issue-action="\${esc(item.suggestedActionCommand || "")}">\${esc(item.suggestedAction)}</button>\`;
 }
 
 function handleSuggestedAction(command) {
@@ -342,40 +354,70 @@ function renderMain() {
 }
 
 // ---------- REVIEW DETAILS VIEW ----------
-function renderIssueCard(issue, idx) {
-  const facts = issue.technicalDetails && Object.keys(issue.technicalDetails).length
+function renderCapabilityCard(result) {
+  const facts = result.technicalDetails && Object.keys(result.technicalDetails).length
     ? \`<details class="mt-2">
         <summary class="cursor-pointer text-[11px] text-on-surface-variant">Technical Details</summary>
-        <pre class="mt-1 whitespace-pre-wrap break-all rounded bg-surface-container-lowest p-2 font-code-mono text-[11px] text-on-surface-variant">\${esc(JSON.stringify(issue.technicalDetails, null, 2))}</pre>
+        <pre class="mt-1 whitespace-pre-wrap break-all rounded bg-surface-container-lowest p-2 font-code-mono text-[11px] text-on-surface-variant">\${esc(JSON.stringify(result.technicalDetails, null, 2))}</pre>
       </details>\`
     : "";
 
-  const expectFound = (issue.whatWeExpected || issue.whatWeFound)
+  const expectFound = (result.whatWeExpected || result.whatWeFound)
     ? \`<div class="mt-1.5 grid grid-cols-1 gap-1 text-[11px]">
-        \${issue.whatWeExpected ? \`<div><span class="text-on-surface-variant">What we expected: </span><span class="text-on-surface">\${esc(issue.whatWeExpected)}</span></div>\` : ""}
-        \${issue.whatWeFound ? \`<div><span class="text-on-surface-variant">What we found: </span><span class="text-on-surface">\${esc(issue.whatWeFound)}</span></div>\` : ""}
+        \${result.whatWeExpected ? \`<div><span class="text-on-surface-variant">What we expected: </span><span class="text-on-surface">\${esc(result.whatWeExpected)}</span></div>\` : ""}
+        \${result.whatWeFound ? \`<div><span class="text-on-surface-variant">What we found: </span><span class="text-on-surface">\${esc(result.whatWeFound)}</span></div>\` : ""}
       </div>\`
     : "";
 
+  const restrictions = (result.agentRestrictions && result.agentRestrictions.length)
+    ? \`<p class="m-0 mt-1.5 text-[11px] text-on-surface-variant">Agent restrictions: \${result.agentRestrictions.map((r) => esc(r.description)).join(" ")}</p>\`
+    : "";
+
+  const dimmed = result.state === "not_applicable" ? "opacity-50" : "";
+
   return \`
-    <section class="vs-card rounded-lg p-2.5">
+    <section class="vs-card rounded-lg p-2.5 \${dimmed}">
       <div class="flex items-center justify-between gap-2">
-        <span class="text-[13px] font-semibold text-on-surface">\${esc(issue.title)}</span>
-        \${severityBadge(issue.severity)}
+        <span class="font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">\${esc(CAPABILITY_LABELS[result.capability] || result.capability)}</span>
+        <div class="flex items-center">\${stateBadge(result.state)}\${blocksSafetyTag(result)}</div>
       </div>
-      \${issue.whyItMatters ? \`<p class="m-0 mt-1 text-[11px] text-on-surface-variant">Why it matters: \${esc(issue.whyItMatters)}</p>\` : \`<p class="m-0 mt-1 text-[11px] text-on-surface-variant">\${esc(issue.message)}</p>\`}
+      <p class="m-0 mt-1 text-[13px] font-semibold text-on-surface">\${esc(result.title)}</p>
+      \${result.whyItMatters ? \`<p class="m-0 mt-1 text-[11px] text-on-surface-variant">Why it matters: \${esc(result.whyItMatters)}</p>\` : \`<p class="m-0 mt-1 text-[11px] text-on-surface-variant">\${esc(result.summary)}</p>\`}
       \${expectFound}
-      \${actionButtonForIssue(issue)}
+      \${restrictions}
+      \${actionButtonForIssue(result)}
       \${facts}
     </section>
   \`;
 }
 
+function renderInfoNoteCard(note) {
+  return \`
+    <section class="vs-card rounded-lg p-2.5 opacity-80">
+      <span class="font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Note</span>
+      <p class="m-0 mt-1 text-[13px] font-semibold text-on-surface">\${esc(note.title)}</p>
+      <p class="m-0 mt-1 text-[11px] text-on-surface-variant">\${esc(note.message)}</p>
+      \${actionButtonForIssue(note)}
+    </section>
+  \`;
+}
+
 function renderDetails() {
-  if (state.issues.length === 0) {
-    return '<p class="text-[12px] text-on-surface-variant">No issues detected.</p>';
-  }
-  return state.issues.map(renderIssueCard).join("");
+  const byCapability = {};
+  for (const result of state.capabilityResults) byCapability[result.capability] = result;
+
+  const cards = CAPABILITY_ORDER
+    .map((capability) => (byCapability[capability] ? renderCapabilityCard(byCapability[capability]) : ""))
+    .join("");
+
+  const notes = state.infoNotes.length
+    ? \`<section class="mt-2 flex flex-col gap-1.5">
+        <span class="font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Other Notes</span>
+        \${state.infoNotes.map(renderInfoNoteCard).join("")}
+      </section>\`
+    : "";
+
+  return cards + notes;
 }
 
 // ---------- REPO MEMORY VIEW ----------

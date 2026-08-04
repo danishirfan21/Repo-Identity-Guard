@@ -24,7 +24,8 @@ import { Profile, RepoFacts, StatusSummary } from "./types";
 
 let latestSummary: StatusSummary = {
   level: "not_checked",
-  issues: [],
+  capabilityResults: [],
+  infoNotes: [],
   issueCount: 0,
   facts: { isGitRepo: false },
 };
@@ -189,7 +190,8 @@ export function activate(context: vscode.ExtensionContext): void {
       if (sequence !== scanSequence) return;
       latestSummary = {
         level: "not_checked",
-        issues: [],
+        capabilityResults: [],
+        infoNotes: [],
         issueCount: 0,
         facts: { isGitRepo: false, gitError: getErrorMessage(error) },
       };
