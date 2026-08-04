@@ -31,8 +31,14 @@ it knows lives on your machine.
 
 Repo Identity Guard matches the open repo's `origin` remote owner (e.g. a
 GitHub org or username) against **Profiles** you define (Work, Personal,
-etc.) in Settings. A repo with no matching profile is treated as **NOT
-SAFE** — profile setup takes one click from Review Details.
+one per freelance client, one per employer — as many as you need) in
+Settings. A repo with no matching profile is treated as **NOT SAFE** —
+profile setup takes one click from Review Details. If a repo's owner
+matches *more than one* profile (e.g. two clients' owner patterns
+overlap), that's also **NOT SAFE** — "Multiple profiles match this repo" —
+rather than silently guessing which identity to use. Saving a profile
+whose owners overlap with an existing one warns you immediately, before it
+ever shows up as an unsafe repo.
 
 ## Views
 

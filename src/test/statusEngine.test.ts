@@ -77,6 +77,32 @@ test("an unmatched/unknown profile is NOT SAFE", () => {
   assert.ok(summary.issues.some((issue) => issue.title === "Repo profile is unknown"));
 });
 
+test("a repo matching two profiles (overlapping freelance clients) is NOT SAFE and unresolved", () => {
+  const clientA: Profile = {
+    id: "client-a",
+    label: "Freelance Client A",
+    gitEmail: "danish@client-a.com",
+    expectedRemoteOwners: ["shared-org"],
+  };
+  const clientB: Profile = {
+    id: "client-b",
+    label: "Freelance Client B",
+    gitEmail: "danish@client-b.com",
+    expectedRemoteOwners: ["shared-org"],
+  };
+
+  const summary = computeStatus({
+    facts: safeFacts({ remoteOwner: "shared-org" }),
+    profiles: [clientA, clientB],
+    protectedBranches: ["main", "master"],
+    preferences: defaultPreferences,
+  });
+
+  assert.equal(summary.level, "not_safe");
+  assert.equal(summary.matchedProfile, undefined);
+  assert.ok(summary.issues.some((issue) => issue.title === "Multiple profiles match this repo"));
+});
+
 test("HTTPS remote is NOT SAFE only when the profile requires strict push setup", () => {
   const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
   const strictProfile: Profile = { ...workProfile, strictPushSetup: true };

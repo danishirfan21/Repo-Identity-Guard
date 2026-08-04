@@ -5,7 +5,7 @@ import {
   SafetyPreferences,
   StatusSummary,
 } from "../types";
-import { branchMatchesAnyPattern, resolveProfile } from "./profileResolver";
+import { branchMatchesAnyPattern, findMatchingProfiles } from "./profileResolver";
 import {
   agentGuardOffIssue,
   agentNotSafeIssue,
@@ -14,6 +14,7 @@ import {
   identityNotLockedIssue,
   noPinnedMemoryIssue,
   noRemoteIssue,
+  overlappingProfilesIssue,
   profileUnknownIssue,
   protectedBranchIssue,
   pushSetupGenericSshIssue,
@@ -44,10 +45,13 @@ export function computeStatus(input: StatusEngineInput): StatusSummary {
     };
   }
 
-  const matchedProfile = resolveProfile(facts, input.profiles);
+  const matches = findMatchingProfiles(facts, input.profiles);
+  const matchedProfile = matches.length === 1 ? matches[0] : undefined;
   const issues: Issue[] = [];
 
-  if (!matchedProfile) {
+  if (matches.length > 1) {
+    issues.push(overlappingProfilesIssue(facts, matches));
+  } else if (!matchedProfile) {
     issues.push(profileUnknownIssue());
   } else {
     issues.push(...checkCommitIdentity(facts, matchedProfile, input.preferences));

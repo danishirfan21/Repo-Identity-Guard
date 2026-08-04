@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Support for multiple profiles matching one repo owner is now detected
+  explicitly: a repo whose remote owner matches more than one profile (e.g.
+  two freelance clients sharing an org, or a duplicated/overlapping owner
+  pattern) is flagged as NOT SAFE with "Multiple profiles match this repo",
+  instead of silently picking whichever profile happened to be listed
+  first.
+- Saving a profile (from Settings or "Add Profile for This Repo") now warns
+  immediately if its expected remote owners overlap with an existing
+  profile's, so the ambiguity can be caught before it ever shows up as an
+  unsafe repo.
+
 ## 0.2.0
 
 Rebuilt as Repo Identity Guard: a full local-first safety sidebar instead of

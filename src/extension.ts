@@ -2,6 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { buildAiContext } from "./core/aiContext";
+import { findOverlappingProfiles } from "./core/profileResolver";
 import { computeStatus } from "./core/statusEngine";
 import { collectRepoFacts } from "./services/gitService";
 import { copyToClipboard, runSavedCommand } from "./services/commandRunner";
@@ -106,6 +107,14 @@ export function activate(context: vscode.ExtensionContext): void {
       const index = profiles.findIndex((p) => p.id === profile.id);
       const next = index >= 0 ? profiles.map((p, i) => (i === index ? profile : p)) : [...profiles, profile];
       await saveProfiles(next);
+
+      const overlapping = findOverlappingProfiles(profile, next);
+      if (overlapping.length > 0) {
+        await vscode.window.showWarningMessage(
+          `"${profile.label}" shares an owner pattern with ${overlapping.map((p) => p.label).join(", ")}. Any repo matching both will show as Not Safe until you narrow the owners.`,
+        );
+      }
+
       await scan();
     },
     deleteProfile: async (id) => {
@@ -250,8 +259,18 @@ export function activate(context: vscode.ExtensionContext): void {
       strictPushSetup: false,
     };
 
-    await saveProfiles([...getProfiles(), profile]);
-    await vscode.window.showInformationMessage(`Added profile "${label}".`);
+    const nextProfiles = [...getProfiles(), profile];
+    await saveProfiles(nextProfiles);
+
+    const overlapping = findOverlappingProfiles(profile, nextProfiles);
+    if (overlapping.length > 0) {
+      await vscode.window.showWarningMessage(
+        `"${label}" shares an owner pattern with ${overlapping.map((p) => p.label).join(", ")}. Any repo matching both will show as Not Safe until you narrow the owners.`,
+      );
+    } else {
+      await vscode.window.showInformationMessage(`Added profile "${label}".`);
+    }
+
     await scan(facts.repoRoot);
   }
 

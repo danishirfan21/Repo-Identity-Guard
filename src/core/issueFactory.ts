@@ -27,6 +27,27 @@ export function profileUnknownIssue(): Issue {
   };
 }
 
+export function overlappingProfilesIssue(facts: RepoFacts, matches: Profile[]): Issue {
+  const labels = matches.map((profile) => profile.label).join(", ");
+  return {
+    id: "commit_identity:profile_overlap",
+    category: "commit_identity",
+    severity: "blocking",
+    title: "Multiple profiles match this repo",
+    message: `This repo's remote owner matches more than one of your profiles (${labels}), so we can't tell which identity to expect.`,
+    whyItMatters:
+      "Ambiguous profile matching means commits could use the wrong identity for either profile — treated as unsafe until the overlap is fixed.",
+    whatWeExpected: "Exactly one profile matching this repo's remote owner",
+    whatWeFound: `${labels} all match "${facts.remoteOwner ?? "this repo's owner"}"`,
+    suggestedAction: "Open Settings",
+    suggestedActionCommand: "openSettings",
+    technicalDetails: {
+      remoteOwner: facts.remoteOwner,
+      matchingProfileIds: matches.map((profile) => profile.id),
+    },
+  };
+}
+
 export function wrongCommitIdentityIssue(facts: RepoFacts, profile: Profile): Issue {
   return {
     id: "commit_identity:wrong",
