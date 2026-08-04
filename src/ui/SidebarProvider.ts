@@ -9,6 +9,7 @@ export interface SidebarActions {
   openSettingsJson(): Promise<void>;
   copyContextForAI(): Promise<void>;
   enableWorkspaceTrust(): Promise<void>;
+  resolveProfileConflict(): Promise<void>;
 
   addMemoryNote(text: string, pinned: boolean): Promise<void>;
   removeMemoryNote(id: string): Promise<void>;
@@ -88,6 +89,9 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
         break;
       case "enableWorkspaceTrust":
         await a.enableWorkspaceTrust();
+        break;
+      case "resolveProfileConflict":
+        await a.resolveProfileConflict();
         break;
       case "addMemoryNote":
         await a.addMemoryNote(String(message.text ?? ""), !!message.pinned);
@@ -277,6 +281,7 @@ function handleSuggestedAction(command) {
   if (command === "addProfileForRepo") { send("addProfileForRepo"); return; }
   if (command === "reviewDetails") { navigate("details"); return; }
   if (command === "enableWorkspaceTrust") { send("enableWorkspaceTrust"); return; }
+  if (command === "resolveProfileConflict") { send("resolveProfileConflict"); return; }
 }
 
 // ---------- MAIN VIEW ----------
@@ -446,6 +451,9 @@ function renderProfileEditor(profile) {
         <label class="flex flex-col gap-0.5 text-[11px] text-on-surface-variant">Expected remote owners (comma separated)
           <input class="h-7 rounded border border-outline-variant bg-surface-container-lowest px-2 text-[12px] text-on-surface" data-field="expectedRemoteOwners" value="\${esc((profile.expectedRemoteOwners || []).join(", "))}" />
         </label>
+        <label class="flex flex-col gap-0.5 text-[11px] text-on-surface-variant">Exact repos (host/owner/repo, comma separated — always wins over owners above)
+          <input class="h-7 rounded border border-outline-variant bg-surface-container-lowest px-2 font-code-mono text-[12px] text-on-surface" data-field="exactRepos" placeholder="github.com/AcmeSoftware/secret-project" value="\${esc((profile.exactRepos || []).join(", "))}" />
+        </label>
         <label class="flex flex-col gap-0.5 text-[11px] text-on-surface-variant">Expected branch patterns (comma separated)
           <input class="h-7 rounded border border-outline-variant bg-surface-container-lowest px-2 text-[12px] text-on-surface" data-field="expectedBranchPatterns" value="\${esc((profile.expectedBranchPatterns || []).join(", "))}" />
         </label>
@@ -571,7 +579,7 @@ document.addEventListener("click", (event) => {
   if (removeCmdBtn) { send("removeSavedCommand", { id: removeCmdBtn.dataset.removeCommand }); return; }
 
   if (target.closest("#addProfileButton")) {
-    send("saveProfile", { profile: { id: "profile-" + Date.now().toString(36), label: "New Profile", gitEmail: "", expectedRemoteOwners: [], expectedBranchPatterns: [], strictPushSetup: false } });
+    send("saveProfile", { profile: { id: "profile-" + Date.now().toString(36), label: "New Profile", gitEmail: "", expectedRemoteOwners: [], exactRepos: [], expectedBranchPatterns: [], strictPushSetup: false } });
     return;
   }
   const saveProfileBtn = target.closest("[data-save-profile]");
@@ -587,6 +595,7 @@ document.addEventListener("click", (event) => {
         gitName: field("gitName").value.trim(),
         gitEmail: field("gitEmail").value.trim(),
         expectedRemoteOwners: listField("expectedRemoteOwners"),
+        exactRepos: listField("exactRepos"),
         expectedBranchPatterns: listField("expectedBranchPatterns"),
         strictPushSetup: field("strictPushSetup").checked,
       },

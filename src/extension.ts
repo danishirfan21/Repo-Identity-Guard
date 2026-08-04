@@ -2,7 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { buildAiContext } from "./core/aiContext";
-import { findOverlappingProfiles } from "./core/profileResolver";
+import { canonicalRepoKey, findOverlappingProfiles, resolveProfiles } from "./core/profileResolver";
 import { computeStatus } from "./core/statusEngine";
 import { collectRepoFacts } from "./services/gitService";
 import { copyToClipboard, runSavedCommand } from "./services/commandRunner";
@@ -58,6 +58,7 @@ export function activate(context: vscode.ExtensionContext): void {
     enableWorkspaceTrust: async () => {
       await vscode.commands.executeCommand("workbench.trust.manage");
     },
+    resolveProfileConflict: () => resolveProfileConflict(),
 
     addMemoryNote: async (text, pinned) => {
       const repoRoot = requireRepoRoot();
@@ -295,6 +296,46 @@ export function activate(context: vscode.ExtensionContext): void {
       await vscode.window.showInformationMessage(`Added profile "${label}".`);
     }
 
+    await scan(facts.repoRoot);
+  }
+
+  async function resolveProfileConflict(): Promise<void> {
+    const { facts } = latestSummary;
+    const resolution = resolveProfiles(facts, getProfiles());
+    const conflict = resolution.forkConflict;
+    if (!conflict) {
+      await vscode.window.showInformationMessage("No origin/upstream profile conflict to resolve for this repo.");
+      return;
+    }
+
+    const originKey = canonicalRepoKey(facts.remoteHost, facts.remoteOwner, facts.remoteRepo);
+    if (!originKey) {
+      await vscode.window.showInformationMessage("Could not determine this repo's canonical host/owner/repo.");
+      return;
+    }
+
+    const choice = await vscode.window.showQuickPick(
+      [
+        { label: conflict.originProfile.label, description: "Matches this repo's origin remote", profile: conflict.originProfile },
+        { label: conflict.upstreamProfile.label, description: "Matches this repo's upstream remote", profile: conflict.upstreamProfile },
+      ],
+      {
+        title: "Assign This Repo to a Profile",
+        placeHolder: `Which profile should ${originKey} always use?`,
+      },
+    );
+    if (!choice) return;
+
+    const profiles = getProfiles();
+    const next = profiles.map((profile) =>
+      profile.id === choice.profile.id
+        ? { ...profile, exactRepos: [...(profile.exactRepos ?? []), originKey] }
+        : profile,
+    );
+    await saveProfiles(next);
+    await vscode.window.showInformationMessage(
+      `Assigned ${originKey} to ${choice.profile.label}. This overrides owner-pattern matching for this exact repo.`,
+    );
     await scan(facts.repoRoot);
   }
 

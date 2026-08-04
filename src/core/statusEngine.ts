@@ -5,11 +5,12 @@ import {
   SafetyPreferences,
   StatusSummary,
 } from "../types";
-import { branchMatchesAnyPattern, findMatchingProfiles, wildcardMatch } from "./profileResolver";
+import { branchMatchesAnyPattern, canonicalRepoKey, resolveProfiles, wildcardMatch } from "./profileResolver";
 import {
   agentNotSafeIssue,
   branchPatternMismatchIssue,
   detachedHeadIssue,
+  forkConflictIssue,
   identityNotLockedIssue,
   inProgressOperationIssue,
   mergeConflictsIssue,
@@ -51,12 +52,14 @@ export function computeStatus(input: StatusEngineInput): StatusSummary {
     };
   }
 
-  const matches = findMatchingProfiles(facts, input.profiles);
-  const matchedProfile = matches.length === 1 ? matches[0] : undefined;
+  const resolution = resolveProfiles(facts, input.profiles);
+  const matchedProfile = resolution.matches.length === 1 ? resolution.matches[0] : undefined;
   const issues: Issue[] = [];
 
-  if (matches.length > 1) {
-    issues.push(overlappingProfilesIssue(facts, matches));
+  if (resolution.matches.length > 1) {
+    issues.push(overlappingProfilesIssue(facts, resolution.matches));
+  } else if (resolution.forkConflict) {
+    issues.push(forkConflictIssue(facts, resolution.forkConflict));
   } else if (!matchedProfile) {
     issues.push(profileUnknownIssue());
   } else {
@@ -145,12 +148,18 @@ function checkPushSetup(facts: RepoFacts, profile: Profile): Issue[] {
     return [pushDestinationUnresolvedIssue(profile)];
   }
 
+  const pushKey = canonicalRepoKey(facts.pushRemoteHost, facts.pushRemoteOwner, facts.pushRemoteRepo);
+  const exactRepoMatches = profile.exactRepos ?? [];
+  const matchesExactRepo = !!pushKey && exactRepoMatches.some((pattern) => wildcardMatch(pushKey, pattern));
+
   const expectedOwners = profile.expectedRemoteOwners ?? [];
-  const destinationMatches =
+  const matchesOwnerPattern =
     expectedOwners.length === 0 ||
     (facts.pushRemoteOwner
       ? expectedOwners.some((pattern) => wildcardMatch(facts.pushRemoteOwner as string, pattern))
       : false);
+
+  const destinationMatches = matchesExactRepo || matchesOwnerPattern;
 
   if (!destinationMatches) {
     return [pushDestinationMismatchIssue(facts, profile)];

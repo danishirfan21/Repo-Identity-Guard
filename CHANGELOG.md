@@ -4,6 +4,23 @@
 
 ### Added
 
+- Exact-repository profile overrides: `Profile.exactRepos` canonicalizes a
+  repo as `host/owner/repo` (wildcards allowed) and always takes precedence
+  over `expectedRemoteOwners` — pins one specific repo to a profile
+  regardless of its owner.
+- Fork/upstream conflict detection: if a repo has an `upstream` remote
+  whose owner unambiguously implies a *different* profile than `origin`'s
+  owner does (e.g. a personal fork of a company repo), that's reported as
+  NOT SAFE — "Origin and upstream imply different profiles" — instead of
+  silently trusting `origin`. `upstream` is only ever used as evidence for
+  this conflict, never as an automatic tiebreaker. **Assign This Repo**
+  resolves it by writing an exact-repository override to the chosen
+  profile.
+- Push destination matching now also honors a profile's `exactRepos`
+  override, not just `expectedRemoteOwners`.
+- `findOverlappingProfiles` (the proactive save-time warning) now also
+  checks for overlapping `exactRepos` entries, not just owner patterns.
+
 - Support for multiple profiles matching one repo owner is now detected
   explicitly: a repo whose remote owner matches more than one profile (e.g.
   two freelance clients sharing an org, or a duplicated/overlapping owner

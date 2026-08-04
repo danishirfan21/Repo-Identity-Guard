@@ -37,16 +37,36 @@ diverge (e.g. mid-rebase). This still reflects the environment checked at
 scan time; an explicit command-line override can always change what
 actually gets used for a given commit.
 
-Repo Identity Guard matches the open repo's `origin` remote owner (e.g. a
-GitHub org or username) against **Profiles** you define (Work, Personal,
-one per freelance client, one per employer — as many as you need) in
-Settings. A repo with no matching profile is treated as **NOT SAFE** —
-profile setup takes one click from Review Details. If a repo's owner
-matches *more than one* profile (e.g. two clients' owner patterns
-overlap), that's also **NOT SAFE** — "Multiple profiles match this repo" —
-rather than silently guessing which identity to use. Saving a profile
-whose owners overlap with an existing one warns you immediately, before it
-ever shows up as an unsafe repo.
+Repo Identity Guard matches the open repo against **Profiles** you define
+(Work, Personal, one per freelance client, one per employer — as many as
+you need) in Settings, in this order:
+
+1. **Exact-repository override** (`Profile.exactRepos`, canonicalized as
+   `host/owner/repo`, e.g. `github.com/AcmeSoftware/secret-project`) —
+   always wins outright when present. This is how you pin one specific
+   repo to a profile regardless of its owner, e.g. to resolve a
+   fork/upstream conflict (see below).
+2. **Owner/org pattern** (`Profile.expectedRemoteOwners`) matched against
+   the repo's `origin` remote.
+3. **Unresolved** — treated as **NOT SAFE**, "Repo profile is unknown,"
+   with a one-click **Add Profile for This Repo**.
+
+If a repo's owner matches *more than one* profile at the same tier (e.g.
+two clients' owner patterns overlap, or two profiles claim the same exact
+repo), that's also **NOT SAFE** — "Multiple profiles match this repo" —
+rather than silently picking one. Saving a profile whose owners or exact
+repos overlap with an existing one warns you immediately, before it ever
+shows up as an unsafe repo.
+
+**Fork/upstream conflicts:** if the repo has an `upstream` remote (the
+conventional name for the repo a fork was created from) and its owner
+unambiguously implies a *different* profile than `origin`'s owner does —
+e.g. your personal fork of a company repo — that's reported as **NOT
+SAFE**, "Origin and upstream imply different profiles," rather than
+silently trusting `origin`. `upstream` is only ever used as evidence for
+this conflict check; it never wins a match by itself. **Assign This Repo**
+resolves it by writing an exact-repository override to your chosen
+profile.
 
 ## Views
 
@@ -148,6 +168,7 @@ Settings view in the sidebar, or directly in `settings.json`:
       "gitName": "Jane Doe",
       "gitEmail": "jane@acme.com",
       "expectedRemoteOwners": ["AcmeSoftware"],
+      "exactRepos": ["github.com/some-other-org/one-specific-repo"],
       "expectedBranchPatterns": ["feature/*", "fix/*"],
       "strictPushSetup": true
     },
@@ -164,10 +185,12 @@ Settings view in the sidebar, or directly in `settings.json`:
 }
 ```
 
-`expectedRemoteOwners` and `expectedBranchPatterns` support `*` wildcards
-and are matched case-insensitively. `protectedBranches` is a **local**
-branch policy Repo Identity Guard enforces on this machine — it is not
-synced with, and does not check, GitHub's own branch protection settings.
+`expectedRemoteOwners`, `exactRepos`, and `expectedBranchPatterns` all
+support `*` wildcards and are matched case-insensitively. `exactRepos`
+always takes precedence over `expectedRemoteOwners` for the same repo.
+`protectedBranches` is a **local** branch policy Repo Identity Guard
+enforces on this machine — it is not synced with, and does not check,
+GitHub's own branch protection settings.
 
 ## Commands
 
@@ -195,11 +218,11 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
   toggle that could be mistaken for one — just a disabled "Coming soon"
   card. That's intentionally left as clean, opt-in-only architecture for a
   later pass.
-- **Profile matching is owner-only, not repo-exact.** A profile matches by
-  remote owner (e.g. a GitHub org/username), not by exact host+owner+repo.
-  This means a fork whose `origin` is your personal account but whose
-  `upstream` is a company org isn't specially handled yet — profile-level
-  exact-repo overrides and fork/upstream affiliation are a future pass.
+- **Fork detection is naming-convention-based, not verified.** The
+  fork/upstream conflict check only looks for a remote literally named
+  `upstream` — there's no reliable way to detect a fork relationship from
+  Git alone. A fork set up with a differently-named remote won't trigger
+  the conflict check.
 - **Single active repo per window.** A multi-root workspace with more than
   one Git repository only reflects whichever repo the active editor (or
   first workspace folder) belongs to — it doesn't yet aggregate status

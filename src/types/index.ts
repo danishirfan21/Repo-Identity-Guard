@@ -52,6 +52,12 @@ export interface RepoFacts {
   pushRemoteOwner?: string;
   pushRemoteRepo?: string;
 
+  /** The `upstream` remote, if one exists (the conventional fork-tracking remote name). Evidence only — never auto-selects a profile by itself. */
+  upstreamRemoteUrl?: string;
+  upstreamHost?: string;
+  upstreamOwner?: string;
+  upstreamRepo?: string;
+
   gitError?: string;
 }
 
@@ -61,6 +67,14 @@ export interface Profile {
   gitName?: string;
   gitEmail: string;
   expectedRemoteOwners?: string[];
+  /**
+   * Exact-repository overrides, canonicalized as `host/owner/repo` (wildcards
+   * allowed). Always takes precedence over `expectedRemoteOwners` — this is
+   * how a specific repo gets pinned to a profile regardless of its owner
+   * pattern, e.g. to resolve a fork/upstream conflict. Never keyed by disk
+   * path or written into the repo itself.
+   */
+  exactRepos?: string[];
   expectedBranchPatterns?: string[];
   strictPushSetup?: boolean;
 }
@@ -86,7 +100,8 @@ export type SuggestedActionCommand =
   | "openSettings"
   | "addProfileForRepo"
   | "reviewDetails"
-  | "enableWorkspaceTrust";
+  | "enableWorkspaceTrust"
+  | "resolveProfileConflict";
 
 export interface StatusSummary {
   level: SafetyLevel;

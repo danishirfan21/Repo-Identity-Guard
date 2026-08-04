@@ -136,6 +136,17 @@ export async function getOriginRemote(repoRoot: string): Promise<string | null> 
 }
 
 /**
+ * The `upstream` remote, if one exists — the conventional name for the repo
+ * a fork was created from. This is purely a naming convention (there's no
+ * reliable way to detect a fork relationship from Git alone), so callers
+ * must treat it as evidence to cross-check against `origin`, never as an
+ * automatic profile winner.
+ */
+export async function getUpstreamRemote(repoRoot: string): Promise<string | null> {
+  return tryGit(repoRoot, ["remote", "get-url", "upstream"]);
+}
+
+/**
  * Resolves which remote a plain `git push` would actually use, following
  * Git's own precedence: `branch.<name>.pushRemote`, then
  * `remote.pushDefault`, then `branch.<name>.remote`, then `origin` if it
@@ -302,6 +313,7 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       detached,
       statusFacts,
       remoteUrl,
+      upstreamUrl,
       authorIdent,
       committerIdent,
       localName,
@@ -316,6 +328,7 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       isDetachedHead(repoRoot),
       getStatusFacts(repoRoot),
       getOriginRemote(repoRoot),
+      getUpstreamRemote(repoRoot),
       getEffectiveAuthorIdent(repoRoot),
       getEffectiveCommitterIdent(repoRoot),
       getLocalGitUserName(repoRoot),
@@ -334,6 +347,7 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
     const parsedPushRemote = pushRemoteUrl ? parseRemoteUrl(pushRemoteUrl) : undefined;
 
     const parsedRemote = remoteUrl ? parseRemoteUrl(remoteUrl) : undefined;
+    const parsedUpstream = upstreamUrl ? parseRemoteUrl(upstreamUrl) : undefined;
 
     return {
       isGitRepo: true,
@@ -368,6 +382,11 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       pushRemoteHost: parsedPushRemote?.host,
       pushRemoteOwner: parsedPushRemote?.owner,
       pushRemoteRepo: parsedPushRemote?.repo,
+
+      upstreamRemoteUrl: upstreamUrl ?? undefined,
+      upstreamHost: parsedUpstream?.host,
+      upstreamOwner: parsedUpstream?.owner,
+      upstreamRepo: parsedUpstream?.repo,
     };
   } catch (error) {
     return {

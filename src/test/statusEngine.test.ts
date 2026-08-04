@@ -105,6 +105,52 @@ test("an unmatched/unknown profile is NOT SAFE", () => {
   assert.ok(summary.issues.some((issue) => issue.title === "Repo profile is unknown"));
 });
 
+test("a fork where origin and upstream imply different profiles is NOT SAFE and matchedProfile is unresolved", () => {
+  const personalProfile: Profile = {
+    id: "personal",
+    label: "Personal",
+    gitEmail: "danish@example.com",
+    expectedRemoteOwners: ["danish-irfan"],
+  };
+  const summary = computeStatus({
+    facts: safeFacts({ remoteOwner: "danish-irfan", upstreamOwner: "AcmeSoftware" }),
+    profiles: [workProfile, personalProfile],
+    protectedBranches: ["main", "master"],
+    preferences: defaultPreferences,
+  });
+  assert.equal(summary.level, "not_safe");
+  assert.equal(summary.matchedProfile, undefined);
+  assert.ok(summary.issues.some((issue) => issue.title === "Origin and upstream imply different profiles"));
+});
+
+test("assigning an exact-repo override resolves what would otherwise be a fork conflict", () => {
+  const personalWithOverride: Profile = {
+    id: "personal",
+    label: "Personal",
+    gitEmail: "danish@example.com",
+    expectedRemoteOwners: ["danish-irfan"],
+    exactRepos: ["github-work/danish-irfan/acme-frontend"],
+  };
+  const summary = computeStatus({
+    facts: safeFacts({
+      remoteOwner: "danish-irfan",
+      remoteHost: "github-work",
+      upstreamOwner: "AcmeSoftware",
+      effectiveGitEmail: "danish@example.com",
+      effectiveCommitterEmail: "danish@example.com",
+      localGitEmail: "danish@example.com",
+      pushRemoteHost: "github-work",
+      pushRemoteOwner: "danish-irfan",
+    }),
+    profiles: [workProfile, personalWithOverride],
+    protectedBranches: ["main", "master"],
+    preferences: defaultPreferences,
+    pinnedMemoryNote: "note",
+  });
+  assert.equal(summary.matchedProfile?.id, "personal");
+  assert.ok(!summary.issues.some((issue) => issue.title === "Origin and upstream imply different profiles"));
+});
+
 test("a repo matching two profiles (overlapping freelance clients) is NOT SAFE and unresolved", () => {
   const clientA: Profile = {
     id: "client-a",
@@ -153,6 +199,21 @@ test("push destination resolving to a different owner is NOT SAFE (destination m
   );
   assert.equal(summary.level, "not_safe");
   assert.ok(summary.issues.some((issue) => issue.title === "Push destination does not match Work"));
+});
+
+test("push destination matching a profile's exact-repo override is confirmed even outside its owner pattern", () => {
+  const profileWithOverride: Profile = {
+    ...workProfile,
+    expectedRemoteOwners: [],
+    exactRepos: ["github-work/acmesoftware/acme-frontend"],
+  };
+  const summary = computeStatus({
+    facts: safeFacts(),
+    profiles: [profileWithOverride],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+  });
+  assert.ok(!summary.issues.some((issue) => issue.category === "push_setup"));
 });
 
 test("push account is unverified over HTTPS, blocking only when the profile requires strict push setup", () => {

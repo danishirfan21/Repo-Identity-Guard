@@ -2,9 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   branchMatchesAnyPattern,
+  canonicalRepoKey,
   findMatchingProfiles,
   findOverlappingProfiles,
   ownerPatternsOverlap,
+  resolveProfiles,
   wildcardMatch,
 } from "../core/profileResolver";
 import { Profile, RepoFacts } from "../types";
@@ -96,6 +98,110 @@ test("findOverlappingProfiles flags profiles that share an owner pattern", () =>
 
 test("findOverlappingProfiles returns nothing when owners are disjoint", () => {
   assert.deepEqual(findOverlappingProfiles(workProfile, [workProfile, personalProfile]), []);
+});
+
+test("canonicalRepoKey lowercases and joins host/owner/repo", () => {
+  assert.equal(canonicalRepoKey("GitHub.com", "AcmeSoftware", "Widgets"), "github.com/acmesoftware/widgets");
+});
+
+test("canonicalRepoKey returns undefined when any part is missing", () => {
+  assert.equal(canonicalRepoKey(undefined, "AcmeSoftware", "widgets"), undefined);
+  assert.equal(canonicalRepoKey("github.com", undefined, "widgets"), undefined);
+  assert.equal(canonicalRepoKey("github.com", "AcmeSoftware", undefined), undefined);
+});
+
+test("resolveProfiles: exact-repo override wins over owner pattern entirely", () => {
+  const personalWithOverride: Profile = {
+    ...personalProfile,
+    exactRepos: ["github.com/AcmeSoftware/open-source-thing"],
+  };
+  const resolution = resolveProfiles(
+    facts({ remoteHost: "github.com", remoteOwner: "AcmeSoftware", remoteRepo: "open-source-thing" }),
+    [workProfile, personalWithOverride],
+  );
+  assert.equal(resolution.tier, "exact_repo");
+  assert.deepEqual(resolution.matches, [personalWithOverride]);
+});
+
+test("resolveProfiles: two profiles with the same exact-repo override are ambiguous", () => {
+  const a: Profile = { ...workProfile, id: "a", exactRepos: ["github.com/org/repo"] };
+  const b: Profile = { ...personalProfile, id: "b", exactRepos: ["github.com/org/repo"] };
+  const resolution = resolveProfiles(
+    facts({ remoteHost: "github.com", remoteOwner: "org", remoteRepo: "repo" }),
+    [a, b],
+  );
+  assert.equal(resolution.tier, "exact_repo");
+  assert.equal(resolution.matches.length, 2);
+});
+
+test("resolveProfiles: falls back to owner pattern when no exact-repo override matches", () => {
+  const resolution = resolveProfiles(facts({ remoteOwner: "AcmeSoftware" }), [workProfile, personalProfile]);
+  assert.equal(resolution.tier, "owner_pattern");
+  assert.deepEqual(resolution.matches, [workProfile]);
+});
+
+test("resolveProfiles: unresolved when nothing matches", () => {
+  const resolution = resolveProfiles(facts({ remoteOwner: "someone-else" }), [workProfile]);
+  assert.equal(resolution.tier, "none");
+  assert.deepEqual(resolution.matches, []);
+});
+
+test("resolveProfiles: fork conflict when origin and upstream imply different single profiles", () => {
+  // origin is the user's personal fork; upstream is the company's original repo.
+  const resolution = resolveProfiles(
+    facts({ remoteOwner: "danish-irfan", upstreamOwner: "AcmeSoftware" }),
+    [workProfile, personalProfile],
+  );
+  assert.equal(resolution.matches.length, 0);
+  assert.ok(resolution.forkConflict);
+  assert.equal(resolution.forkConflict!.originProfile.id, "personal");
+  assert.equal(resolution.forkConflict!.upstreamProfile.id, "work");
+});
+
+test("resolveProfiles: an exact-repo override resolves what would otherwise be a fork conflict", () => {
+  const personalWithOverride: Profile = {
+    ...personalProfile,
+    exactRepos: ["github.com/danish-irfan/forked-repo"],
+  };
+  const resolution = resolveProfiles(
+    facts({
+      remoteHost: "github.com",
+      remoteOwner: "danish-irfan",
+      remoteRepo: "forked-repo",
+      upstreamOwner: "AcmeSoftware",
+    }),
+    [workProfile, personalWithOverride],
+  );
+  assert.equal(resolution.tier, "exact_repo");
+  assert.equal(resolution.forkConflict, undefined);
+  assert.deepEqual(resolution.matches, [personalWithOverride]);
+});
+
+test("resolveProfiles: upstream matching nothing is not treated as a conflict", () => {
+  const resolution = resolveProfiles(
+    facts({ remoteOwner: "AcmeSoftware", upstreamOwner: "some-unrelated-org" }),
+    [workProfile, personalProfile],
+  );
+  assert.equal(resolution.tier, "owner_pattern");
+  assert.deepEqual(resolution.matches, [workProfile]);
+  assert.equal(resolution.forkConflict, undefined);
+});
+
+test("resolveProfiles: upstream implying the same profile as origin is not a conflict", () => {
+  const resolution = resolveProfiles(
+    facts({ remoteOwner: "AcmeSoftware", upstreamOwner: "AcmeSoftware" }),
+    [workProfile, personalProfile],
+  );
+  assert.equal(resolution.tier, "owner_pattern");
+  assert.deepEqual(resolution.matches, [workProfile]);
+  assert.equal(resolution.forkConflict, undefined);
+});
+
+test("findOverlappingProfiles also flags overlapping exact-repo overrides", () => {
+  const a: Profile = { ...workProfile, id: "a", expectedRemoteOwners: [], exactRepos: ["github.com/org/repo"] };
+  const b: Profile = { ...personalProfile, id: "b", expectedRemoteOwners: [], exactRepos: ["github.com/org/repo"] };
+  const overlaps = findOverlappingProfiles(a, [a, b]);
+  assert.deepEqual(overlaps, [b]);
 });
 
 test("branchMatchesAnyPattern treats an empty pattern list as always matching", () => {

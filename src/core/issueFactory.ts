@@ -1,3 +1,4 @@
+import { ForkConflict } from "./profileResolver";
 import { InProgressOperation, Issue, Profile, RepoFacts } from "../types";
 
 function identity(name?: string, email?: string): string {
@@ -60,6 +61,28 @@ export interface IdentityMismatch {
  * committer can diverge (e.g. during a rebase), so both are checked and
  * named individually when they disagree.
  */
+export function forkConflictIssue(facts: RepoFacts, conflict: ForkConflict): Issue {
+  return {
+    id: "commit_identity:fork_conflict",
+    category: "commit_identity",
+    severity: "blocking",
+    title: "Origin and upstream imply different profiles",
+    message: `This repo's origin remote suggests ${conflict.originProfile.label}, but its upstream remote suggests ${conflict.upstreamProfile.label} — likely a fork. We won't guess which one applies.`,
+    whyItMatters:
+      "A personal fork of a company repo (or vice versa) can silently use the wrong identity if the tool just assumes origin is authoritative. Upstream is treated as evidence of a conflict, never as an automatic tiebreaker.",
+    whatWeExpected: "Origin and upstream to imply the same profile, or an exact-repo override resolving which one applies",
+    whatWeFound: `origin → ${conflict.originProfile.label}, upstream → ${conflict.upstreamProfile.label}`,
+    suggestedAction: "Assign This Repo",
+    suggestedActionCommand: "resolveProfileConflict",
+    technicalDetails: {
+      originRemoteUrl: facts.originRemoteUrl,
+      remoteOwner: facts.remoteOwner,
+      upstreamRemoteUrl: facts.upstreamRemoteUrl,
+      upstreamOwner: facts.upstreamOwner,
+    },
+  };
+}
+
 export function wrongCommitIdentityIssue(
   facts: RepoFacts,
   profile: Profile,
