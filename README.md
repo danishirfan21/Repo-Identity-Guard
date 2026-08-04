@@ -23,11 +23,19 @@ it knows lives on your machine.
 
 | Category | Question it answers |
 | --- | --- |
-| **Commit Identity** | Who will appear as the author of commits? |
-| **Push Setup** | Is this repo clearly configured to push through the right account? |
+| **Commit Identity** | Who will appear as the author *and* committer of commits? |
+| **Push Setup** | Where would a plain `git push` actually go, and can the account be trusted? |
 | **Branch Safety** | Is the current branch safe for this repo? |
 | **Agent Guard** | Is this repo safe for an AI coding agent to operate in right now? |
 | **Repo Memory** | What repo-specific notes/commands should I not have to rediscover? |
+
+Commit identity is read from Git's *effective* author/committer identity
+(`git var GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT`), which reflects any
+environment-variable overrides — not just `git config user.name/email`.
+Author and committer are checked and reported separately, since they can
+diverge (e.g. mid-rebase). This still reflects the environment checked at
+scan time; an explicit command-line override can always change what
+actually gets used for a given commit.
 
 Repo Identity Guard matches the open repo's `origin` remote owner (e.g. a
 GitHub org or username) against **Profiles** you define (Work, Personal,
@@ -66,32 +74,65 @@ git config --local --unset user.email
 It never modifies global Git config, remotes, SSH config, credential
 managers, or keychains, and it never runs `push`, `push --force`,
 `reset --hard`, `clean -fd`, `rebase`, or `merge`. Saved commands in Repo
-Memory always run in a visible integrated terminal — never silently.
+Memory always run in a visible integrated terminal — never silently, and
+never at all when the workspace isn't [trusted](#workspace-trust).
 
-**Shield Mode / Agent Guard hooks** are opt-in local Git hooks that would
-block unsafe commits/pushes with a clear message. The toggle exists in
-Settings today as a safety preference; the hooks themselves are not yet
-installed automatically (see Limitations).
+Fixing commit identity on a repo that's a linked Git worktree shows an
+extra warning first: depending on whether `extensions.worktreeConfig` is
+on for that repo, the change may affect only this worktree or every
+worktree attached to it. Full per-worktree config management isn't built —
+this is deliberately just an honest warning before you confirm.
 
-## Push setup language
+**Shield Mode** (local Git hooks that would block unsafe commits/pushes) is
+not built yet. There is no toggle for it — a disabled "Coming soon" card in
+Settings makes that explicit, rather than showing a switch that looks live
+but does nothing (see Limitations).
 
-- "Push setup is verified" / "Push setup is not verified"
-- "Repo is not locked to Work identity"
-- "Make Push Setup Safer"
+## Push setup: destination vs. account
 
-A repo pushing over a generic host (`github.com` via HTTPS, or SSH without a
-dedicated host alias) can't prove which account will authenticate. Whether
-that's treated as **NOT SAFE** or just a warning depends on each profile's
-**Strict push setup** setting (Settings → Profiles).
+Push safety is really two separate questions, and Repo Identity Guard
+answers them separately instead of collapsing them into one claim:
+
+- **Push destination** — where would a plain `git push` actually go? This
+  follows Git's own resolution order (`branch.<name>.pushRemote` →
+  `remote.pushDefault` → `branch.<name>.remote` → `origin`), not just
+  `origin`'s fetch URL. If it resolves to an owner that doesn't match the
+  matched profile (e.g. a branch's push remote points at an upstream fork),
+  that's **NOT SAFE** — "Push destination does not match `<Profile>`". If it
+  can't be resolved at all, that's **NOT SAFE** too — "Push destination is
+  not verified" — regardless of any profile's strictness setting, because
+  an unresolved destination isn't a judgment call.
+- **Push account** — once the destination is confirmed, can we tell which
+  account will actually authenticate? HTTPS (credential manager) and a
+  generic SSH host (`github.com` with no dedicated alias) can't be
+  confirmed locally, so they're reported as "Push account is unverified."
+  Whether that's **NOT SAFE** or just a warning depends on the profile's
+  **Strict push setup** setting. This is never phrased as verifying the
+  account — only ever "trusted from your profile configuration."
 
 ## Copy Context for AI
 
-One click copies a privacy-safe summary for pasting into an AI agent's
-context — repo name, matched profile, status, branch, open issues, and
-pinned memory notes — plus a short list of rules for the agent (no
-`git push`, don't touch `main`/`master`, ask before switching branches or
-changing identity/remote/SSH/credential config). It never includes secrets,
-tokens, `.env` values, SSH key contents, or raw Git config.
+One click copies a summary for pasting into an AI agent's context — repo
+name, matched profile, status, branch, open issues — plus a fixed list of
+rules for the agent (no `git push`, don't touch `main`/`master`, ask before
+switching branches, preserve existing uncommitted changes, don't change
+identity/remote/SSH/credential config). It never includes secrets, tokens,
+`.env` values, SSH key contents, or raw Git config — the fields copied are
+an explicit allowlist, not a best-effort filter.
+
+The exact text is always opened in a preview tab so you can check it before
+pasting anywhere, in addition to being copied to the clipboard. Your pinned
+Repo Memory note is **not** included by default — it's free text you wrote
+for yourself and may contain sensitive info. Turn on "Include pinned memory
+note in Copy Context for AI" in Settings if you want it included.
+
+## Workspace Trust
+
+Read-only scanning still runs in an untrusted workspace — you'll see an
+honest NOT SAFE with "Workspace is not trusted" rather than nothing at all.
+But **Fix Commit Identity** and running a saved command are both blocked
+until the workspace is trusted, since both execute something in that
+folder.
 
 ## Settings
 
@@ -119,12 +160,14 @@ Settings view in the sidebar, or directly in `settings.json`:
   ],
   "repoIdentityGuard.protectedBranches": ["main", "master"],
   "repoIdentityGuard.requireLocalIdentity": false,
-  "repoIdentityGuard.agentGuardEnabled": false
+  "repoIdentityGuard.includeMemoryInAiContext": false
 }
 ```
 
 `expectedRemoteOwners` and `expectedBranchPatterns` support `*` wildcards
-and are matched case-insensitively.
+and are matched case-insensitively. `protectedBranches` is a **local**
+branch policy Repo Identity Guard enforces on this machine — it is not
+synced with, and does not check, GitHub's own branch protection settings.
 
 ## Commands
 
@@ -148,9 +191,28 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
 
 ## Limitations in this build
 
-- Shield Mode / Agent Guard is a Settings preference and status-engine
-  signal today; it does not yet install Git hooks. That is intentionally
-  left as clean, opt-in-only architecture for a later pass.
+- **Shield Mode is not built.** No Git hooks are installed, and there is no
+  toggle that could be mistaken for one — just a disabled "Coming soon"
+  card. That's intentionally left as clean, opt-in-only architecture for a
+  later pass.
+- **Profile matching is owner-only, not repo-exact.** A profile matches by
+  remote owner (e.g. a GitHub org/username), not by exact host+owner+repo.
+  This means a fork whose `origin` is your personal account but whose
+  `upstream` is a company org isn't specially handled yet — profile-level
+  exact-repo overrides and fork/upstream affiliation are a future pass.
+- **Single active repo per window.** A multi-root workspace with more than
+  one Git repository only reflects whichever repo the active editor (or
+  first workspace folder) belongs to — it doesn't yet aggregate status
+  across every repo in the workspace.
+- **No cryptographic account verification.** "Push account is unverified"
+  never upgrades to "verified" — Repo Identity Guard doesn't make network
+  calls (e.g. an SSH test connection) to confirm which account a key or
+  credential belongs to. SSH host aliases are trusted from your own profile
+  configuration, not cryptographically checked.
+- **Worktree config isn't fully modeled.** Fixing identity on a linked
+  worktree shows a warning about scope (this worktree vs. every worktree)
+  based on `extensions.worktreeConfig`, but doesn't manage per-worktree
+  config for you.
 - It does not switch GitHub CLI accounts, switch SSH keys, manage HTTPS
   credentials, or touch OS keychains/credential managers.
 - It never runs `push`, `reset --hard`, `clean`, `rebase`, `merge`, or edits

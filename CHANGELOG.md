@@ -14,6 +14,44 @@
   immediately if its expected remote owners overlap with an existing
   profile's, so the ambiguity can be caught before it ever shows up as an
   unsafe repo.
+- Commit identity now reads Git's *effective* author and committer identity
+  (`git var GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT`), not just
+  `git config user.name/email` — this catches environment-variable
+  overrides a plain config read would miss, and author/committer are
+  checked and reported separately since they can diverge.
+- Push setup is now two separate checks instead of one: **push
+  destination** (does a plain `git push` actually go where the matched
+  profile expects, resolved via `branch.<name>.pushRemote` →
+  `remote.pushDefault` → `branch.<name>.remote` → `origin`, not just
+  `origin`'s fetch URL) and **push account** (can we tell which account
+  authenticates — HTTPS/generic-SSH stay "unverified," never "verified").
+  An unresolved or mismatched push destination is always NOT SAFE,
+  regardless of a profile's strict push setup setting.
+- Agent Guard now checks repo operation state: an in-progress
+  merge/rebase/cherry-pick/revert or unresolved conflicts is NOT SAFE
+  (blocking); ordinary uncommitted changes are a non-blocking warning
+  ("preserve existing changes"), so the tool isn't permanently red during
+  normal development.
+- Workspace Trust integration: read-only scanning still runs in an
+  untrusted workspace (reported as NOT SAFE), but Fix Commit Identity and
+  running saved commands are both blocked until the workspace is trusted.
+- Linked Git worktrees now get a warning before Fix Commit Identity runs,
+  noting whether the change affects only this worktree or every worktree
+  attached to the repository (based on `extensions.worktreeConfig`).
+- Copy Context for AI now always opens a preview tab of the exact text
+  before/alongside copying to the clipboard, includes a "Checked:"
+  timestamp, and no longer includes the pinned Repo Memory note unless you
+  explicitly opt in via a new `repoIdentityGuard.includeMemoryInAiContext`
+  setting (off by default).
+
+### Changed
+
+- **Shield Mode's toggle has been removed.** `repoIdentityGuard.agentGuardEnabled`
+  no longer exists; Settings shows a disabled "Shield Mode — Coming soon"
+  card instead, so nothing in the UI can be mistaken for active enforcement.
+- "Protected branches" is now described everywhere as a **local branch
+  policy** — Repo Identity Guard does not check or sync with GitHub's own
+  branch protection settings.
 
 ## 0.2.0
 

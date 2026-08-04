@@ -124,19 +124,25 @@
           "type": "array",
           "default": ["main", "master"],
           "items": { "type": "string" },
-          "description": "Branch names that should never be committed to directly."
+          "description": "Local branch policy: branch names Repo Identity Guard treats as protected on this machine. Not synced with GitHub's own branch protection settings."
         },
         "repoIdentityGuard.requireLocalIdentity": {
           "type": "boolean",
           "default": false,
           "description": "Require matched repositories to set the expected identity in local Git config, even when the effective identity currently matches via global config."
         },
-        "repoIdentityGuard.agentGuardEnabled": {
+        "repoIdentityGuard.includeMemoryInAiContext": {
           "type": "boolean",
           "default": false,
-          "description": "Shield Mode (coming later): opt-in local Git hooks that block unsafe commits/pushes. Currently a preference placeholder only — no hooks are installed."
+          "description": "Off by default. When enabled, your pinned Repo Memory note is included in 'Copy Context for AI'. Pinned notes are free text you wrote for yourself and may contain sensitive info — only enable this if you're sure."
         }
       }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Read-only repo scanning still runs in untrusted workspaces. Fixing commit identity and running saved commands are blocked until the workspace is trusted."
     }
   },
   "devDependencies": {

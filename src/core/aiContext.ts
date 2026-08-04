@@ -4,18 +4,37 @@ const AI_RULES = [
   "Do not run git push.",
   "Do not modify main/master.",
   "Ask before changing branch.",
+  "Preserve existing uncommitted changes — do not reset, stash, or discard them.",
   "Do not change Git identity, remotes, SSH config, or credential settings.",
 ];
 
-/**
- * Builds a privacy-safe text block for pasting into an AI agent's context.
- * Deliberately excludes secrets, tokens, .env values, SSH key contents, raw
- * Git config, and any private file contents — only status labels, issue
- * titles, and pinned memory text ever go in.
- */
-export function buildAiContext(summary: StatusSummary, memory: RepoMemory): string {
-  const lines: string[] = ["[REPO CONTEXT]"];
+export interface AiContextOptions {
+  /**
+   * Off unless the user explicitly opts in (Settings). Pinned notes are
+   * user-authored free text and may contain things the user typed for
+   * themselves, not for export — never include them silently.
+   */
+  includeMemory: boolean;
+  /** Injectable for tests; defaults to `new Date()`. */
+  now?: Date;
+}
 
+/**
+ * Builds a text block for pasting into an AI agent's context. Fields are an
+ * explicit allowlist — repo name, matched profile, status, branch, issue
+ * titles, and (only when opted in) pinned memory text — never raw remote
+ * URLs, tokens, secrets, `.env` values, SSH key contents, or raw Git config.
+ * Call sites should let the user preview this exact text before it's used.
+ */
+export function buildAiContext(
+  summary: StatusSummary,
+  memory: RepoMemory,
+  options: AiContextOptions,
+): string {
+  const lines: string[] = ["[REPO CONTEXT]"];
+  const checkedAt = options.now ?? new Date();
+
+  lines.push(`Checked: ${checkedAt.toLocaleString()}`);
   lines.push(`Repo: ${summary.repoName ?? "Unknown"}`);
   lines.push(`Profile: ${summary.matchedProfile?.label ?? "Unknown"}`);
   lines.push(`Status: ${statusLabel(summary.level)}`);
@@ -34,11 +53,16 @@ export function buildAiContext(summary: StatusSummary, memory: RepoMemory): stri
   }
 
   const pinnedNotes = memory.notes.filter((note) => note.pinned);
-  if (pinnedNotes.length > 0) {
-    lines.push("", "Pinned memory:");
+  if (options.includeMemory && pinnedNotes.length > 0) {
+    lines.push("", "User-approved pinned notes:");
     for (const note of pinnedNotes) {
       lines.push(`- ${note.text}`);
     }
+  } else if (pinnedNotes.length > 0) {
+    lines.push(
+      "",
+      "(Pinned memory omitted — enable \"Include Repo Memory in AI context\" in Settings to include it. Notes are free text you wrote and may contain sensitive info.)",
+    );
   }
 
   lines.push("", "Rules for AI:");

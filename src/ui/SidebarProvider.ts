@@ -8,6 +8,7 @@ export interface SidebarActions {
   addProfileForRepo(): Promise<void>;
   openSettingsJson(): Promise<void>;
   copyContextForAI(): Promise<void>;
+  enableWorkspaceTrust(): Promise<void>;
 
   addMemoryNote(text: string, pinned: boolean): Promise<void>;
   removeMemoryNote(id: string): Promise<void>;
@@ -21,7 +22,7 @@ export interface SidebarActions {
   deleteProfile(id: string): Promise<void>;
   saveProtectedBranches(branches: string[]): Promise<void>;
   saveRequireLocalIdentity(value: boolean): Promise<void>;
-  saveAgentGuardEnabled(value: boolean): Promise<void>;
+  saveIncludeMemoryInAiContext(value: boolean): Promise<void>;
 }
 
 export interface SidebarModel {
@@ -85,6 +86,9 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
       case "copyContextForAI":
         await a.copyContextForAI();
         break;
+      case "enableWorkspaceTrust":
+        await a.enableWorkspaceTrust();
+        break;
       case "addMemoryNote":
         await a.addMemoryNote(String(message.text ?? ""), !!message.pinned);
         break;
@@ -118,8 +122,8 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
       case "saveRequireLocalIdentity":
         await a.saveRequireLocalIdentity(!!message.value);
         break;
-      case "saveAgentGuardEnabled":
-        await a.saveAgentGuardEnabled(!!message.value);
+      case "saveIncludeMemoryInAiContext":
+        await a.saveIncludeMemoryInAiContext(!!message.value);
         break;
     }
   }
@@ -271,6 +275,8 @@ function handleSuggestedAction(command) {
   if (command === "openRepoMemory") { navigate("memory"); return; }
   if (command === "openSettings") { navigate("settings"); return; }
   if (command === "addProfileForRepo") { send("addProfileForRepo"); return; }
+  if (command === "reviewDetails") { navigate("details"); return; }
+  if (command === "enableWorkspaceTrust") { send("enableWorkspaceTrust"); return; }
 }
 
 // ---------- MAIN VIEW ----------
@@ -464,7 +470,8 @@ function renderSettings() {
     </section>
 
     <section class="vs-card flex flex-col gap-1.5 rounded-lg p-2.5">
-      <span class="font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Protected Branches</span>
+      <span class="font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Local Branch Policy</span>
+      <p class="m-0 text-[11px] text-on-surface-variant">Branches treated as protected on this machine only — not synced with GitHub's own branch protection rules.</p>
       <input id="protectedBranchesInput" class="h-7 rounded border border-outline-variant bg-surface-container-lowest px-2 text-[12px] text-on-surface" value="\${esc(state.protectedBranches.join(", "))}" />
       <button class="vs-button-secondary h-7 rounded text-[12px]" id="saveBranchesButton">Save</button>
     </section>
@@ -475,10 +482,17 @@ function renderSettings() {
         <input type="checkbox" id="requireLocalIdentityCheckbox" \${state.preferences.requireLocalIdentity ? "checked" : ""} />
         Require identity to be locked locally per repo
       </label>
-      <label class="flex items-center gap-1.5 text-[12px] text-on-surface">
-        <input type="checkbox" id="agentGuardCheckbox" \${state.preferences.agentGuardEnabled ? "checked" : ""} />
-        Shield Mode (opt-in local git hooks, coming later)
+      <label class="flex items-start gap-1.5 text-[12px] text-on-surface">
+        <input type="checkbox" id="includeMemoryCheckbox" class="mt-0.5" \${state.preferences.includeMemoryInAiContext ? "checked" : ""} />
+        <span>Include pinned memory note in Copy Context for AI
+          <span class="mt-0.5 block text-[10px] text-on-surface-variant">Off by default. Pinned notes are free text you wrote for yourself and may contain sensitive info — only turn this on if you're sure.</span>
+        </span>
       </label>
+    </section>
+
+    <section class="vs-card flex flex-col gap-1 rounded-lg p-2.5 opacity-60">
+      <span class="font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Shield Mode — Coming soon</span>
+      <p class="m-0 text-[11px] text-on-surface-variant">Optional local Git hooks that would block unsafe commits/pushes. Not built yet — this is not currently protecting you, and there is no toggle for it.</p>
     </section>
 
     <button class="vs-button-secondary h-7 rounded text-[12px]" id="openSettingsJsonButton">Open settings.json</button>
@@ -594,7 +608,7 @@ document.addEventListener("change", (event) => {
   const target = event.target;
   if (!(target instanceof Element)) return;
   if (target.id === "requireLocalIdentityCheckbox") { send("saveRequireLocalIdentity", { value: target.checked }); return; }
-  if (target.id === "agentGuardCheckbox") { send("saveAgentGuardEnabled", { value: target.checked }); return; }
+  if (target.id === "includeMemoryCheckbox") { send("saveIncludeMemoryInAiContext", { value: target.checked }); return; }
 });
 
 window.addEventListener("message", (event) => {

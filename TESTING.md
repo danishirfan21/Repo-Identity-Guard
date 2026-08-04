@@ -21,18 +21,28 @@ git branch --show-current
 | Scenario | Setup | Expected |
 | --- | --- | --- |
 | Safe repo | Profile matches remote owner; effective identity, protocol, and branch all match. | Main view shows 🟢 SAFE. |
-| Wrong commit identity | Profile matches; set local/global identity to a different name/email. | 🔴 NOT SAFE; "Wrong commit identity" in Review Details; **Fix Commit Identity** repairs it. |
+| Wrong author identity | Profile matches; set local/global identity to a different name/email. | 🔴 NOT SAFE; "Wrong commit identity" in Review Details, "What we found" starts with "Author:"; **Fix Commit Identity** repairs it. |
+| Wrong committer identity only | `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` env vars set to something else while `user.name`/`user.email` are correct. | 🔴 NOT SAFE; "Wrong commit identity", "What we found" shows "Committer:" only. |
+| Environment override missed by config-only check | Set `GIT_AUTHOR_EMAIL` env var to a different address while `git config user.email` still shows the right one. | Still 🔴 NOT SAFE — confirms the check uses `git var GIT_AUTHOR_IDENT`, not just `git config`. |
 | Unknown profile | No profile's `expectedRemoteOwners` matches this repo's remote owner. | 🔴 NOT SAFE; "Repo profile is unknown"; Review Details offers **Add Profile for This Repo**. |
-| HTTPS push, relaxed profile | `strictPushSetup: false`, origin is `https://github.com/...`. | Still SAFE overall; "Push setup is not verified" appears as a non-blocking warning. |
-| HTTPS push, strict profile | `strictPushSetup: true`, origin is `https://github.com/...`. | 🔴 NOT SAFE; "Push setup is not verified" is blocking. |
-| Generic SSH host, strict profile | `strictPushSetup: true`, origin like `git@github.com:org/repo.git`. | 🔴 NOT SAFE; "Repo is not locked to `<Profile>` identity". |
-| SSH host alias | Origin like `git@github-work:AcmeSoftware/repo.git`. | No push-setup issue (treated as a locked, dedicated host). |
+| Push destination unresolved | Remove all remotes (`git remote remove origin`) and unset any `pushRemote`/`pushDefault`. | 🔴 NOT SAFE; "Push destination is not verified" — blocking even with `strictPushSetup: false`. |
+| Push destination mismatch | Set `branch.<name>.pushRemote` (or add an `upstream` remote and point push there) to a remote owned by someone other than the matched profile. | 🔴 NOT SAFE; "Push destination does not match `<Profile>`". |
+| HTTPS push, relaxed profile | `strictPushSetup: false`, push remote is `https://github.com/...`. | Still SAFE overall; "Push account is unverified" appears as a non-blocking warning. |
+| HTTPS push, strict profile | `strictPushSetup: true`, push remote is `https://github.com/...`. | 🔴 NOT SAFE; "Push account is unverified" is blocking. |
+| Generic SSH host, strict profile | `strictPushSetup: true`, push remote like `git@github.com:org/repo.git`. | 🔴 NOT SAFE; "Push account is unverified". |
+| SSH host alias | Push remote like `git@github-work:AcmeSoftware/repo.git`. | No push-setup issue (treated as a trusted, dedicated host). |
 | Protected branch | Check out `main` or `master`. | 🔴 NOT SAFE; "Working directly on main". |
 | Detached HEAD | `git checkout <commit-sha>`. | 🔴 NOT SAFE; "Working in detached HEAD". |
 | Branch pattern mismatch | Profile has `expectedBranchPatterns: ["feature/*"]`; check out `chore/x`. | Non-blocking "Branch does not match repo rules" warning. |
+| Merge conflict | Start a merge that conflicts, leave it unresolved. | 🔴 NOT SAFE; "Unresolved merge conflicts". |
+| Rebase in progress | `git rebase -i HEAD~2` and stop mid-rebase. | 🔴 NOT SAFE; "A rebase is in progress". |
+| Ordinary uncommitted changes | Edit a tracked file, don't commit; no conflicts, no in-progress operation. | Still SAFE overall; non-blocking "Uncommitted changes present" warning ("preserve existing changes"). |
+| Untrusted workspace | Open the folder, then disable Workspace Trust for it (`Workspaces: Manage Workspace Trust`). | 🔴 NOT SAFE; "Workspace is not trusted"; **Fix Commit Identity** and saved-command **Run** are both blocked with a clear message. |
+| Linked worktree | `git worktree add ../wt-branch branch-name`, open that folder, try **Fix Commit Identity**. | Confirmation dialog includes an extra sentence about affecting this worktree only vs. every worktree, based on `extensions.worktreeConfig`. |
 | Strict local identity | Enable `repoIdentityGuard.requireLocalIdentity`; unset local identity while global/effective still matches. | Non-blocking "Repo is not locked to `<Profile>` identity" (commit identity). |
 | Non-Git folder | Open a plain folder with no `.git`. | ⚪ NOT CHECKED. |
 | No pinned memory | Repo Memory has no pinned note. | Info-only "No pinned repo memory" (never blocks SAFE). |
+| Shield Mode card | Open Settings. | A disabled "Shield Mode — Coming soon" card with no checkbox — never an interactive toggle. |
 
 Remember: Repo Identity Guard does not verify pull/push access. If
 `git pull` or `git push` fails with "Repository not found", check GitHub
@@ -89,27 +99,34 @@ Open **Review Details** and confirm each issue shows, in plain English:
 
 ### Copy Context for AI
 
-Click **Copy Context for AI** from the Main view, paste the clipboard
-contents, and confirm it includes:
-
-- Repo name, matched profile, status, branch
-- The open (non-info) issues
-- Pinned memory notes
-- A fixed "Rules for AI" section (no push, don't touch main/master, ask
-  before switching branches, don't change identity/remote/SSH/credentials)
-
-Confirm it does **not** include secrets, tokens, `.env` values, SSH key
-contents, or raw Git config.
+1. With no pinned note, click **Copy Context for AI** from the Main view.
+   Confirm a preview tab opens with the exact text, and that it's also on
+   the clipboard.
+2. Confirm the preview includes: a "Checked:" timestamp, repo name, matched
+   profile, status, branch, the open (non-info) issues, and a fixed "Rules
+   for AI" section (no push, don't touch main/master, ask before switching
+   branches, preserve existing uncommitted changes, don't change
+   identity/remote/SSH/credentials).
+3. Pin a memory note. With "Include pinned memory note in Copy Context for
+   AI" **off** (default), confirm the preview shows a note explaining it
+   was omitted, not the note text itself.
+4. Turn the setting **on**, copy again, and confirm the pinned note text
+   now appears under "User-approved pinned notes."
+5. Confirm the output never includes secrets, tokens, `.env` values, SSH
+   key contents, or raw Git config regardless of the setting.
 
 ### Settings
 
 1. Open the Settings view. Add a profile with label, Git name/email,
    expected remote owners, expected branch patterns, and strict push setup.
 2. Confirm it's saved to `repoIdentityGuard.profiles` in `settings.json`.
-3. Edit protected branches; confirm it updates
+3. Edit the Local Branch Policy field; confirm it updates
    `repoIdentityGuard.protectedBranches`.
-4. Toggle "Require identity to be locked locally" and "Shield Mode"; confirm
-   both persist and trigger a rescan.
+4. Toggle "Require identity to be locked locally" and "Include pinned
+   memory note in Copy Context for AI"; confirm both persist to
+   `settings.json` and trigger a rescan.
+5. Confirm the "Shield Mode — Coming soon" card has no checkbox and cannot
+   be interacted with.
 
 ### Refresh behavior
 
@@ -119,7 +136,8 @@ Confirm status updates after:
 - editing repo-local Git config with `git config --local`;
 - editing global Git config with `git config --global`;
 - switching the active editor between repositories;
-- pinning/unpinning a Repo Memory note.
+- pinning/unpinning a Repo Memory note;
+- granting Workspace Trust to a previously untrusted folder.
 
 ## Automated checks
 

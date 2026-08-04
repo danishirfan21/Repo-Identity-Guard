@@ -1,4 +1,4 @@
-import { Issue, Profile, RepoFacts } from "../types";
+import { InProgressOperation, Issue, Profile, RepoFacts } from "../types";
 
 function identity(name?: string, email?: string): string {
   if (!name && !email) {
@@ -48,7 +48,31 @@ export function overlappingProfilesIssue(facts: RepoFacts, matches: Profile[]): 
   };
 }
 
-export function wrongCommitIdentityIssue(facts: RepoFacts, profile: Profile): Issue {
+export interface IdentityMismatch {
+  author: boolean;
+  committer: boolean;
+}
+
+/**
+ * "What we found" is built from Git's *effective* author/committer identity
+ * (`git var GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT`), which accounts for
+ * environment overrides — not just `git config user.name/email`. Author and
+ * committer can diverge (e.g. during a rebase), so both are checked and
+ * named individually when they disagree.
+ */
+export function wrongCommitIdentityIssue(
+  facts: RepoFacts,
+  profile: Profile,
+  mismatch: IdentityMismatch,
+): Issue {
+  const found: string[] = [];
+  if (mismatch.author) {
+    found.push(`Author: ${identity(facts.effectiveGitName, facts.effectiveGitEmail)}`);
+  }
+  if (mismatch.committer) {
+    found.push(`Committer: ${identity(facts.effectiveCommitterName, facts.effectiveCommitterEmail)}`);
+  }
+
   return {
     id: "commit_identity:wrong",
     category: "commit_identity",
@@ -56,14 +80,16 @@ export function wrongCommitIdentityIssue(facts: RepoFacts, profile: Profile): Is
     title: "Wrong commit identity",
     message: `Commits in this repo may be authored with the wrong identity instead of ${profile.label}.`,
     whyItMatters:
-      "Commits with the wrong name or email can leak personal info into a work repo, or vice versa, and can't be un-pushed easily.",
+      "Commits with the wrong name or email can leak personal info into a work repo, or vice versa, and can't be un-pushed easily. This reflects Git's effective author/committer identity in the environment checked, including any environment-variable overrides — a command can still override it explicitly.",
     whatWeExpected: `${profile.label} identity: ${identity(profile.gitName, profile.gitEmail)}`,
-    whatWeFound: identity(facts.effectiveGitName, facts.effectiveGitEmail),
+    whatWeFound: found.join(" · ") || identity(facts.effectiveGitName, facts.effectiveGitEmail),
     suggestedAction: "Fix Commit Identity",
     suggestedActionCommand: "fixCommitIdentity",
     technicalDetails: {
-      effectiveGitName: facts.effectiveGitName,
-      effectiveGitEmail: facts.effectiveGitEmail,
+      effectiveAuthorName: facts.effectiveGitName,
+      effectiveAuthorEmail: facts.effectiveGitEmail,
+      effectiveCommitterName: facts.effectiveCommitterName,
+      effectiveCommitterEmail: facts.effectiveCommitterEmail,
       localGitName: facts.localGitName,
       localGitEmail: facts.localGitEmail,
       globalGitName: facts.globalGitName,
@@ -95,62 +121,76 @@ export function identityNotLockedIssue(facts: RepoFacts, profile: Profile): Issu
   };
 }
 
-export function pushSetupHttpsIssue(facts: RepoFacts, profile: Profile, blocking: boolean): Issue {
+/** The push destination couldn't be resolved at all — ambiguous, so always blocking regardless of profile strictness. */
+export function pushDestinationUnresolvedIssue(profile: Profile): Issue {
   return {
-    id: "push_setup:https_unverified",
+    id: "push_setup:destination_unresolved",
     category: "push_setup",
-    severity: blocking ? "blocking" : "warning",
-    title: "Push setup is not verified",
-    message:
-      "This repo pushes over HTTPS. We can't tell which account will actually authenticate when you push.",
+    severity: "blocking",
+    title: "Push destination is not verified",
+    message: "We couldn't work out where a plain `git push` would actually send commits from this branch.",
     whyItMatters:
-      "Your credential manager could be signed into a different account than the one this repo expects, so a push could go out under the wrong name.",
-    whatWeExpected: `A push setup clearly locked to ${profile.label}`,
-    whatWeFound: `HTTPS remote (${facts.remoteHost ?? "unknown host"})`,
+      "With no resolvable remote, a push could fail, go somewhere unintended, or require a destination to be chosen on the spot — none of which is safe to assume for an AI agent.",
+    whatWeExpected: `A push destination resolvable to ${profile.label}`,
+    whatWeFound: "No configured pushRemote, pushDefault, branch remote, or origin",
+    suggestedAction: "Make Push Setup Safer",
+    suggestedActionCommand: "makePushSetupSafer",
+  };
+}
+
+/** The push destination resolved to a real remote, but its owner doesn't match the matched profile at all. */
+export function pushDestinationMismatchIssue(facts: RepoFacts, profile: Profile): Issue {
+  return {
+    id: "push_setup:destination_mismatch",
+    category: "push_setup",
+    severity: "blocking",
+    title: `Push destination does not match ${profile.label}`,
+    message: `A plain \`git push\` from this branch would go to ${facts.pushRemoteOwner ?? "an owner"}, not ${profile.label}.`,
+    whyItMatters:
+      "This can happen when a branch's push remote points somewhere other than the repo's origin (e.g. an upstream fork) — pushing would land in the wrong place.",
+    whatWeExpected: `Push destination owned by ${profile.label}`,
+    whatWeFound: `Push remote "${facts.pushRemoteName ?? "unknown"}" → ${facts.pushRemoteOwner ?? "unknown owner"}`,
     suggestedAction: "Make Push Setup Safer",
     suggestedActionCommand: "makePushSetupSafer",
     technicalDetails: {
+      pushRemoteName: facts.pushRemoteName,
+      pushRemoteUrl: facts.pushRemoteUrl,
       originRemoteUrl: facts.originRemoteUrl,
-      remoteProtocol: facts.remoteProtocol,
-      remoteHost: facts.remoteHost,
     },
   };
 }
 
-export function pushSetupGenericSshIssue(facts: RepoFacts, profile: Profile, blocking: boolean): Issue {
+/**
+ * Push destination is confirmed correct, but we still can't say *which
+ * account* will authenticate the push (HTTPS credential helper, or SSH with
+ * no dedicated host alias). This is deliberately never phrased as verifying
+ * the account — only the destination is confirmed.
+ */
+export function pushAccountUnverifiedIssue(facts: RepoFacts, profile: Profile, blocking: boolean): Issue {
+  const isHttps = facts.pushRemoteProtocol === "https";
   return {
-    id: "push_setup:generic_ssh",
+    id: isHttps ? "push_setup:account_unverified_https" : "push_setup:account_unverified_ssh",
     category: "push_setup",
     severity: blocking ? "blocking" : "warning",
-    title: `Repo is not locked to ${profile.label} identity`,
-    message:
-      "This repo uses a generic SSH host, so it will push with whichever SSH key is used by default — not necessarily the right account.",
-    whyItMatters:
-      "A generic SSH host doesn't guarantee that the account behind your default SSH key matches this repo's expected profile.",
-    whatWeExpected: `A dedicated SSH host alias for ${profile.label}`,
-    whatWeFound: `SSH remote using generic host: ${facts.remoteHost ?? "unknown"}`,
+    title: "Push account is unverified",
+    message: isHttps
+      ? "This repo pushes over HTTPS. We can't tell which account your credential manager will actually authenticate with."
+      : "This repo's push remote uses a generic SSH host, so it authenticates with whichever SSH key is used by default — not necessarily the right account.",
+    whyItMatters: isHttps
+      ? "Your credential manager could be signed into a different account than the one this repo expects, so a push could go out under the wrong name."
+      : "A generic SSH host doesn't guarantee that the account behind your default SSH key matches this repo's expected profile.",
+    whatWeExpected: `An account trusted from your ${profile.label} profile configuration`,
+    whatWeFound: isHttps
+      ? `HTTPS remote (${facts.pushRemoteHost ?? "unknown host"})`
+      : `SSH remote using generic host: ${facts.pushRemoteHost ?? "unknown"}`,
     suggestedAction: "Make Push Setup Safer",
     suggestedActionCommand: "makePushSetupSafer",
     technicalDetails: {
-      originRemoteUrl: facts.originRemoteUrl,
-      remoteProtocol: facts.remoteProtocol,
-      remoteHost: facts.remoteHost,
+      pushRemoteName: facts.pushRemoteName,
+      pushRemoteUrl: facts.pushRemoteUrl,
+      pushRemoteProtocol: facts.pushRemoteProtocol,
+      pushRemoteHost: facts.pushRemoteHost,
     },
-  };
-}
-
-export function noRemoteIssue(profile: Profile): Issue {
-  return {
-    id: "push_setup:no_remote",
-    category: "push_setup",
-    severity: "warning",
-    title: "Push setup is not verified",
-    message: "This repo has no origin remote yet, so push safety can't be checked.",
-    whyItMatters: `Once a remote is added, we can verify it's locked to ${profile.label}.`,
-    whatWeExpected: "An origin remote",
-    whatWeFound: "No origin remote",
-    suggestedAction: "Make Push Setup Safer",
-    suggestedActionCommand: "makePushSetupSafer",
   };
 }
 
@@ -174,8 +214,9 @@ export function protectedBranchIssue(branch: string): Issue {
     category: "branch_safety",
     severity: "blocking",
     title: `Working directly on ${branch}`,
-    message: `You're committing directly on ${branch}, the protected branch for this repo.`,
-    whyItMatters: "Commits made directly on a protected branch skip review and can break things for everyone.",
+    message: `You're committing directly on ${branch}, which your local branch policy treats as protected.`,
+    whyItMatters:
+      "Commits made directly on a protected branch skip review and can break things for everyone. Repo Identity Guard treats this branch as protected locally — it does not check or sync with GitHub's own branch protection settings.",
     whatWeExpected: "A feature branch",
     whatWeFound: `Current branch: ${branch}`,
     suggestedAction: "Switch to a feature branch",
@@ -196,6 +237,77 @@ export function branchPatternMismatchIssue(branch: string, profile: Profile): Is
   };
 }
 
+const OPERATION_LABEL: Record<InProgressOperation, string> = {
+  merge: "merge",
+  rebase: "rebase",
+  "cherry-pick": "cherry-pick",
+  revert: "revert",
+};
+
+export function inProgressOperationIssue(operation: InProgressOperation): Issue {
+  const label = OPERATION_LABEL[operation];
+  return {
+    id: "agent_guard:operation_in_progress",
+    category: "agent_guard",
+    severity: "blocking",
+    title: `A ${label} is in progress`,
+    message: `This repo has an unfinished ${label}. Committing, pushing, or running other Git commands now can make it worse.`,
+    whyItMatters: `An AI agent that doesn't recognize an in-progress ${label} could commit half-resolved changes or abandon it mid-way.`,
+    whatWeExpected: "No unfinished Git operation",
+    whatWeFound: `${label} in progress`,
+    suggestedAction: `Finish or abort the ${label} first`,
+  };
+}
+
+export function mergeConflictsIssue(): Issue {
+  return {
+    id: "agent_guard:merge_conflicts",
+    category: "agent_guard",
+    severity: "blocking",
+    title: "Unresolved merge conflicts",
+    message: "This repo has unresolved conflict markers. Committing now could bake broken code into history.",
+    whyItMatters: "An agent that commits over unresolved conflicts can silently corrupt the merge result.",
+    whatWeExpected: "No unresolved conflicts",
+    whatWeFound: "Conflicted files present",
+    suggestedAction: "Resolve conflicts first",
+  };
+}
+
+/**
+ * Ordinary staged/unstaged/untracked changes are normal during development —
+ * this is a restriction/warning, not a blocker, so the tool isn't
+ * permanently red the moment you start editing.
+ */
+export function uncommittedChangesIssue(): Issue {
+  return {
+    id: "agent_guard:uncommitted_changes",
+    category: "agent_guard",
+    severity: "warning",
+    title: "Uncommitted changes present",
+    message: "This repo has uncommitted changes.",
+    whyItMatters: "An AI agent should preserve existing work here — not reset, stash, or broadly rewrite it.",
+    whatWeExpected: "Agent should preserve existing changes",
+    whatWeFound: "Staged, unstaged, or untracked changes present",
+    suggestedAction: "Review Details",
+    suggestedActionCommand: "reviewDetails",
+  };
+}
+
+export function untrustedWorkspaceIssue(): Issue {
+  return {
+    id: "agent_guard:workspace_untrusted",
+    category: "agent_guard",
+    severity: "blocking",
+    title: "Workspace is not trusted",
+    message: "VS Code Workspace Trust is off for this folder, so running commands or changing Git identity here is blocked.",
+    whyItMatters: "Workspace Trust exists specifically to stop untrusted code from running automatically.",
+    whatWeExpected: "A trusted workspace",
+    whatWeFound: "Untrusted workspace",
+    suggestedAction: "Enable Workspace Trust",
+    suggestedActionCommand: "enableWorkspaceTrust",
+  };
+}
+
 export function agentNotSafeIssue(): Issue {
   return {
     id: "agent_guard:not_safe",
@@ -203,21 +315,25 @@ export function agentNotSafeIssue(): Issue {
     severity: "blocking",
     title: "Not safe for AI agent",
     message: "Fix the issues above before letting an AI coding agent commit, push, or run commands here.",
-    whyItMatters: "An AI agent will inherit whatever identity, push setup, and branch you're currently on.",
+    whyItMatters: "An AI agent will inherit whatever identity, push setup, branch, and repo state you're currently in.",
     suggestedAction: "Review Details",
+    suggestedActionCommand: "reviewDetails",
   };
 }
 
-export function agentGuardOffIssue(): Issue {
+/**
+ * Shield Mode (local Git hooks) is not implemented yet. This is a static,
+ * always-shown info note — never gated behind a settings toggle a user
+ * could mistake for something that's actually protecting them.
+ */
+export function shieldModeComingSoonIssue(): Issue {
   return {
-    id: "agent_guard:shield_off",
+    id: "agent_guard:shield_mode_coming_soon",
     category: "agent_guard",
     severity: "info",
-    title: "Shield Mode is off",
-    message: "Optional local safeguards that block unsafe commits or pushes are not turned on yet.",
-    whyItMatters: "Shield Mode is opt-in and never installs anything automatically.",
-    suggestedAction: "Open Settings",
-    suggestedActionCommand: "openSettings",
+    title: "Shield Mode is not built yet",
+    message: "Optional local Git hooks that would block unsafe commits/pushes don't exist yet — nothing is enforcing this automatically.",
+    whyItMatters: "This is informational only. No hooks are installed, and none will be installed without explicit action later.",
   };
 }
 

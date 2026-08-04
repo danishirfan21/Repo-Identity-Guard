@@ -34,7 +34,7 @@ export async function saveProtectedBranches(branches: string[]): Promise<void> {
 export function getSafetyPreferences(): SafetyPreferences {
   return {
     requireLocalIdentity: config().get<boolean>("requireLocalIdentity", false),
-    agentGuardEnabled: config().get<boolean>("agentGuardEnabled", false),
+    includeMemoryInAiContext: config().get<boolean>("includeMemoryInAiContext", false),
   };
 }
 
@@ -42,8 +42,8 @@ export async function saveRequireLocalIdentity(value: boolean): Promise<void> {
   await config().update("requireLocalIdentity", value, vscode.ConfigurationTarget.Global);
 }
 
-export async function saveAgentGuardEnabled(value: boolean): Promise<void> {
-  await config().update("agentGuardEnabled", value, vscode.ConfigurationTarget.Global);
+export async function saveIncludeMemoryInAiContext(value: boolean): Promise<void> {
+  await config().update("includeMemoryInAiContext", value, vscode.ConfigurationTarget.Global);
 }
 
 export function affectsRepoIdentityGuardConfig(event: vscode.ConfigurationChangeEvent): boolean {
@@ -51,6 +51,6 @@ export function affectsRepoIdentityGuardConfig(event: vscode.ConfigurationChange
     event.affectsConfiguration(`${SECTION}.profiles`) ||
     event.affectsConfiguration(`${SECTION}.protectedBranches`) ||
     event.affectsConfiguration(`${SECTION}.requireLocalIdentity`) ||
-    event.affectsConfiguration(`${SECTION}.agentGuardEnabled`)
+    event.affectsConfiguration(`${SECTION}.includeMemoryInAiContext`)
   );
 }

@@ -5,20 +5,24 @@ import {
   SafetyPreferences,
   StatusSummary,
 } from "../types";
-import { branchMatchesAnyPattern, findMatchingProfiles } from "./profileResolver";
+import { branchMatchesAnyPattern, findMatchingProfiles, wildcardMatch } from "./profileResolver";
 import {
-  agentGuardOffIssue,
   agentNotSafeIssue,
   branchPatternMismatchIssue,
   detachedHeadIssue,
   identityNotLockedIssue,
+  inProgressOperationIssue,
+  mergeConflictsIssue,
   noPinnedMemoryIssue,
-  noRemoteIssue,
   overlappingProfilesIssue,
   profileUnknownIssue,
   protectedBranchIssue,
-  pushSetupGenericSshIssue,
-  pushSetupHttpsIssue,
+  pushAccountUnverifiedIssue,
+  pushDestinationMismatchIssue,
+  pushDestinationUnresolvedIssue,
+  shieldModeComingSoonIssue,
+  uncommittedChangesIssue,
+  untrustedWorkspaceIssue,
   wrongCommitIdentityIssue,
 } from "./issueFactory";
 
@@ -31,6 +35,8 @@ export interface StatusEngineInput {
   protectedBranches: string[];
   preferences: SafetyPreferences;
   pinnedMemoryNote?: string;
+  /** Defaults to trusted (VS Code's own default for local folders) when omitted. */
+  isWorkspaceTrusted?: boolean;
 }
 
 export function computeStatus(input: StatusEngineInput): StatusSummary {
@@ -59,12 +65,18 @@ export function computeStatus(input: StatusEngineInput): StatusSummary {
     issues.push(...checkBranchSafety(facts, matchedProfile, input.protectedBranches));
   }
 
+  // Repo operation state and workspace trust apply regardless of which (or whether a) profile matched.
+  issues.push(...checkRepoOperationState(facts));
+  if (input.isWorkspaceTrusted === false) {
+    issues.push(untrustedWorkspaceIssue());
+  }
+
   const hasBlockingIssue = issues.some((issue) => issue.severity === "blocking");
 
   if (hasBlockingIssue) {
     issues.push(agentNotSafeIssue());
-  } else if (!input.preferences.agentGuardEnabled) {
-    issues.push(agentGuardOffIssue());
+  } else {
+    issues.push(shieldModeComingSoonIssue());
   }
 
   if (!input.pinnedMemoryNote) {
@@ -96,26 +108,22 @@ function checkCommitIdentity(
   profile: Profile,
   preferences: SafetyPreferences,
 ): Issue[] {
-  const nameMatches =
-    !profile.gitName ||
-    facts.effectiveGitName?.trim().toLocaleLowerCase() ===
-      profile.gitName.trim().toLocaleLowerCase();
-  const emailMatches =
-    facts.effectiveGitEmail?.trim().toLocaleLowerCase() ===
-    profile.gitEmail.trim().toLocaleLowerCase();
+  const nameMatches = (name?: string) =>
+    !profile.gitName || name?.trim().toLocaleLowerCase() === profile.gitName.trim().toLocaleLowerCase();
+  const emailMatches = (email?: string) =>
+    email?.trim().toLocaleLowerCase() === profile.gitEmail.trim().toLocaleLowerCase();
 
-  if (!nameMatches || !emailMatches) {
-    return [wrongCommitIdentityIssue(facts, profile)];
+  const authorMismatch = !nameMatches(facts.effectiveGitName) || !emailMatches(facts.effectiveGitEmail);
+  const committerMismatch =
+    !nameMatches(facts.effectiveCommitterName) || !emailMatches(facts.effectiveCommitterEmail);
+
+  if (authorMismatch || committerMismatch) {
+    return [wrongCommitIdentityIssue(facts, profile, { author: authorMismatch, committer: committerMismatch })];
   }
 
   if (preferences.requireLocalIdentity) {
-    const localNameMatches =
-      !profile.gitName ||
-      facts.localGitName?.trim().toLocaleLowerCase() ===
-        profile.gitName.trim().toLocaleLowerCase();
-    const localEmailMatches =
-      facts.localGitEmail?.trim().toLocaleLowerCase() ===
-      profile.gitEmail.trim().toLocaleLowerCase();
+    const localNameMatches = nameMatches(facts.localGitName);
+    const localEmailMatches = emailMatches(facts.localGitEmail);
 
     if (!localNameMatches || !localEmailMatches) {
       return [identityNotLockedIssue(facts, profile)];
@@ -125,24 +133,38 @@ function checkCommitIdentity(
   return [];
 }
 
+/**
+ * Push safety is two separate questions: does a plain `git push` even land
+ * in the right place (destination), and can we tell which account
+ * authenticates it (account)? Ambiguous destination resolution is always
+ * blocking, regardless of a profile's strictness — that's not a judgment
+ * call the way HTTPS-vs-SSH-alias is.
+ */
 function checkPushSetup(facts: RepoFacts, profile: Profile): Issue[] {
-  if (!facts.originRemoteUrl) {
-    return [noRemoteIssue(profile)];
+  if (!facts.pushRemoteUrl) {
+    return [pushDestinationUnresolvedIssue(profile)];
+  }
+
+  const expectedOwners = profile.expectedRemoteOwners ?? [];
+  const destinationMatches =
+    expectedOwners.length === 0 ||
+    (facts.pushRemoteOwner
+      ? expectedOwners.some((pattern) => wildcardMatch(facts.pushRemoteOwner as string, pattern))
+      : false);
+
+  if (!destinationMatches) {
+    return [pushDestinationMismatchIssue(facts, profile)];
   }
 
   const strict = !!profile.strictPushSetup;
-  const host = facts.remoteHost?.toLocaleLowerCase();
+  const host = facts.pushRemoteHost?.toLocaleLowerCase();
 
-  if (facts.remoteProtocol === "https") {
-    return [pushSetupHttpsIssue(facts, profile, strict)];
+  if (facts.pushRemoteProtocol === "https" || facts.pushRemoteProtocol === "unknown") {
+    return [pushAccountUnverifiedIssue(facts, profile, strict)];
   }
 
-  if (facts.remoteProtocol === "ssh" && host && GENERIC_REMOTE_HOSTS.has(host)) {
-    return [pushSetupGenericSshIssue(facts, profile, strict)];
-  }
-
-  if (facts.remoteProtocol === "unknown") {
-    return [pushSetupHttpsIssue(facts, profile, strict)];
+  if (facts.pushRemoteProtocol === "ssh" && host && GENERIC_REMOTE_HOSTS.has(host)) {
+    return [pushAccountUnverifiedIssue(facts, profile, strict)];
   }
 
   return [];
@@ -172,6 +194,29 @@ function checkBranchSafety(
   const patterns = profile.expectedBranchPatterns ?? [];
   if (patterns.length > 0 && !branchMatchesAnyPattern(branch, patterns)) {
     return [branchPatternMismatchIssue(branch, profile)];
+  }
+
+  return [];
+}
+
+/**
+ * Conflicts and an unfinished merge/rebase/cherry-pick/revert block — an
+ * agent operating on top of those can corrupt the repo. Ordinary dirty-tree
+ * changes (staged/unstaged/untracked, nothing conflicted) are only a
+ * warning: that's normal mid-development state, not a safety issue by
+ * itself, so it must not keep the tool permanently red.
+ */
+function checkRepoOperationState(facts: RepoFacts): Issue[] {
+  if (facts.inProgressOperation) {
+    return [inProgressOperationIssue(facts.inProgressOperation)];
+  }
+
+  if (facts.hasMergeConflicts) {
+    return [mergeConflictsIssue()];
+  }
+
+  if (facts.hasUncommittedChanges) {
+    return [uncommittedChangesIssue()];
   }
 
   return [];

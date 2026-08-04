@@ -11,6 +11,8 @@ export type IssueCategory =
 
 export type IssueSeverity = "blocking" | "warning" | "info";
 
+export type InProgressOperation = "merge" | "rebase" | "cherry-pick" | "revert";
+
 export interface RepoFacts {
   isGitRepo: boolean;
   repoRoot?: string;
@@ -18,17 +20,38 @@ export interface RepoFacts {
   currentBranch?: string;
   isDetachedHead?: boolean;
   hasUncommittedChanges?: boolean;
+  hasMergeConflicts?: boolean;
+  inProgressOperation?: InProgressOperation;
+  isLinkedWorktree?: boolean;
+  /** Whether this repo has `extensions.worktreeConfig` on; null/undefined means unknown/not queried. */
+  worktreeConfigEnabled?: boolean;
+
+  /** Effective author identity Git would use right now (`git var GIT_AUTHOR_IDENT`), including env overrides. */
   effectiveGitName?: string;
   effectiveGitEmail?: string;
+  /** Effective committer identity (`git var GIT_COMMITTER_IDENT`) — usually equals author, but can diverge. */
+  effectiveCommitterName?: string;
+  effectiveCommitterEmail?: string;
   localGitName?: string;
   localGitEmail?: string;
   globalGitName?: string;
   globalGitEmail?: string;
+
+  /** `origin`'s fetch URL — identifies whose repo this is, used for profile matching. */
   originRemoteUrl?: string;
   remoteProtocol?: RemoteProtocol;
   remoteHost?: string;
   remoteOwner?: string;
   remoteRepo?: string;
+
+  /** Where a plain `git push` would actually go — may differ from `origin` via pushRemote/pushDefault/pushurl. */
+  pushRemoteName?: string;
+  pushRemoteUrl?: string;
+  pushRemoteProtocol?: RemoteProtocol;
+  pushRemoteHost?: string;
+  pushRemoteOwner?: string;
+  pushRemoteRepo?: string;
+
   gitError?: string;
 }
 
@@ -61,7 +84,9 @@ export type SuggestedActionCommand =
   | "makePushSetupSafer"
   | "openRepoMemory"
   | "openSettings"
-  | "addProfileForRepo";
+  | "addProfileForRepo"
+  | "reviewDetails"
+  | "enableWorkspaceTrust";
 
 export interface StatusSummary {
   level: SafetyLevel;
@@ -99,5 +124,6 @@ export function emptyRepoMemory(): RepoMemory {
 
 export interface SafetyPreferences {
   requireLocalIdentity: boolean;
-  agentGuardEnabled: boolean;
+  /** Off by default: pinned memory text may contain sensitive notes the user typed for themselves, not for export. */
+  includeMemoryInAiContext: boolean;
 }

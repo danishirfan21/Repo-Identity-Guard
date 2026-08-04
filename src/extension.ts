@@ -12,7 +12,7 @@ import {
   getProfiles,
   getProtectedBranches,
   getSafetyPreferences,
-  saveAgentGuardEnabled,
+  saveIncludeMemoryInAiContext,
   saveProfiles,
   saveProtectedBranches,
   saveRequireLocalIdentity,
@@ -55,6 +55,9 @@ export function activate(context: vscode.ExtensionContext): void {
       await vscode.commands.executeCommand("workbench.action.openSettingsJson");
     },
     copyContextForAI: () => copyContextForAI(),
+    enableWorkspaceTrust: async () => {
+      await vscode.commands.executeCommand("workbench.trust.manage");
+    },
 
     addMemoryNote: async (text, pinned) => {
       const repoRoot = requireRepoRoot();
@@ -89,6 +92,7 @@ export function activate(context: vscode.ExtensionContext): void {
     runSavedCommand: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
+      if (!(await requireWorkspaceTrust())) return;
       const saved = memoryStore.getMemory(repoRoot).commands.find((c) => c.id === id);
       if (saved) runSavedCommand(repoRoot, saved.command);
     },
@@ -129,8 +133,8 @@ export function activate(context: vscode.ExtensionContext): void {
       await saveRequireLocalIdentity(value);
       await scan();
     },
-    saveAgentGuardEnabled: async (value) => {
-      await saveAgentGuardEnabled(value);
+    saveIncludeMemoryInAiContext: async (value) => {
+      await saveIncludeMemoryInAiContext(value);
       await scan();
     },
   });
@@ -146,6 +150,15 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function requireRepoRoot(): string | undefined {
     return latestSummary.facts.repoRoot;
+  }
+
+  /** Blocks mutating/executing actions when Workspace Trust is off, with a clear reason. */
+  async function requireWorkspaceTrust(): Promise<boolean> {
+    if (vscode.workspace.isTrusted) return true;
+    await vscode.window.showWarningMessage(
+      "This workspace isn't trusted, so Repo Identity Guard won't run commands or change Git identity here. Enable Workspace Trust first.",
+    );
+    return false;
   }
 
   async function scan(cwdOverride?: string): Promise<void> {
@@ -164,6 +177,7 @@ export function activate(context: vscode.ExtensionContext): void {
         protectedBranches: getProtectedBranches(),
         preferences: getSafetyPreferences(),
         pinnedMemoryNote: pinnedNote,
+        isWorkspaceTrusted: vscode.workspace.isTrusted,
       });
 
       latestSummary = summary;
@@ -184,6 +198,14 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  function worktreeWarning(facts: RepoFacts): string {
+    if (!facts.isLinkedWorktree) return "";
+    if (facts.worktreeConfigEnabled === true) {
+      return " This repo is a linked worktree with per-worktree config enabled, so this change affects only this worktree.";
+    }
+    return " This repo is a linked worktree. Per-worktree config isn't enabled here, so this change may affect every worktree attached to this repository, not just this one.";
+  }
+
   async function fixCommitIdentity(): Promise<void> {
     const { facts, matchedProfile } = latestSummary;
     if (!facts.repoRoot || !matchedProfile) {
@@ -192,9 +214,10 @@ export function activate(context: vscode.ExtensionContext): void {
       );
       return;
     }
+    if (!(await requireWorkspaceTrust())) return;
 
     const confirmation = await vscode.window.showWarningMessage(
-      `Set this repo's local Git identity to ${matchedProfile.label} (${matchedProfile.gitName ?? ""} <${matchedProfile.gitEmail}>)? This only changes this repo's local Git config — your global Git identity is never touched.`,
+      `Set this repo's local Git identity to ${matchedProfile.label} (${matchedProfile.gitName ?? ""} <${matchedProfile.gitEmail}>)? This only changes this repo's local Git config — your global Git identity is never touched.${worktreeWarning(facts)}`,
       { modal: true },
       "Set Local Identity",
     );
@@ -216,6 +239,7 @@ export function activate(context: vscode.ExtensionContext): void {
   async function unsetLocalIdentity(): Promise<void> {
     const { facts } = latestSummary;
     if (!facts.repoRoot) return;
+    if (!(await requireWorkspaceTrust())) return;
     await safeActionRunner.unsetLocalIdentity(facts.repoRoot);
     await scan(facts.repoRoot);
   }
@@ -277,9 +301,17 @@ export function activate(context: vscode.ExtensionContext): void {
   async function copyContextForAI(): Promise<void> {
     const repoRoot = latestSummary.facts.repoRoot;
     const memory = repoRoot ? memoryStore.getMemory(repoRoot) : { notes: [], commands: [] };
-    const text = buildAiContext(latestSummary, memory);
+    const { includeMemoryInAiContext } = getSafetyPreferences();
+    const text = buildAiContext(latestSummary, memory, { includeMemory: includeMemoryInAiContext });
+
     await copyToClipboard(text);
-    await vscode.window.showInformationMessage("Repo context copied. Paste it into your AI agent.");
+
+    // Always show the exact text before it's used — this is the trust experience, not an afterthought.
+    const previewDoc = await vscode.workspace.openTextDocument({ content: text, language: "plaintext" });
+    await vscode.window.showTextDocument(previewDoc, { preview: true });
+    await vscode.window.showInformationMessage(
+      "Copied to clipboard. Review the preview before pasting it into your AI agent.",
+    );
   }
 
   context.subscriptions.push(
@@ -293,6 +325,7 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.window.onDidChangeActiveTextEditor(() => void scan()),
     vscode.workspace.onDidChangeWorkspaceFolders(() => void scan()),
+    vscode.workspace.onDidGrantWorkspaceTrust(() => void scan()),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (affectsRepoIdentityGuardConfig(event)) void scan();
     }),
