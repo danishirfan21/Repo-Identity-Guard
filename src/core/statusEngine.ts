@@ -29,6 +29,7 @@ import {
   pushDestinationMismatchResult,
   pushDestinationNotApplicableResult,
   pushDestinationUnresolvedResult,
+  repoInspectionFailedResult,
   repoOperationCleanResult,
   repoOperationConflictsResult,
   repoOperationDirtyResult,
@@ -245,6 +246,9 @@ function checkBranchPolicy(
  * itself, so it must not keep the tool permanently red.
  */
 function checkRepoOperationState(facts: RepoFacts): CapabilityResult {
+  if (facts.gitError) {
+    return repoInspectionFailedResult(facts.gitError);
+  }
   if (facts.inProgressOperation) {
     return repoOperationInProgressResult(facts.inProgressOperation);
   }

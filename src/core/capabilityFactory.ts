@@ -465,6 +465,23 @@ export function repoOperationCleanResult(): CapabilityResult {
   };
 }
 
+export function repoInspectionFailedResult(gitError: string): CapabilityResult {
+  return {
+    id: "repo_operation_state:inspection_failed",
+    capability: "repo_operation_state",
+    state: "unverified",
+    title: "Could not fully inspect this repository",
+    summary: "A Git command failed while checking this repo, so its safety can't be confirmed.",
+    whyItMatters: "Working tree state, branch, and identity may all be stale or missing — treating this as safe would be a guess.",
+    whatWeExpected: "All read-only Git checks to succeed",
+    whatWeFound: gitError,
+    blocksOverallSafety: true,
+    technicalDetails: { gitError },
+    suggestedAction: "Review Details",
+    suggestedActionCommand: "reviewDetails",
+  };
+}
+
 // ==================== workspace_trust ====================
 
 export function workspaceUntrustedResult(): CapabilityResult {

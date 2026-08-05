@@ -4,6 +4,44 @@
 
 ### Added
 
+- **Multi-root workspace support.** When a workspace has more than one Git
+  repository (or a repo plus its linked worktree, opened as separate
+  folders), Repo Identity Guard now evaluates every one of them
+  independently and rolls the results up with a deliberately conservative
+  rule — not a plain OR:
+  - **SAFE** only when every detected repository has been checked and is
+    SAFE.
+  - **NOT SAFE** when any repository is blocking, unresolved, or couldn't
+    be checked reliably — a safe active repo never makes the workspace
+    read green while another repo in the same workspace is unresolved.
+  - **NOT CHECKED** only when no repositories have been evaluated, or none
+    were detected at all.
+  This is computed by a new `computeWorkspaceSafetyState`, derived from an
+  array of per-repo `RepositorySafetyState` — capability results stay
+  strictly repo-scoped; nothing synthesizes a cross-repo
+  `CapabilityResult`.
+  - Workspace folders that resolve to the same repo root are deduplicated;
+    linked worktrees always get their own entry, since their branch and
+    working-tree state can differ from the main worktree.
+  - A folder that isn't a Git repo is excluded from the count entirely —
+    it never counts as "no repositories detected." A repo whose inspection
+    fails partway (a Git command errors) now surfaces as its own blocking
+    "Could not fully inspect this repository" result instead of silently
+    falling through the other five checks with missing facts.
+  - The Main view shows an aggregate badge and repo counts, followed by a
+    repository list — each row has its own mini-status and selects that
+    repo for Review Details and for every mutating/executing action (Fix
+    Commit Identity, saved commands, Repo Memory). There is always exactly
+    one selected repository; no action ever runs against an ambiguous
+    mix. Review Details shows which repo is being reviewed whenever more
+    than one is open. Single-repo workspaces are unchanged — no extra UI
+    appears.
+  - **Copy Workspace Safety Summary** is a new, separate action from Copy
+    Context for AI: a compact per-repo SAFE/NOT SAFE line with blocking
+    reasons and restrictions for every repo in the workspace — not a
+    combined dump of every repo's full checklist or Repo Memory notes.
+    Copy Context for AI is unchanged and still describes only the
+    currently selected repo in full detail.
 - **New capability-based result model**, replacing the old flat
   blocking/warning/info `Issue` list. Every scan now evaluates exactly six
   capabilities (Commit Identity, Push Destination, Push Account, Branch

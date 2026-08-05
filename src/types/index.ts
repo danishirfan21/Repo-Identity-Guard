@@ -194,3 +194,33 @@ export interface SafetyPreferences {
   /** Off by default: pinned memory text may contain sensitive notes the user typed for themselves, not for export. */
   includeMemoryInAiContext: boolean;
 }
+
+/**
+ * One repository's fully independent safety evaluation, as it contributes to
+ * a multi-root workspace. `repoId` is a canonical (symlink-resolved) disk
+ * path used only in-memory to deduplicate workspace folders that resolve to
+ * the same repo root — never persisted, never shown raw in Copy Context.
+ * Capability results stay strictly repo-scoped: this never mixes checks from
+ * different repos into one result.
+ */
+export interface RepositorySafetyState {
+  repoId: string;
+  workspaceFolderName?: string;
+  summary: StatusSummary;
+}
+
+/**
+ * A derived roll-up of {@link RepositorySafetyState}s for the whole
+ * workspace. Deliberately conservative, not a plain OR:
+ * - `safe` only when every detected repo has been checked and is safe.
+ * - `not_safe` when any repo is blocking, unresolved, or couldn't be
+ *   checked reliably.
+ * - `not_checked` only when no repositories have been evaluated/detected.
+ */
+export interface WorkspaceSafetyState {
+  level: SafetyLevel;
+  repos: RepositorySafetyState[];
+  safeCount: number;
+  notSafeCount: number;
+  uncheckedCount: number;
+}

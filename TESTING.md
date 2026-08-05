@@ -48,8 +48,16 @@ git branch --show-current
 | No pinned memory | Repo Memory has no pinned note. | Info-only "No pinned repo memory" (never blocks SAFE). |
 | Shield Mode card | Open Settings. | A disabled "Shield Mode — Coming soon" card with no checkbox — never an interactive toggle. |
 | Full checklist on a safe repo | All checks pass. | Review Details shows all 6 capabilities (Commit Identity, Push Destination, Push Account, Branch Policy, Repo State, Workspace Trust) with a **Confirmed** badge each — not just an empty "no issues" list. |
+| Failed Git inspection | Simulate a Git command failure mid-scan (e.g. corrupt a ref temporarily). | 🔴 NOT SAFE; Repo State shows "Could not fully inspect this repository" as **Unverified** and blocking — never silently treated as clean. |
 | Dependent capability shown as Not applicable | No profile resolves for this repo. | Push Destination, Push Account, and Branch Policy each show a **Not applicable** badge (dimmed) rather than being silently omitted, and don't carry a "Blocks Safety" tag. |
 | Blocks Safety tag vs. state | HTTPS push with `strictPushSetup: false` vs. `true`, same repo. | Both show the **Unverified** badge on Push Account; only the `strictPushSetup: true` case also shows a **Blocks Safety** tag. |
+| Multi-root, all safe | Open a workspace with two Git repos as separate folders, both matching profiles and passing every check. | Main shows the aggregate 🟢 SAFE badge, "2 safe, 0 not safe, 0 unchecked of 2 repos", and a repository list with both rows green. |
+| Multi-root, one unresolved | Same as above, but one repo has no matching profile. | Aggregate badge is 🔴 NOT SAFE even though the other repo is individually SAFE — a safe repo never makes the workspace read green while another is unresolved. The unsafe repo's row shows its next-fix title. |
+| Multi-root repo selection | In a multi-root workspace, click a row in the repository list. | Navigates to Review Details, which now shows a "Reviewing: `<repo name>`" header; **Fix Commit Identity** and Repo Memory now act on that repo, not whichever was previously selected. |
+| Multi-root, duplicate folder | Add the same repo twice as separate workspace folders (e.g. via a symlink). | It appears once in the repository list, not twice. |
+| Multi-root, linked worktree | Open a repo and its linked worktree (`git worktree add`) as two separate workspace folders. | Both appear as separate rows with independent status — a worktree on a different/protected branch can be NOT SAFE while the main worktree is SAFE. |
+| Multi-root, non-repo folder | Add a plain (non-Git) folder to a multi-root workspace alongside a Git repo. | The non-Git folder doesn't appear in the repository list and doesn't affect the aggregate. |
+| Copy Workspace Safety Summary | In a multi-root workspace with a mix of safe/unsafe repos, click **Copy Workspace Safety Summary**. | Preview tab shows one line per repo (name, SAFE/NOT SAFE, blocking reasons) — not each repo's full checklist or any Repo Memory notes. Also on the clipboard. |
 
 Remember: Repo Identity Guard does not verify pull/push access. If
 `git pull` or `git push` fails with "Repository not found", check GitHub

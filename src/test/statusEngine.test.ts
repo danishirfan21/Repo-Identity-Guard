@@ -365,6 +365,15 @@ test("unresolved merge conflicts are NOT SAFE", () => {
   assert.equal(result?.title, "Unresolved merge conflicts");
 });
 
+test("a failed Git inspection is NOT SAFE and unverified, not silently treated as clean", () => {
+  const summary = run(safeFacts({ gitError: "fatal: unable to read some refs" }));
+  assert.equal(summary.level, "not_safe");
+  const result = summary.capabilityResults.find((r) => r.capability === "repo_operation_state");
+  assert.equal(result?.title, "Could not fully inspect this repository");
+  assert.equal(result?.state, "unverified");
+  assert.equal(result?.blocksOverallSafety, true);
+});
+
 test("ordinary uncommitted changes are only a warning with a preserve-changes restriction, not a blocker", () => {
   const summary = run(safeFacts({ hasUncommittedChanges: true, hasMergeConflicts: false }));
   assert.equal(summary.level, "safe");

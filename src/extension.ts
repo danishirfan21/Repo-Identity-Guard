@@ -1,9 +1,11 @@
+import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { buildAiContext } from "./core/aiContext";
+import { buildAiContext, buildWorkspaceSafetySummary } from "./core/aiContext";
 import { canonicalRepoKey, findOverlappingProfiles, resolveProfiles } from "./core/profileResolver";
 import { computeStatus } from "./core/statusEngine";
+import { computeWorkspaceSafetyState } from "./core/workspaceAggregate";
 import { collectRepoFacts } from "./services/gitService";
 import { copyToClipboard, runSavedCommand } from "./services/commandRunner";
 import { SafeActionRunner } from "./services/safeActionRunner";
@@ -20,15 +22,27 @@ import {
 import { MemoryStore } from "./storage/memoryStore";
 import { RepoIdentitySidebarProvider, SidebarModel } from "./ui/SidebarProvider";
 import { IdentityStatusBar } from "./statusBar";
-import { Profile, RepoFacts, StatusSummary } from "./types";
+import { Profile, RepoFacts, RepositorySafetyState, StatusSummary, WorkspaceSafetyState } from "./types";
 
-let latestSummary: StatusSummary = {
-  level: "not_checked",
-  capabilityResults: [],
-  infoNotes: [],
-  issueCount: 0,
-  facts: { isGitRepo: false },
-};
+function emptyNotCheckedSummary(gitError?: string): StatusSummary {
+  return {
+    level: "not_checked",
+    capabilityResults: [],
+    infoNotes: [],
+    issueCount: 0,
+    facts: { isGitRepo: false, gitError },
+  };
+}
+
+function emptyWorkspaceState(): WorkspaceSafetyState {
+  return { level: "not_checked", repos: [], safeCount: 0, notSafeCount: 0, uncheckedCount: 0 };
+}
+
+let latestSummary: StatusSummary = emptyNotCheckedSummary();
+/** All repos detected across the workspace this scan, and the derived aggregate — see `computeWorkspaceSafetyState`. */
+let workspaceState: WorkspaceSafetyState = emptyWorkspaceState();
+/** The repo mutating/executing actions apply to. Always a concrete repo from `workspaceState.repos`, never ambiguous. */
+let selectedRepoId: string | undefined;
 let scanSequence = 0;
 let repoGitConfigWatcher: vscode.FileSystemWatcher | undefined;
 let watchedRepoRoot: string | undefined;
@@ -41,6 +55,8 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const buildModel = (): SidebarModel => ({
     summary: latestSummary,
+    workspace: workspaceState,
+    selectedRepoId,
     memory: latestSummary.facts.repoRoot ? memoryStore.getMemory(latestSummary.facts.repoRoot) : { notes: [], commands: [] },
     profiles: getProfiles(),
     protectedBranches: getProtectedBranches(),
@@ -56,10 +72,15 @@ export function activate(context: vscode.ExtensionContext): void {
       await vscode.commands.executeCommand("workbench.action.openSettingsJson");
     },
     copyContextForAI: () => copyContextForAI(),
+    copyWorkspaceSafetySummary: () => copyWorkspaceSafetySummary(),
     enableWorkspaceTrust: async () => {
       await vscode.commands.executeCommand("workbench.trust.manage");
     },
     resolveProfileConflict: () => resolveProfileConflict(),
+    selectRepo: async (repoId: string) => {
+      selectRepo(repoId);
+      refreshSidebar();
+    },
 
     addMemoryNote: async (text, pinned) => {
       const repoRoot = requireRepoRoot();
@@ -163,16 +184,76 @@ export function activate(context: vscode.ExtensionContext): void {
     return false;
   }
 
+  /**
+   * cwdOverride is only meaningful for the no-workspace-folder fallback (a
+   * single loose file/folder). When real workspace folders exist, every
+   * scan re-evaluates all of them — that's the only way to keep the
+   * aggregate honest after acting on any one repo.
+   */
   async function scan(cwdOverride?: string): Promise<void> {
     const sequence = ++scanSequence;
-    const cwd = cwdOverride ?? getActiveCwd();
 
     try {
-      const facts = await collectRepoFacts(cwd);
+      const targets = getScanTargets(cwdOverride);
+      const repos = await buildRepositoryStates(targets);
       if (sequence !== scanSequence) return;
 
-      const pinnedNote = facts.repoRoot ? memoryStore.getPinnedNote(facts.repoRoot)?.text : undefined;
+      workspaceState = computeWorkspaceSafetyState(repos);
 
+      if (!selectedRepoId || !repos.some((r) => r.repoId === selectedRepoId)) {
+        selectedRepoId = pickDefaultRepoId(repos);
+      }
+      const selected = repos.find((r) => r.repoId === selectedRepoId);
+      latestSummary = selected?.summary ?? emptyNotCheckedSummary();
+
+      statusBar.update(workspaceState);
+      refreshSidebar();
+      updateRepoGitConfigWatcher(latestSummary.facts.repoRoot, scan);
+    } catch (error) {
+      if (sequence !== scanSequence) return;
+      workspaceState = emptyWorkspaceState();
+      selectedRepoId = undefined;
+      latestSummary = emptyNotCheckedSummary(getErrorMessage(error));
+      statusBar.update(workspaceState);
+      refreshSidebar();
+      updateRepoGitConfigWatcher(undefined, scan);
+    }
+  }
+
+  /** Workspace folders to scan, or a single ad hoc folder when the window has none open as a workspace. */
+  function getScanTargets(cwdOverride?: string): { path: string; folderName?: string }[] {
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders && folders.length > 0) {
+      return folders.map((folder) => ({ path: folder.uri.fsPath, folderName: folder.name }));
+    }
+    const cwd = cwdOverride ?? getActiveCwd();
+    return cwd ? [{ path: cwd }] : [];
+  }
+
+  /**
+   * Scans every target and returns one entry per unique repo root — folders
+   * that resolve to the same repo (a multi-folder workspace opened inside
+   * one repo, or symlinked paths) collapse to a single entry via the
+   * realpath-canonicalized root; linked worktrees have their own distinct
+   * root and are always kept separate, since their branch/working-tree
+   * state can differ. A folder that isn't a Git repo is excluded entirely —
+   * it never counts toward "no repositories detected."
+   */
+  async function buildRepositoryStates(
+    targets: { path: string; folderName?: string }[],
+  ): Promise<RepositorySafetyState[]> {
+    const scans = await Promise.all(
+      targets.map(async (target) => ({ target, facts: await collectRepoFacts(target.path) })),
+    );
+
+    const byRepoId = new Map<string, RepositorySafetyState>();
+    for (const { target, facts } of scans) {
+      if (!facts.isGitRepo || !facts.repoRoot) continue;
+
+      const repoId = await canonicalizeRepoRoot(facts.repoRoot);
+      if (byRepoId.has(repoId)) continue;
+
+      const pinnedNote = memoryStore.getPinnedNote(facts.repoRoot)?.text;
       const summary = computeStatus({
         facts,
         profiles: getProfiles(),
@@ -182,23 +263,43 @@ export function activate(context: vscode.ExtensionContext): void {
         isWorkspaceTrusted: vscode.workspace.isTrusted,
       });
 
-      latestSummary = summary;
-      statusBar.update(summary);
-      refreshSidebar();
-      updateRepoGitConfigWatcher(facts.repoRoot, scan);
-    } catch (error) {
-      if (sequence !== scanSequence) return;
-      latestSummary = {
-        level: "not_checked",
-        capabilityResults: [],
-        infoNotes: [],
-        issueCount: 0,
-        facts: { isGitRepo: false, gitError: getErrorMessage(error) },
-      };
-      statusBar.update(latestSummary);
-      refreshSidebar();
-      updateRepoGitConfigWatcher(undefined, scan);
+      byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary });
     }
+
+    return [...byRepoId.values()];
+  }
+
+  async function canonicalizeRepoRoot(repoRoot: string): Promise<string> {
+    try {
+      return await fs.realpath(repoRoot);
+    } catch {
+      return repoRoot;
+    }
+  }
+
+  /** Prefers the repo the active editor's file lives in, then the first workspace folder's repo. */
+  function pickDefaultRepoId(repos: RepositorySafetyState[]): string | undefined {
+    if (repos.length === 0) return undefined;
+    const activeCwd = getActiveCwd();
+    if (activeCwd) {
+      const match = repos.find((r) => r.summary.facts.repoRoot && isSubpath(activeCwd, r.summary.facts.repoRoot));
+      if (match) return match.repoId;
+    }
+    return repos[0].repoId;
+  }
+
+  function isSubpath(candidate: string, repoRoot: string): boolean {
+    const rel = path.relative(repoRoot, candidate);
+    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+  }
+
+  /** Explicit repo selection for multi-root workspaces — every mutating/executing action reads the repo this points at, never an ambiguous mix. */
+  function selectRepo(repoId: string): void {
+    const repo = workspaceState.repos.find((r) => r.repoId === repoId);
+    if (!repo) return;
+    selectedRepoId = repoId;
+    latestSummary = repo.summary;
+    updateRepoGitConfigWatcher(latestSummary.facts.repoRoot, scan);
   }
 
   function worktreeWarning(facts: RepoFacts): string {
@@ -357,12 +458,24 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   }
 
+  async function copyWorkspaceSafetySummary(): Promise<void> {
+    const text = buildWorkspaceSafetySummary(workspaceState);
+    await copyToClipboard(text);
+
+    const previewDoc = await vscode.workspace.openTextDocument({ content: text, language: "plaintext" });
+    await vscode.window.showTextDocument(previewDoc, { preview: true });
+    await vscode.window.showInformationMessage(
+      "Copied to clipboard. Review the preview before pasting it into your AI agent.",
+    );
+  }
+
   context.subscriptions.push(
     vscode.commands.registerCommand("repoIdentityGuard.scan", () => scan()),
     vscode.commands.registerCommand("repoIdentityGuard.showStatus", () => showStatus()),
     vscode.commands.registerCommand("repoIdentityGuard.fixIdentity", () => fixCommitIdentity()),
     vscode.commands.registerCommand("repoIdentityGuard.addRuleForCurrentRepo", () => addProfileForRepo()),
     vscode.commands.registerCommand("repoIdentityGuard.copyDiagnosticReport", () => copyContextForAI()),
+    vscode.commands.registerCommand("repoIdentityGuard.copyWorkspaceSafetySummary", () => copyWorkspaceSafetySummary()),
     vscode.commands.registerCommand("repoIdentityGuard.openSettings", () =>
       vscode.commands.executeCommand("workbench.action.openSettingsJson"),
     ),

@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { StatusSummary } from "./types";
+import { WorkspaceSafetyState } from "./types";
 
 export class IdentityStatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
@@ -10,22 +10,31 @@ export class IdentityStatusBar implements vscode.Disposable {
     this.item.name = "Repo Identity Guard";
   }
 
-  public update(summary: StatusSummary): void {
+  public update(workspace: WorkspaceSafetyState): void {
     this.item.backgroundColor = undefined;
 
-    if (summary.level === "not_checked") {
+    if (workspace.level === "not_checked") {
       this.item.hide();
       return;
     }
 
-    if (summary.level === "safe") {
-      this.item.text = `$(shield) Safe${summary.matchedProfile ? ` (${summary.matchedProfile.label})` : ""}`;
+    const multiRoot = workspace.repos.length > 1;
+    const profileSuffix = !multiRoot && workspace.repos[0]?.summary.matchedProfile
+      ? ` (${workspace.repos[0].summary.matchedProfile.label})`
+      : "";
+
+    if (workspace.level === "safe") {
+      this.item.text = multiRoot
+        ? `$(shield) Safe (${workspace.safeCount}/${workspace.repos.length} repos)`
+        : `$(shield) Safe${profileSuffix}`;
     } else {
-      this.item.text = "$(warning) Not Safe";
+      this.item.text = multiRoot
+        ? `$(warning) Not Safe (${workspace.notSafeCount}/${workspace.repos.length} repos)`
+        : "$(warning) Not Safe";
       this.item.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
     }
 
-    this.item.tooltip = buildTooltip(summary);
+    this.item.tooltip = buildTooltip(workspace);
     this.item.show();
   }
 
@@ -34,17 +43,34 @@ export class IdentityStatusBar implements vscode.Disposable {
   }
 }
 
-function buildTooltip(summary: StatusSummary): vscode.MarkdownString {
+function buildTooltip(workspace: WorkspaceSafetyState): vscode.MarkdownString {
+  if (workspace.repos.length <= 1) {
+    const summary = workspace.repos[0]?.summary;
+    const lines = [
+      "**Repo Identity Guard**",
+      "",
+      workspace.level === "safe" ? "Safe to work, commit, and push." : "Not safe — see Review Details.",
+      `Repo: \`${summary?.repoName ?? "Unknown"}\``,
+      `Profile: \`${summary?.matchedProfile?.label ?? "Unknown"}\``,
+    ];
+
+    for (const result of (summary?.capabilityResults ?? []).filter((r) => r.blocksOverallSafety)) {
+      lines.push(`- ${result.title}`);
+    }
+
+    return new vscode.MarkdownString(lines.join("\n"));
+  }
+
   const lines = [
-    "**Repo Identity Guard**",
+    "**Repo Identity Guard — Workspace**",
     "",
-    summary.level === "safe" ? "Safe to work, commit, and push." : "Not safe — see Review Details.",
-    `Repo: \`${summary.repoName ?? "Unknown"}\``,
-    `Profile: \`${summary.matchedProfile?.label ?? "Unknown"}\``,
+    `${workspace.safeCount} safe, ${workspace.notSafeCount} not safe, ${workspace.uncheckedCount} unchecked of ${workspace.repos.length} repositories`,
+    "",
   ];
 
-  for (const result of summary.capabilityResults.filter((result) => result.blocksOverallSafety)) {
-    lines.push(`- ${result.title}`);
+  for (const repo of workspace.repos) {
+    const icon = repo.summary.level === "safe" ? "🟢" : repo.summary.level === "not_safe" ? "🔴" : "⚪";
+    lines.push(`${icon} ${repo.summary.repoName ?? repo.workspaceFolderName ?? "(unnamed repo)"}`);
   }
 
   return new vscode.MarkdownString(lines.join("\n"));

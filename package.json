@@ -68,6 +68,10 @@
         "title": "Repo Identity Guard: Copy Context for AI"
       },
       {
+        "command": "repoIdentityGuard.copyWorkspaceSafetySummary",
+        "title": "Repo Identity Guard: Copy Workspace Safety Summary"
+      },
+      {
         "command": "repoIdentityGuard.openSettings",
         "title": "Repo Identity Guard: Open Settings"
       }

@@ -1,5 +1,13 @@
 import * as vscode from "vscode";
-import { CapabilityResult, InfoNote, Profile, RepoMemory, SafetyPreferences, StatusSummary } from "../types";
+import {
+  CapabilityResult,
+  InfoNote,
+  Profile,
+  RepoMemory,
+  SafetyPreferences,
+  StatusSummary,
+  WorkspaceSafetyState,
+} from "../types";
 
 export interface SidebarActions {
   rescan(): Promise<void>;
@@ -8,8 +16,10 @@ export interface SidebarActions {
   addProfileForRepo(): Promise<void>;
   openSettingsJson(): Promise<void>;
   copyContextForAI(): Promise<void>;
+  copyWorkspaceSafetySummary(): Promise<void>;
   enableWorkspaceTrust(): Promise<void>;
   resolveProfileConflict(): Promise<void>;
+  selectRepo(repoId: string): Promise<void>;
 
   addMemoryNote(text: string, pinned: boolean): Promise<void>;
   removeMemoryNote(id: string): Promise<void>;
@@ -28,6 +38,8 @@ export interface SidebarActions {
 
 export interface SidebarModel {
   summary: StatusSummary;
+  workspace: WorkspaceSafetyState;
+  selectedRepoId?: string;
   memory: RepoMemory;
   profiles: Profile[];
   protectedBranches: string[];
@@ -87,11 +99,17 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
       case "copyContextForAI":
         await a.copyContextForAI();
         break;
+      case "copyWorkspaceSafetySummary":
+        await a.copyWorkspaceSafetySummary();
+        break;
       case "enableWorkspaceTrust":
         await a.enableWorkspaceTrust();
         break;
       case "resolveProfileConflict":
         await a.resolveProfileConflict();
+        break;
+      case "selectRepo":
+        await a.selectRepo(String(message.id ?? ""));
         break;
       case "addMemoryNote":
         await a.addMemoryNote(String(message.text ?? ""), !!message.pinned);
@@ -185,6 +203,23 @@ function getNonce(): string {
 type WireCapabilityResult = CapabilityResult;
 type WireInfoNote = InfoNote;
 
+interface WireRepoListEntry {
+  repoId: string;
+  name: string;
+  level: "safe" | "not_safe" | "not_checked";
+  issueCount: number;
+  nextFixTitle?: string;
+  selected: boolean;
+}
+
+interface WireWorkspace {
+  level: "safe" | "not_safe" | "not_checked";
+  safeCount: number;
+  notSafeCount: number;
+  uncheckedCount: number;
+  repos: WireRepoListEntry[];
+}
+
 interface WireState {
   level: "safe" | "not_safe" | "not_checked";
   isGitRepo: boolean;
@@ -201,6 +236,7 @@ interface WireState {
   profiles: Profile[];
   protectedBranches: string[];
   preferences: SafetyPreferences;
+  workspace: WireWorkspace;
 }
 
 function toWireState(model: SidebarModel): WireState {
@@ -221,6 +257,20 @@ function toWireState(model: SidebarModel): WireState {
     profiles: model.profiles,
     protectedBranches: model.protectedBranches,
     preferences: model.preferences,
+    workspace: {
+      level: model.workspace.level,
+      safeCount: model.workspace.safeCount,
+      notSafeCount: model.workspace.notSafeCount,
+      uncheckedCount: model.workspace.uncheckedCount,
+      repos: model.workspace.repos.map((repo) => ({
+        repoId: repo.repoId,
+        name: repo.summary.repoName || repo.workspaceFolderName || "(unnamed repo)",
+        level: repo.summary.level,
+        issueCount: repo.summary.issueCount,
+        nextFixTitle: repo.summary.nextFix?.title,
+        selected: repo.repoId === model.selectedRepoId,
+      })),
+    },
   };
 }
 
@@ -297,16 +347,60 @@ function handleSuggestedAction(command) {
 }
 
 // ---------- MAIN VIEW ----------
+function renderRepoListRow(repo) {
+  const meta = statusMeta(repo.level);
+  const fixLine = repo.level === "not_safe" && repo.nextFixTitle
+    ? \`<span class="block text-[11px] text-on-surface-variant">\${esc(repo.nextFixTitle)}</span>\`
+    : "";
+  const selectedCls = repo.selected ? "border-l-4 border-l-primary" : "";
+  return \`
+    <button class="vs-card flex w-full items-start gap-2 rounded-lg p-2 text-left \${selectedCls}" data-select-repo="\${esc(repo.repoId)}">
+      <span class="text-[15px] leading-none">\${meta.icon}</span>
+      <div class="flex min-w-0 flex-col">
+        <span class="truncate text-[12px] font-semibold text-on-surface">\${esc(repo.name)}</span>
+        \${fixLine}
+      </div>
+    </button>\`;
+}
+
+function renderWorkspaceSummary() {
+  const ws = state.workspace;
+  if (!ws || ws.repos.length <= 1) return "";
+  const meta = statusMeta(ws.level);
+  return \`
+    <div class="flex items-start gap-2 rounded-lg border border-outline-variant bg-surface-container-low p-3">
+      <span class="text-[22px] leading-none">\${meta.icon}</span>
+      <div class="flex min-w-0 flex-col gap-0.5">
+        <span class="text-[15px] font-bold \${meta.cls}">Workspace: \${meta.label}</span>
+        <span class="text-[12px] text-on-surface-variant">\${ws.safeCount} safe, \${ws.notSafeCount} not safe, \${ws.uncheckedCount} unchecked of \${ws.repos.length} repos</span>
+      </div>
+    </div>
+    <section class="flex flex-col gap-1.5">
+      <span class="font-label-caps text-[10px] uppercase tracking-wider text-on-surface-variant">Repositories</span>
+      \${ws.repos.map(renderRepoListRow).join("")}
+    </section>
+    <button class="vs-button-secondary flex h-8 items-center justify-center rounded text-[12px]" id="copyWorkspaceSummaryButton">Copy Workspace Safety Summary</button>
+  \`;
+}
+
 function renderMain() {
   const meta = statusMeta(state.level);
+  const multiRoot = state.workspace && state.workspace.repos.length > 1;
 
-  if (!state.isGitRepo) {
+  if (!state.isGitRepo && !multiRoot) {
     return \`
       <div class="flex flex-col items-center gap-2 rounded-lg border border-outline-variant bg-surface-container-low p-4 text-center">
         <span class="text-[28px]">⚪</span>
         <span class="text-[14px] font-semibold text-on-surface">NOT CHECKED</span>
         <p class="m-0 text-[12px] text-on-surface-variant">Open a folder that is a Git repository to check its safety.</p>
       </div>\`;
+  }
+
+  const workspaceSection = renderWorkspaceSummary();
+
+  if (!state.isGitRepo) {
+    // Multi-root workspace with no repo currently selected (e.g. active editor outside any repo).
+    return workspaceSection;
   }
 
   const issueLine = state.issueCount === 0
@@ -331,10 +425,12 @@ function renderMain() {
       </section>\`;
 
   return \`
+    \${workspaceSection}
+
     <div class="flex items-start gap-2 rounded-lg border border-outline-variant bg-surface-container-low p-3">
       <span class="text-[22px] leading-none">\${meta.icon}</span>
       <div class="flex min-w-0 flex-col gap-0.5">
-        <span class="text-[15px] font-bold \${meta.cls}">\${meta.label}</span>
+        <span class="text-[15px] font-bold \${meta.cls}">\${meta.label}\${multiRoot ? " (selected repo)" : ""}</span>
         <span class="text-[12px] text-on-surface-variant">Repo: \${esc(state.repoName || "Unknown")}</span>
         <span class="text-[12px] text-on-surface-variant">Profile: \${esc(state.profileLabel || "Unknown")}</span>
       </div>
@@ -403,6 +499,11 @@ function renderInfoNoteCard(note) {
 }
 
 function renderDetails() {
+  const multiRoot = state.workspace && state.workspace.repos.length > 1;
+  const reviewingHeader = multiRoot
+    ? \`<div class="rounded-lg border border-outline-variant bg-surface-container-low p-2 text-[11px] text-on-surface-variant">Reviewing: <span class="font-semibold text-on-surface">\${esc(state.repoName || "Unknown repo")}</span></div>\`
+    : "";
+
   const byCapability = {};
   for (const result of state.capabilityResults) byCapability[result.capability] = result;
 
@@ -417,7 +518,7 @@ function renderDetails() {
       </section>\`
     : "";
 
-  return cards + notes;
+  return reviewingHeader + cards + notes;
 }
 
 // ---------- REPO MEMORY VIEW ----------
@@ -591,6 +692,10 @@ document.addEventListener("click", (event) => {
   if (issueAction) { handleSuggestedAction(issueAction.dataset.issueAction); return; }
 
   if (target.closest("#copyContextButton")) { send("copyContextForAI"); return; }
+  if (target.closest("#copyWorkspaceSummaryButton")) { send("copyWorkspaceSafetySummary"); return; }
+
+  const selectRepoBtn = target.closest("[data-select-repo]");
+  if (selectRepoBtn) { send("selectRepo", { id: selectRepoBtn.dataset.selectRepo }); navigate("details"); return; }
 
   if (target.closest("#addNoteButton")) {
     const input = document.getElementById("newNoteText");

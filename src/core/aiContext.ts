@@ -1,4 +1,4 @@
-import { AgentRestriction, CapabilityResult, RepoMemory, StatusSummary } from "../types";
+import { AgentRestriction, CapabilityResult, RepoMemory, StatusSummary, WorkspaceSafetyState } from "../types";
 
 /** Fixed baseline rules that apply regardless of any specific finding this scan — never derived. */
 const BASELINE_RESTRICTIONS: AgentRestriction[] = [
@@ -187,6 +187,48 @@ function statusLabel(level: StatusSummary["level"]): string {
     case "not_checked":
       return "NOT CHECKED";
   }
+}
+
+/**
+ * Compact multi-repo status for pasting into an AI agent's context in a
+ * multi-root workspace — every repo's SAFE/NOT SAFE verdict and its blocking
+ * reasons, one line each. Deliberately not a combined dump of every repo's
+ * full capability checklist or Repo Memory notes; use `buildAiContext` for a
+ * single repo's full detail.
+ */
+export function buildWorkspaceSafetySummary(workspace: WorkspaceSafetyState, now: Date = new Date()): string {
+  const lines: string[] = [];
+  lines.push(`Workspace safety summary — checked ${now.toISOString()}`);
+  lines.push(
+    `Overall: ${statusLabel(workspace.level)} (${workspace.safeCount} safe, ${workspace.notSafeCount} not safe, ${workspace.uncheckedCount} unchecked of ${workspace.repos.length} repositories)`,
+  );
+  lines.push("");
+
+  if (workspace.repos.length === 0) {
+    lines.push("No Git repositories detected in this workspace.");
+    return lines.join("\n");
+  }
+
+  for (const repo of workspace.repos) {
+    const { summary } = repo;
+    const label = summary.repoName ?? repo.workspaceFolderName ?? "(unnamed repo)";
+    const profileNote = summary.matchedProfile ? ` — ${summary.matchedProfile.label}` : "";
+    lines.push(`- ${label}: ${statusLabel(summary.level)}${profileNote}`);
+
+    for (const result of summary.capabilityResults.filter((r) => r.blocksOverallSafety)) {
+      lines.push(`    - ${result.title}`);
+      if (result.agentRestrictions?.length) {
+        for (const restriction of result.agentRestrictions) {
+          lines.push(`        - Restriction: ${restriction.description}`);
+        }
+      }
+    }
+  }
+
+  lines.push("");
+  lines.push("Rules for AI: treat any repository above marked NOT SAFE as off-limits for commits, pushes, or identity/remote changes until its own Review Details are resolved.");
+
+  return lines.join("\n");
 }
 
 /** Exported for the invariant test: every capability result that blocks overall safety must be representable in the AI context. */

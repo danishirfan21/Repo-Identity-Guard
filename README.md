@@ -86,10 +86,45 @@ this conflict check; it never wins a match by itself. **Assign This Repo**
 resolves it by writing an exact-repository override to your chosen
 profile.
 
+## Multi-root workspaces
+
+When a workspace has more than one Git repository open as separate folders
+(or a repo plus a linked worktree), Repo Identity Guard evaluates each one
+independently and rolls the results up conservatively, not with a plain OR:
+
+- **SAFE** only when every detected repository has been checked and is SAFE.
+- **NOT SAFE** when any repository is blocking, unresolved, or couldn't be
+  checked reliably. A safe active repo never makes the workspace read green
+  while another repo in the workspace is unresolved.
+- **NOT CHECKED** only when no repositories have been evaluated, or none
+  were detected.
+
+Workspace folders that resolve to the same repo root are deduplicated;
+linked worktrees always get their own entry, since branch and working-tree
+state can differ between worktrees. A folder that isn't a Git repo is
+excluded from the count entirely.
+
+Capability results stay strictly scoped to the repository that produced
+them — nothing here synthesizes a workspace-wide `CapabilityResult` by
+mixing checks from different repos. The Main view shows an aggregate badge
+and repo counts, followed by a repository list; each row selects that repo
+for Review Details and for every mutating or executing action (Fix Commit
+Identity, saved commands, Repo Memory) — there's always exactly one
+selected repository, so no action ever runs against an ambiguous mix.
+Single-repo workspaces look exactly as before; this extra UI only appears
+once there's more than one repo to show.
+
+**Copy Workspace Safety Summary** is a separate action from Copy Context
+for AI: a compact per-repo SAFE/NOT SAFE line with blocking reasons and
+restrictions for every repo in the workspace, not a combined dump of every
+repo's full checklist or Repo Memory notes. Copy Context for AI still
+describes only the currently selected repo, in full detail.
+
 ## Views
 
 - **Main** — compact status, matched profile, issue count, next fix, one
-  pinned memory note, and quick actions.
+  pinned memory note, and quick actions. In a multi-root workspace, also
+  shows the aggregate workspace badge and a repository list (see above).
 - **Review Details** — the full six-capability checklist in plain English
   (why it matters, what we expected, what we found, and any agent
   restrictions that follow from it), with raw Git facts tucked behind an
@@ -236,6 +271,7 @@ GitHub's own branch protection settings.
 - **Repo Identity Guard: Fix Commit Identity**
 - **Repo Identity Guard: Add Profile for Current Repo**
 - **Repo Identity Guard: Copy Context for AI**
+- **Repo Identity Guard: Copy Workspace Safety Summary**
 - **Repo Identity Guard: Open Settings**
 
 ## Run locally
@@ -260,10 +296,11 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
   `upstream` — there's no reliable way to detect a fork relationship from
   Git alone. A fork set up with a differently-named remote won't trigger
   the conflict check.
-- **Single active repo per window.** A multi-root workspace with more than
-  one Git repository only reflects whichever repo the active editor (or
-  first workspace folder) belongs to — it doesn't yet aggregate status
-  across every repo in the workspace.
+- **Multi-root repo discovery starts with workspace folders.** Repos are
+  found from `vscode.workspace.workspaceFolders` — Repo Identity Guard
+  doesn't recursively crawl nested directories looking for `.git` folders
+  that aren't themselves workspace folders (e.g. repos several levels deep
+  inside one open folder, never added as their own workspace folder).
 - **No cryptographic account verification.** "Push account is unverified"
   never upgrades to "verified" — Repo Identity Guard doesn't make network
   calls (e.g. an SSH test connection) to confirm which account a key or
