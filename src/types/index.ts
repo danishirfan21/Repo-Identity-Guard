@@ -30,6 +30,9 @@ export interface RepoFacts {
   effectiveCommitterEmail?: string;
   localGitName?: string;
   localGitEmail?: string;
+  /** From `git config --worktree`; only actually distinct from `--local` when `extensions.worktreeConfig` is on. May hold a value `Fix Commit Identity` wrote here instead of `--local` — see `resolveIdentityConfigScope`. */
+  worktreeGitName?: string;
+  worktreeGitEmail?: string;
   globalGitName?: string;
   globalGitEmail?: string;
 

@@ -143,10 +143,17 @@ function checkCommitIdentity(
   }
 
   if (preferences.requireLocalIdentity) {
-    const localNameMatches = nameMatches(facts.localGitName);
-    const localEmailMatches = emailMatches(facts.localGitEmail);
+    // An explicit non-global override can live in either scope — Fix
+    // Commit Identity writes `--worktree` instead of `--local` when
+    // `extensions.worktreeConfig` is on (see `resolveIdentityConfigScope`).
+    // Checking `localGitName`/`localGitEmail` alone would keep reporting
+    // "not locked" even after a successful worktree-scoped fix.
+    const scopedName = facts.worktreeGitName ?? facts.localGitName;
+    const scopedEmail = facts.worktreeGitEmail ?? facts.localGitEmail;
+    const scopedNameMatches = nameMatches(scopedName);
+    const scopedEmailMatches = emailMatches(scopedEmail);
 
-    if (!localNameMatches || !localEmailMatches) {
+    if (!scopedNameMatches || !scopedEmailMatches) {
       return commitIdentityNotLockedResult(facts, profile);
     }
   }

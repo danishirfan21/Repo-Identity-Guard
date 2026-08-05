@@ -237,8 +237,10 @@ export function activate(context: vscode.ExtensionContext): void {
    * Watches the resolved `gitDir`/`gitCommonDir` (not a guessed
    * `<repoRoot>/.git`, which is wrong for linked worktrees) for the files
    * that drive Commit Identity, Branch Policy, and Repo State: HEAD,
-   * config, the index, the merge/cherry-pick/revert markers, and the
-   * rebase-in-progress directories. This does not watch the working tree
+   * config, config.worktree (an external `git config --worktree` edit must
+   * also trigger a rescan, not just `--local`), the index, the
+   * merge/cherry-pick/revert markers, and the rebase-in-progress
+   * directories. This does not watch the working tree
    * itself (recursively watching every file in every repo would be
    * expensive); `onDidSaveTextDocument` below gives ordinary edits a
    * lighter-weight nudge instead.
@@ -263,7 +265,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const disposables: vscode.Disposable[] = [];
       for (const dir of dirs) {
         const stateWatcher = vscode.workspace.createFileSystemWatcher(
-          new vscode.RelativePattern(vscode.Uri.file(dir), "{HEAD,config,index,MERGE_HEAD,CHERRY_PICK_HEAD,REVERT_HEAD}"),
+          new vscode.RelativePattern(vscode.Uri.file(dir), "{HEAD,config,config.worktree,index,MERGE_HEAD,CHERRY_PICK_HEAD,REVERT_HEAD}"),
         );
         const operationWatcher = vscode.workspace.createFileSystemWatcher(
           new vscode.RelativePattern(vscode.Uri.file(dir), "{rebase-merge,rebase-apply}/**"),
@@ -409,10 +411,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function worktreeWarning(facts: RepoFacts, scope: "local" | "worktree"): string {
     const hasMultipleWorktrees = (facts.worktreeCount ?? 1) > 1;
-    if (!hasMultipleWorktrees) return "";
+
     if (scope === "worktree") {
-      return " This repo has other worktrees attached, but per-worktree config is enabled, so this is written with `git config --worktree` and affects only this worktree.";
+      return hasMultipleWorktrees
+        ? " This repo has other worktrees attached; per-worktree config is enabled, so this is written with `git config --worktree` and affects only this worktree."
+        : " Per-worktree config is enabled for this repo, so this is written with `git config --worktree` (this worktree's own config) rather than the shared repo config — that matters even with only one worktree right now, since a worktree-scoped value always overrides `--local`.";
     }
+
+    if (!hasMultipleWorktrees) return "";
     return " This repo has other worktrees attached, and per-worktree config isn't enabled, so this is written with `git config --local` and will be shared by every worktree attached to this repository, not just this one.";
   }
 
@@ -426,7 +432,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     if (!(await requireWorkspaceTrust())) return;
 
-    const scope = resolveIdentityConfigScope(facts.worktreeCount, facts.worktreeConfigEnabled);
+    const scope = resolveIdentityConfigScope(facts.worktreeConfigEnabled);
 
     const confirmation = await vscode.window.showWarningMessage(
       `Set this repo's Git identity to ${matchedProfile.label} (${matchedProfile.gitName ?? ""} <${matchedProfile.gitEmail}>)? Your global Git identity is never touched.${worktreeWarning(facts, scope)}${repoIdentityLines(facts, matchedProfile)}`,
@@ -453,7 +459,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const { facts } = latestSummary;
     if (!facts.repoRoot) return;
     if (!(await requireWorkspaceTrust())) return;
-    const scope = resolveIdentityConfigScope(facts.worktreeCount, facts.worktreeConfigEnabled);
+    const scope = resolveIdentityConfigScope(facts.worktreeConfigEnabled);
     await safeActionRunner.unsetLocalIdentity(facts.repoRoot, scope);
     await scan(facts.repoRoot);
   }

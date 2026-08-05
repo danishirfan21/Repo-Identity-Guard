@@ -158,25 +158,29 @@ managers, or keychains, and it never runs `push`, `push --force`,
 Memory always run in a visible integrated terminal — never silently, and
 never at all when the workspace isn't [trusted](#workspace-trust).
 
-When a repo has more than one worktree attached (checked via `git worktree
-list --porcelain`, not just whether the current one is linked — a *main*
-worktree can have others attached to it too), Fix Commit Identity resolves
-an explicit config scope before writing anything, and the confirmation
-dialog says exactly which scope it's about to use:
+Fix Commit Identity resolves an explicit config scope before writing
+anything, based only on whether `extensions.worktreeConfig` is on — not on
+how many worktrees currently exist:
 
-- Worktree config on (`extensions.worktreeConfig`) → writes `git config
-  --worktree`, scoped to this worktree only.
-- Worktree config off/unknown → still writes `git config --local`, but the
-  dialog says plainly that this is shared across every worktree attached
-  to the repo, not narrower — `--local` is repository-level config no
-  matter how many worktrees exist.
-- Only one worktree → ordinary `--local`, unambiguous either way.
+- Worktree config on → writes `git config --worktree`, even if this repo
+  only has one worktree right now. That's necessary, not overcautious:
+  when worktree config is enabled, Git reads `config.worktree` *after*
+  the shared repo config and lets it override, so a stale value there
+  would keep winning over a `--local` fix even with a single worktree.
+- Worktree config off/unknown → writes `git config --local`. If more than
+  one worktree is attached (checked via `git worktree list --porcelain`,
+  not just whether the *current* one is linked — a main worktree can have
+  others attached to it too), the confirmation dialog says plainly that
+  this is shared across every worktree, not narrower.
 
-Every confirmation also names the repository and its local path alongside
-the matched profile, so "this repo" is never ambiguous once more than one
-is open in the same workspace. Full per-worktree config management isn't
-built — this is deliberately just an honest, correctly-scoped mutation and
-warning before you confirm.
+The confirmation dialog always states which scope is about to be
+written, and also names the repository and its local path alongside the
+matched profile, so "this repo" is never ambiguous once more than one is
+open in the same workspace. The strict "require identity to be locked
+locally" preference (below) checks both scopes too, so it won't keep
+reporting "not locked" after a worktree-scoped fix. Full per-worktree
+config management isn't built — this is deliberately just an honest,
+correctly-scoped mutation and warning before you confirm.
 
 **Shield Mode** (local Git hooks that would block unsafe commits/pushes) is
 not built yet. There is no toggle for it — a disabled "Coming soon" card in

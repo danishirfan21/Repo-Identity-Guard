@@ -86,6 +86,36 @@
   `Promise.allSettled` plus a per-target try/catch, converting any
   unexpected failure into that repo's own inspection-failed result instead
   of risking the whole workspace scan rejecting and hiding every repo.
+- **`resolveIdentityConfigScope` no longer depends on worktree count.**
+  When `extensions.worktreeConfig` is on, Git reads `config.worktree`
+  *after* the shared repo config and lets it override — even with only
+  one worktree attached right now. Gating the scope on worktree count
+  (the previous behavior) meant a stale `config.worktree` value could
+  survive a "successful" `--local` fix, so the command would report
+  success while the effective identity stayed wrong. Scope now depends
+  only on whether worktree config is enabled; worktree count still shapes
+  the confirmation dialog's wording, never which flag gets used.
+- **Strict local-identity mode (`requireLocalIdentity`) now recognizes a
+  worktree-scoped override, not just `--local`.** Previously, after Fix
+  Commit Identity wrote to `--worktree`, this check kept reporting "not
+  locked" because it only ever read `git config --local`. It now reads
+  `git config --worktree` too (safe to query unconditionally — Git treats
+  `--worktree` as `--local` when worktree config isn't enabled) and
+  prefers whichever scope actually holds an explicit value, surfaced in
+  the result's technical details.
+- Watcher reconciliation now also watches `config.worktree`, so an
+  external `git config --worktree user.email ...` triggers a rescan the
+  same way an external `--local` edit already did.
+- **`git status` and `git worktree list` failures are no longer treated
+  as "nothing to report."** They previously shared the same
+  exit-code-1/2/128-means-missing handling as `config --get`/`remote
+  get-url`, where a nonzero exit is a normal "value doesn't exist." For
+  `status` and `worktree list`, a nonzero exit means something is actually
+  wrong — silently downgrading that to "clean tree" or "1 worktree" could
+  hide a real error behind a falsely reassuring default. Both now use
+  `runGit` directly so a genuine failure propagates and surfaces as the
+  repo's own inspection-failed capability result, per the existing
+  conservative philosophy.
 - **New capability-based result model**, replacing the old flat
   blocking/warning/info `Issue` list. Every scan now evaluates exactly six
   capabilities (Commit Identity, Push Destination, Push Account, Branch

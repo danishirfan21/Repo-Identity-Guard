@@ -82,11 +82,16 @@ export function parseStatusPorcelain(status: string): StatusFacts {
   return { hasChanges, hasConflicts };
 }
 
+/**
+ * Deliberately uses `runGit`, not `tryGit`: unlike `config --get` or
+ * `remote get-url` (where a nonzero exit is a normal "value doesn't
+ * exist"), `git status` failing means something is actually wrong with the
+ * repo. Swallowing that as "missing" would report a clean working tree
+ * when the truth is unknown — a failing status must surface as an
+ * inspection failure, not a false "safe."
+ */
 export async function getStatusFacts(repoRoot: string): Promise<StatusFacts> {
-  const status = await tryGit(repoRoot, ["status", "--porcelain=v2", "--branch"]);
-  if (status === null) {
-    return { hasChanges: false, hasConflicts: false };
-  }
+  const status = await runGit(repoRoot, ["status", "--porcelain=v2", "--branch"]);
   return parseStatusPorcelain(status);
 }
 
@@ -136,27 +141,30 @@ export async function getWorktreeConfigEnabled(repoRoot: string): Promise<boolea
  * `git worktree list --porcelain`. A repo can have other worktrees attached
  * while itself being the main one (`isLinkedWorktree` false) — that alone
  * doesn't mean a config write here is safely worktree-scoped.
+ *
+ * Uses `runGit`, not `tryGit`: a failing `worktree list` must surface as an
+ * inspection failure, not silently collapse to "1 worktree" — that would
+ * hide a real error behind an unremarkable-looking default.
  */
 export async function getWorktreeCount(repoRoot: string): Promise<number> {
-  const output = await tryGit(repoRoot, ["worktree", "list", "--porcelain"]);
-  if (!output) return 1;
+  const output = await runGit(repoRoot, ["worktree", "list", "--porcelain"]);
   const count = output.split("\n").filter((line) => line.startsWith("worktree ")).length;
   return count > 0 ? count : 1;
 }
 
 /**
  * Whether `Fix Commit Identity` should write to `--local` or `--worktree`.
- * `--local` is repo-level config shared by every worktree attached to a
- * repo; `--worktree` only actually isolates the change to this worktree
- * when `extensions.worktreeConfig` is on. With only one worktree, `--local`
- * is unambiguous and correct either way.
+ * This depends only on whether `extensions.worktreeConfig` is on — *not*
+ * on how many worktrees currently exist. When it's on, Git reads
+ * `config.worktree` *after* the shared repo config and lets it override,
+ * even with only one worktree attached right now: if that file already
+ * holds a stale value, writing the fix to `--local` would succeed as a
+ * command while leaving the effective identity wrong. Worktree count only
+ * affects how the confirmation message explains the blast radius — see
+ * the caller's warning text — never whether `--worktree` is used.
  */
-export function resolveIdentityConfigScope(
-  worktreeCount: number | undefined,
-  worktreeConfigEnabled: boolean | null | undefined,
-): IdentityConfigScope {
-  const hasMultipleWorktrees = (worktreeCount ?? 1) > 1;
-  return hasMultipleWorktrees && worktreeConfigEnabled === true ? "worktree" : "local";
+export function resolveIdentityConfigScope(worktreeConfigEnabled: boolean | null | undefined): IdentityConfigScope {
+  return worktreeConfigEnabled === true ? "worktree" : "local";
 }
 
 export async function getOriginRemote(repoRoot: string): Promise<string | null> {
@@ -210,6 +218,23 @@ export async function getLocalGitUserName(repoRoot: string): Promise<string | nu
 
 export async function getLocalGitUserEmail(repoRoot: string): Promise<string | null> {
   return tryGit(repoRoot, ["config", "--local", "user.email"]);
+}
+
+/**
+ * The worktree-scoped value, if any (`config.worktree`, only actually
+ * distinct from `--local` when `extensions.worktreeConfig` is on — Git
+ * itself falls back to treating `--worktree` as `--local` otherwise, so
+ * this is safe to query unconditionally). Needed because Fix Commit
+ * Identity may have written here instead of `--local` — see
+ * `resolveIdentityConfigScope` — and a strict "is this locked outside
+ * global config" check must recognize either.
+ */
+export async function getWorktreeGitUserName(repoRoot: string): Promise<string | null> {
+  return tryGit(repoRoot, ["config", "--worktree", "user.name"]);
+}
+
+export async function getWorktreeGitUserEmail(repoRoot: string): Promise<string | null> {
+  return tryGit(repoRoot, ["config", "--worktree", "user.email"]);
 }
 
 export async function getGlobalGitUserName(): Promise<string | null> {
@@ -355,6 +380,8 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       committerIdent,
       localName,
       localEmail,
+      worktreeName,
+      worktreeEmail,
       globalName,
       globalEmail,
       gitDir,
@@ -371,6 +398,8 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       getEffectiveCommitterIdent(repoRoot),
       getLocalGitUserName(repoRoot),
       getLocalGitUserEmail(repoRoot),
+      getWorktreeGitUserName(repoRoot),
+      getWorktreeGitUserEmail(repoRoot),
       getGlobalGitUserName(),
       getGlobalGitUserEmail(),
       getGitDir(repoRoot),
@@ -409,6 +438,8 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       effectiveCommitterEmail: committerIdent.email,
       localGitName: localName ?? undefined,
       localGitEmail: localEmail ?? undefined,
+      worktreeGitName: worktreeName ?? undefined,
+      worktreeGitEmail: worktreeEmail ?? undefined,
       globalGitName: globalName ?? undefined,
       globalGitEmail: globalEmail ?? undefined,
 

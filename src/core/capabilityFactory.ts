@@ -176,6 +176,8 @@ export function commitIdentityNotLockedResult(facts: RepoFacts, profile: Profile
     technicalDetails: {
       localGitName: facts.localGitName,
       localGitEmail: facts.localGitEmail,
+      worktreeGitName: facts.worktreeGitName,
+      worktreeGitEmail: facts.worktreeGitEmail,
       globalGitName: facts.globalGitName,
       globalGitEmail: facts.globalGitEmail,
     },

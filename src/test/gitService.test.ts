@@ -89,25 +89,18 @@ test("isLinkedWorktree compares git-dir against git-common-dir", () => {
   assert.equal(isLinkedWorktree("/repo/.git", null), false);
 });
 
-test("resolveIdentityConfigScope: single worktree always uses --local", () => {
-  assert.equal(resolveIdentityConfigScope(1, true), "local");
-  assert.equal(resolveIdentityConfigScope(1, false), "local");
-  assert.equal(resolveIdentityConfigScope(undefined, undefined), "local");
+test("resolveIdentityConfigScope: worktreeConfig on -> --worktree, regardless of worktree count", () => {
+  // Correction: this must NOT be gated on worktree count. When
+  // extensions.worktreeConfig is on, Git reads config.worktree *after* the
+  // shared repo config and lets it override, even with only one worktree
+  // attached right now — writing the fix to --local while a stale
+  // config.worktree value still exists would succeed as a command and
+  // still leave the effective identity wrong.
+  assert.equal(resolveIdentityConfigScope(true), "worktree");
 });
 
-test("resolveIdentityConfigScope: multiple worktrees + worktreeConfig on -> --worktree", () => {
-  assert.equal(resolveIdentityConfigScope(2, true), "worktree");
-});
-
-test("resolveIdentityConfigScope: multiple worktrees + worktreeConfig off/unknown -> --local (shared, must be warned about)", () => {
-  assert.equal(resolveIdentityConfigScope(2, false), "local");
-  assert.equal(resolveIdentityConfigScope(2, undefined), "local");
-  assert.equal(resolveIdentityConfigScope(2, null), "local");
-});
-
-test("resolveIdentityConfigScope: this is the correction to earlier guidance — isLinkedWorktree alone is not enough", () => {
-  // A repo can be the *main* worktree (isLinkedWorktree === false) while
-  // still having other worktrees attached. worktreeCount, not
-  // isLinkedWorktree, is what must gate --worktree vs --local.
-  assert.equal(resolveIdentityConfigScope(3, true), "worktree");
+test("resolveIdentityConfigScope: worktreeConfig off/unknown -> --local", () => {
+  assert.equal(resolveIdentityConfigScope(false), "local");
+  assert.equal(resolveIdentityConfigScope(undefined), "local");
+  assert.equal(resolveIdentityConfigScope(null), "local");
 });

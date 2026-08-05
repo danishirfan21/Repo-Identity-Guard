@@ -419,6 +419,28 @@ test("strict local identity mode flags identity that is only safe via global con
   assert.equal(result?.blocksOverallSafety, false);
 });
 
+test("strict local identity mode recognizes a worktree-scoped override, not just --local", () => {
+  // Fix Commit Identity may have written --worktree instead of --local
+  // (see resolveIdentityConfigScope) — the strict check must not keep
+  // reporting "not locked" after that succeeds.
+  const summary = run(
+    safeFacts({ localGitName: undefined, localGitEmail: undefined, worktreeGitName: "Danish Irfan", worktreeGitEmail: "work@example.com" }),
+    { requireLocalIdentity: true, includeMemoryInAiContext: false },
+  );
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.state, "confirmed");
+});
+
+test("strict local identity mode still flags a mismatched worktree-scoped override", () => {
+  const summary = run(
+    safeFacts({ localGitName: undefined, localGitEmail: undefined, worktreeGitName: "Someone Else", worktreeGitEmail: "someone@example.com" }),
+    { requireLocalIdentity: true, includeMemoryInAiContext: false },
+  );
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Repo is not locked to Work identity");
+  assert.equal(result?.state, "warning");
+});
+
 test("missing pinned memory produces an info note, not a capability result", () => {
   const summary = computeStatus({
     facts: safeFacts(),
