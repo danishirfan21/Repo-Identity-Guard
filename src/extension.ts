@@ -448,13 +448,30 @@ export function activate(context: vscode.ExtensionContext): void {
         matchedProfile.gitEmail,
         scope,
       );
-      await scan(facts.repoRoot);
 
       // Outcome-based, not just "the write didn't throw": an environment
       // variable (GIT_AUTHOR_EMAIL, etc.) or command-line override can
       // still win over the config this just wrote, in which case saying
-      // "fixed" would be false. Check what the rescan actually found.
-      const commitIdentity = latestSummary.capabilityResults.find((r) => r.capability === "commit_identity");
+      // "fixed" would be false. This check is deliberately independent of
+      // the shared scan()/latestSummary path: a watcher-triggered scan
+      // (possibly fired by this very config write) can supersede scan()'s
+      // own sequence guard and return without publishing, which would let
+      // this read stale global state and report a false "still overridden"
+      // warning. Re-collecting and re-computing this one repo directly
+      // sidesteps that race entirely.
+      const freshFacts = await collectRepoFacts(facts.repoRoot);
+      const freshSummary = computeStatus({
+        facts: freshFacts,
+        profiles: getProfiles(),
+        protectedBranches: getProtectedBranches(),
+        preferences: getSafetyPreferences(),
+        pinnedMemoryNote: freshFacts.repoRoot ? memoryStore.getPinnedNote(freshFacts.repoRoot)?.text : undefined,
+        isWorkspaceTrusted: vscode.workspace.isTrusted,
+      });
+      const commitIdentity = freshSummary.capabilityResults.find((r) => r.capability === "commit_identity");
+
+      await scan(facts.repoRoot); // still refresh the shared sidebar/workspace state
+
       if (commitIdentity?.state === "confirmed") {
         await vscode.window.showInformationMessage("Commit identity fixed for this repo.");
       } else {

@@ -239,7 +239,9 @@ export function commitIdentityConfirmedResult(profile: Profile): CapabilityResul
     capability: "commit_identity",
     state: "confirmed",
     title: "Commit identity confirmed",
-    summary: `Commits will be authored and committed as ${profile.label} (${identity(profile.gitName, profile.gitEmail)}).`,
+    summary: `Commits will be authored and committed as ${profile.label} (${identity(profile.gitName, profile.gitEmail)}) in this process, as of this scan.`,
+    whyItMatters:
+      "This reflects the extension host's own environment right now — a separate terminal, an external agent process, or an explicit --author/-c override could still see a different identity.",
     blocksOverallSafety: false,
   };
 }

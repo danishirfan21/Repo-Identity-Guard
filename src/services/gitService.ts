@@ -268,6 +268,15 @@ export function parseGitIdent(raw: string): ParsedIdent {
  * The identity Git would actually attach to a new commit right now,
  * including any `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` environment overrides
  * that a plain `git config user.name` read would miss.
+ *
+ * Scope of this guarantee: `git var` runs as a child process of the VS
+ * Code extension host, so this reflects *that process's* environment at
+ * the moment of the call — not every process that could create a commit
+ * in this repo. A separate integrated terminal, an external agent
+ * process, a shell profile sourced only interactively, or an explicit
+ * `git commit --author=...`/`-c user.email=...` can each see a different
+ * environment or override this scan never observed. Do not read a
+ * "confirmed" result here as a guarantee about every future commit.
  */
 export async function getEffectiveAuthorIdent(repoRoot: string): Promise<ParsedIdent> {
   const raw = await tryGit(repoRoot, ["var", "GIT_AUTHOR_IDENT"]);

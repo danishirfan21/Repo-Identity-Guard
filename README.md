@@ -66,6 +66,18 @@ config, rescans, and only reports success once the commit-identity
 capability is actually confirmed — if the environment is still overriding
 it afterward, it says so instead of claiming a fix that didn't take.
 
+**What "effective identity" does and doesn't cover:** `git var
+GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT` runs in the VS Code extension
+host's own process, so this reflects that process's environment at the
+moment of the scan — nothing more. It is not a guarantee about every
+process that might create a commit in this repo. A separate integrated
+terminal tab, an external AI agent process, a shell profile sourced only
+in interactive shells, or a future `git commit --author=...`/`-c
+user.email=...` can each carry a different environment or an explicit
+override that this scan never saw and couldn't have. Treat a Confirmed
+result as "this is what the extension host would use right now," not as
+a promise about every other place a commit could originate from.
+
 Repo Identity Guard matches the open repo against **Profiles** you define
 (Work, Personal, one per freelance client, one per employer — as many as
 you need) in Settings, in this order:

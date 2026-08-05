@@ -26,6 +26,7 @@ git branch --show-current
 | Environment override missed by config-only check | Set `GIT_AUTHOR_EMAIL` env var to a different address while `git config user.email` still shows the right one. | Still 🔴 NOT SAFE — confirms the check uses `git var GIT_AUTHOR_IDENT`, not just `git config`. Review Details shows **"Commit identity overridden by the environment"** (not "Wrong commit identity"), with no Fix Commit Identity button — config already matches, so there's nothing for it to write. |
 | Fix Commit Identity can't out-fix an environment override | With the above env-override scenario still active, run **Fix Commit Identity** anyway (e.g. via the command palette). | Config gets written (harmlessly redundant), but after the rescan the result explains that config was updated and the identity is still overridden by the environment/command context — it does **not** say "Commit identity fixed" when the effective identity is still wrong. |
 | Fix Commit Identity succeeds honestly | Set a genuinely wrong local identity (no env override), run **Fix Commit Identity**. | After the write and rescan, Commit Identity shows **Confirmed** and the success message appears — the message is based on the rescanned result, not just "the write didn't throw." |
+| Fix Commit Identity postcondition check survives a concurrent watcher-triggered scan | Trigger **Fix Commit Identity** in a multi-root workspace at the same moment another repo's watcher fires a rescan (e.g. switch branches in another repo right as you confirm the dialog). | The success/warning message still reflects *this* repo's actual post-write state, not a stale result from a scan that got superseded by the concurrent one. |
 | Unknown profile | No profile's `expectedRemoteOwners` or `exactRepos` matches this repo. | 🔴 NOT SAFE; "Repo profile is unknown"; Review Details offers **Add Profile for This Repo**. |
 | Exact-repo override wins over owner pattern | Profile A's `expectedRemoteOwners` matches this repo's owner; Profile B has an `exactRepos` entry for this exact repo. | Profile B is matched, not Profile A — exact-repo always wins. |
 | Fork/upstream conflict | Add an `upstream` remote whose owner matches a *different* profile than `origin`'s owner (e.g. personal fork of a company repo). | 🔴 NOT SAFE; "Origin and upstream imply different profiles"; Review Details offers **Assign This Repo**. |
@@ -200,3 +201,33 @@ be representable in the Copy Context model (as an issue entry or a derived
 restriction). If a new blocking check is added to `statusEngine.ts` without
 a corresponding Copy Context representation, that invariant test is the
 one that should fail — extend its fixture list when adding new checks.
+
+CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run compile`, and
+`npm test` on every PR and push to `main` — the automated result is
+independently enforced on GitHub, not only self-reported.
+
+## Extension Host / manual beta matrix
+
+The automated suite only covers pure logic (`core/`, most of `services/`)
+— `extension.ts`, `statusBar.ts`, and the webview itself need a real
+Extension Development Host (`F5`). Before a broader release, run through
+this matrix there, beyond the scenario-by-scenario tables above:
+
+- A Windows local repository (path separators, line endings, `git worktree`
+  output parsing).
+- Worktree config on/off, tried from both the main worktree and a linked
+  one.
+- A non-selected repo in a multi-root workspace changing state (branch
+  switch, new conflict, identity edit) while another repo is selected.
+- An environment override (`GIT_AUTHOR_EMAIL`, etc.) already present when
+  VS Code itself starts, not just set mid-session.
+- Workspace Trust disabled from a cold start.
+- Remote SSH, WSL, and Dev Containers — where the extension host's own
+  process environment (and thus `git var`'s effective identity) can differ
+  from what a user expects based on their local shell.
+- Saved-command execution and repository selection together — running a
+  saved command in the repo you just switched to via the repository list,
+  not the previously selected one.
+- Watcher freshness during live branch switches, conflicts, and rebases
+  started outside VS Code (a terminal, another tool) while the sidebar is
+  open.

@@ -4,6 +4,11 @@
 
 ### Added
 
+- **CI**: a GitHub Actions workflow (`.github/workflows/ci.yml`) runs
+  `npm ci`, `npm run compile`, and `npm test` on every PR and push to
+  `main`, so the test-suite result is independently enforced on GitHub
+  rather than only self-reported.
+
 - **Multi-root workspace support.** When a workspace has more than one Git
   repository (or a repo plus its linked worktree, opened as separate
   folders), Repo Identity Guard now evaluates every one of them
@@ -130,6 +135,25 @@
     was updated but the effective identity is still overridden by the
     environment or a command-line option — instead of reporting success
     based only on the write not throwing.
+  - That postcondition check no longer reads the shared, mutable
+    `latestSummary` after `scan()` — a watcher-triggered scan (possibly
+    fired by the very config write it's checking) could supersede
+    `scan()`'s own sequence guard and return without publishing, which
+    would risk reading stale state and reporting a false "still
+    overridden" warning. It now re-collects and re-computes just that
+    repo's status directly for the check, independent of any concurrent
+    scan, then still calls `scan()` afterward to refresh the shared
+    sidebar/workspace state.
+- **Documented the effective-identity boundary explicitly.** `git var
+  GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT` runs as a child process of the
+  VS Code extension host, so a "Confirmed" commit-identity result only
+  ever reflects that process's environment at scan time — never a
+  guarantee about every process that could create a commit in this repo
+  (a separate integrated terminal, an external AI agent process, a shell
+  profile sourced only interactively, or an explicit `git commit
+  --author=...`/`-c user.email=...`). Called out in `README.md`, in
+  `getEffectiveAuthorIdent`'s doc comment, and in the Commit Identity
+  Confirmed result's own text.
 - **`git status` and `git worktree list` failures are no longer treated
   as "nothing to report."** They previously shared the same
   exit-code-1/2/128-means-missing handling as `config --get`/`remote
