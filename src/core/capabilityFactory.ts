@@ -158,6 +158,55 @@ export function commitIdentityWrongResult(
   };
 }
 
+/**
+ * The configured identity (worktree/local/global config, in that
+ * precedence — no environment involved) already matches the profile, but
+ * the *effective* identity Git would actually use doesn't. That can only
+ * mean an environment variable (`GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`,
+ * etc.) or an explicit command-line override is winning. `Fix Commit
+ * Identity` only ever writes Git config — offering it here would let it
+ * report success while doing nothing to fix the actual problem, so this
+ * result deliberately carries no config-writing suggested action.
+ */
+export function commitIdentityEnvironmentOverrideResult(
+  facts: RepoFacts,
+  profile: Profile,
+  mismatch: IdentityMismatch,
+): CapabilityResult {
+  const found: string[] = [];
+  if (mismatch.author) {
+    found.push(`Author: ${identity(facts.effectiveGitName, facts.effectiveGitEmail)}`);
+  }
+  if (mismatch.committer) {
+    found.push(`Committer: ${identity(facts.effectiveCommitterName, facts.effectiveCommitterEmail)}`);
+  }
+
+  return {
+    id: "commit_identity:environment_override",
+    capability: "commit_identity",
+    state: "contradicted",
+    title: "Commit identity overridden by the environment",
+    summary: `Git config here is already set to ${profile.label}, but an environment variable or command-line option is overriding it for the next commit.`,
+    whyItMatters:
+      "Config alone doesn't decide what a commit gets stamped with — GIT_AUTHOR_EMAIL/GIT_COMMITTER_EMAIL (or an explicit --author) win over config every time. Fixing config here would not change that. Check for those environment variables or a command-line override before committing.",
+    whatWeExpected: `${profile.label} identity: ${identity(profile.gitName, profile.gitEmail)}`,
+    whatWeFound: found.join(" · ") || identity(facts.effectiveGitName, facts.effectiveGitEmail),
+    blocksOverallSafety: true,
+    agentRestrictions: [NO_COMMIT],
+    // Deliberately no suggestedAction/suggestedActionCommand: there's no
+    // config write that fixes this, so nothing here should render a button
+    // that looks actionable but does nothing.
+    technicalDetails: {
+      effectiveAuthorName: facts.effectiveGitName,
+      effectiveAuthorEmail: facts.effectiveGitEmail,
+      effectiveCommitterName: facts.effectiveCommitterName,
+      effectiveCommitterEmail: facts.effectiveCommitterEmail,
+      configuredGitName: facts.worktreeGitName ?? facts.localGitName ?? facts.globalGitName,
+      configuredGitEmail: facts.worktreeGitEmail ?? facts.localGitEmail ?? facts.globalGitEmail,
+    },
+  };
+}
+
 export function commitIdentityNotLockedResult(facts: RepoFacts, profile: Profile): CapabilityResult {
   return {
     id: "commit_identity:not_locked",

@@ -106,6 +106,30 @@
 - Watcher reconciliation now also watches `config.worktree`, so an
   external `git config --worktree user.email ...` triggers a rescan the
   same way an external `--local` edit already did.
+- **Fix Commit Identity is now outcome-based, and a pure environment
+  override is reported honestly instead of offered a config fix that
+  can't help.** Commit identity is read from Git's *effective*
+  author/committer identity (`git var`), which already reflects
+  `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL`-style environment overrides —
+  but every mismatch previously still offered **Fix Commit Identity**,
+  which only ever writes Git config. If an environment variable is
+  overriding an otherwise-correct config, that fix could write the right
+  config, report "Commit identity fixed," and the repo would remain NOT
+  SAFE because the environment override still wins.
+  - `checkCommitIdentity` now separately checks the *configured* identity
+    (worktree/local/global config, no environment involved). If it
+    already matches the profile but the effective identity doesn't, this
+    is reported as a distinct **"Commit identity overridden by the
+    environment"** result — still blocking, but with no
+    `suggestedActionCommand`, since no config write fixes it. The ordinary
+    **"Wrong commit identity"** result (offering Fix Commit Identity) is
+    reserved for when the configured identity itself doesn't match.
+  - **Fix Commit Identity** itself is now outcome-based: it writes config,
+    rescans, and only reports success if the commit-identity capability is
+    then actually `confirmed`. If it's still not, it explains that config
+    was updated but the effective identity is still overridden by the
+    environment or a command-line option — instead of reporting success
+    based only on the write not throwing.
 - **`git status` and `git worktree list` failures are no longer treated
   as "nothing to report."** They previously shared the same
   exit-code-1/2/128-means-missing handling as `config --get`/`remote

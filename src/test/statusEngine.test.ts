@@ -101,23 +101,59 @@ test("a fully matching repo is SAFE, with every capability confirmed", () => {
   }
 });
 
-test("wrong effective author identity is NOT SAFE and contradicted", () => {
-  const summary = run(safeFacts({ effectiveGitEmail: "personal@example.com" }));
+test("wrong config (local identity itself is wrong) is NOT SAFE with the ordinary fixable result", () => {
+  // Both configured (local) and effective identity are wrong — an ordinary
+  // config problem, fixable by writing config.
+  const summary = run(
+    safeFacts({ effectiveGitEmail: "personal@example.com", localGitEmail: "personal@example.com" }),
+  );
   assert.equal(summary.level, "not_safe");
   const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
   assert.equal(result?.title, "Wrong commit identity");
   assert.equal(result?.state, "contradicted");
   assert.equal(result?.blocksOverallSafety, true);
+  assert.equal(result?.suggestedActionCommand, "fixCommitIdentity");
   assert.match(result?.whatWeFound ?? "", /Author:/);
 });
 
-test("wrong effective committer identity (author matches) is NOT SAFE", () => {
+test("wrong config (committer) is NOT SAFE with the ordinary fixable result", () => {
+  const summary = run(
+    safeFacts({
+      effectiveCommitterName: "Someone Else",
+      effectiveCommitterEmail: "someone@example.com",
+      localGitName: "Someone Else",
+      localGitEmail: "someone@example.com",
+    }),
+  );
+  assert.equal(summary.level, "not_safe");
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Wrong commit identity");
+  assert.match(result?.whatWeFound ?? "", /Committer:/);
+  assert.doesNotMatch(result?.whatWeFound ?? "", /Author:/);
+});
+
+test("effective author mismatch with config already correct is an environment-override result, not the ordinary fixable one", () => {
+  // Local config matches the profile; only the *effective* identity
+  // (which includes GIT_AUTHOR_EMAIL-style env overrides) differs. Fix
+  // Commit Identity writing config again would not change this, so it
+  // must not be offered as a config-writing fix.
+  const summary = run(safeFacts({ effectiveGitEmail: "personal@example.com" }));
+  assert.equal(summary.level, "not_safe");
+  const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
+  assert.equal(result?.title, "Commit identity overridden by the environment");
+  assert.equal(result?.state, "contradicted");
+  assert.equal(result?.blocksOverallSafety, true);
+  assert.equal(result?.suggestedActionCommand, undefined);
+  assert.match(result?.whatWeFound ?? "", /Author:/);
+});
+
+test("effective committer mismatch with config already correct is also an environment-override result", () => {
   const summary = run(
     safeFacts({ effectiveCommitterName: "Someone Else", effectiveCommitterEmail: "someone@example.com" }),
   );
   assert.equal(summary.level, "not_safe");
   const result = summary.capabilityResults.find((r) => r.capability === "commit_identity");
-  assert.equal(result?.title, "Wrong commit identity");
+  assert.equal(result?.title, "Commit identity overridden by the environment");
   assert.match(result?.whatWeFound ?? "", /Committer:/);
   assert.doesNotMatch(result?.whatWeFound ?? "", /Author:/);
 });

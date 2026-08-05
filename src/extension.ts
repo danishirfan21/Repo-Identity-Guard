@@ -448,8 +448,20 @@ export function activate(context: vscode.ExtensionContext): void {
         matchedProfile.gitEmail,
         scope,
       );
-      await vscode.window.showInformationMessage("Commit identity fixed for this repo.");
       await scan(facts.repoRoot);
+
+      // Outcome-based, not just "the write didn't throw": an environment
+      // variable (GIT_AUTHOR_EMAIL, etc.) or command-line override can
+      // still win over the config this just wrote, in which case saying
+      // "fixed" would be false. Check what the rescan actually found.
+      const commitIdentity = latestSummary.capabilityResults.find((r) => r.capability === "commit_identity");
+      if (commitIdentity?.state === "confirmed") {
+        await vscode.window.showInformationMessage("Commit identity fixed for this repo.");
+      } else {
+        await vscode.window.showWarningMessage(
+          "Git config was updated, but this repo's effective commit identity is still not correct — likely an environment variable (GIT_AUTHOR_EMAIL/GIT_COMMITTER_EMAIL) or command-line override winning over config. Repo Identity Guard can only change Git config, not your shell environment or a command's own arguments.",
+        );
+      }
     } catch (error) {
       await vscode.window.showErrorMessage(`Could not fix commit identity: ${getErrorMessage(error)}`);
     }

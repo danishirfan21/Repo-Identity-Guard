@@ -16,6 +16,7 @@ import {
   branchPolicyPatternMismatchResult,
   branchPolicyProtectedResult,
   commitIdentityConfirmedResult,
+  commitIdentityEnvironmentOverrideResult,
   commitIdentityNotLockedResult,
   commitIdentityWrongResult,
   forkConflictResult,
@@ -139,6 +140,18 @@ function checkCommitIdentity(
 
   if (authorMismatch || committerMismatch) {
     const mismatch: IdentityMismatch = { author: authorMismatch, committer: committerMismatch };
+
+    // If the *configured* identity (worktree/local/global config, no
+    // environment involved) already matches the profile, the effective
+    // mismatch can only be an environment variable or command-line
+    // override winning over config — writing config again would not fix
+    // it, so this must not be reported as the ordinary config-fixable case.
+    const configuredName = facts.worktreeGitName ?? facts.localGitName ?? facts.globalGitName;
+    const configuredEmail = facts.worktreeGitEmail ?? facts.localGitEmail ?? facts.globalGitEmail;
+    if (nameMatches(configuredName) && emailMatches(configuredEmail)) {
+      return commitIdentityEnvironmentOverrideResult(facts, profile, mismatch);
+    }
+
     return commitIdentityWrongResult(facts, profile, mismatch);
   }
 

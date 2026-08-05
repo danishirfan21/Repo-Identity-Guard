@@ -55,6 +55,17 @@ diverge (e.g. mid-rebase). This still reflects the environment checked at
 scan time; an explicit command-line override can always change what
 actually gets used for a given commit.
 
+If the *configured* identity (worktree/local/global config) already
+matches the profile but the effective identity doesn't, that can only mean
+an environment variable (`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL`, etc.) or
+a command-line override is winning — Repo Identity Guard reports this as
+its own **"Commit identity overridden by the environment"** result, with
+no config-writing action offered, since writing config again wouldn't fix
+it. **Fix Commit Identity** itself checks its own outcome: it writes
+config, rescans, and only reports success once the commit-identity
+capability is actually confirmed — if the environment is still overriding
+it afterward, it says so instead of claiming a fix that didn't take.
+
 Repo Identity Guard matches the open repo against **Profiles** you define
 (Work, Personal, one per freelance client, one per employer — as many as
 you need) in Settings, in this order:

@@ -76,7 +76,17 @@ function assertInvariantHolds(facts: RepoFacts, profiles: Profile[], preferences
   }
 }
 
-test("invariant: wrong commit identity is represented in the AI context", () => {
+test("invariant: wrong commit identity (config itself wrong) is represented in the AI context", () => {
+  assertInvariantHolds(
+    safeFacts({ effectiveGitEmail: "personal@example.com", localGitEmail: "personal@example.com" }),
+    [workProfile],
+  );
+});
+
+test("invariant: an environment-override commit identity mismatch is represented in the AI context", () => {
+  // Config matches the profile; only the effective (env-influenced)
+  // identity differs — a different capability result than the ordinary
+  // wrong-config case, and it must be covered by the invariant too.
   assertInvariantHolds(safeFacts({ effectiveGitEmail: "personal@example.com" }), [workProfile]);
 });
 
