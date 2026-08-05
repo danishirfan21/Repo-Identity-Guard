@@ -42,6 +42,50 @@
     combined dump of every repo's full checklist or Repo Memory notes.
     Copy Context for AI is unchanged and still describes only the
     currently selected repo in full detail.
+- **Fix Commit Identity now writes to the correct config scope for
+  worktrees.** Previously the confirmation dialog could claim a change
+  "affects only this worktree" while still running `git config --local`,
+  which is repo-level config shared by every worktree — a contradiction
+  between what was promised and what actually happened. It's now resolved
+  explicitly via `resolveIdentityConfigScope`, based on `git worktree list
+  --porcelain` (not just `isLinkedWorktree`, which only detects *this*
+  worktree as linked and misses a *main* worktree that has others attached
+  to it) and whether `extensions.worktreeConfig` is on:
+  - More than one worktree + worktree config on → writes `git config
+    --worktree`, and the dialog says so.
+  - More than one worktree + worktree config off/unknown → still writes
+    `git config --local`, but the dialog now says explicitly that the
+    change is shared across every worktree, not narrower.
+  - One worktree → ordinary `--local`, unambiguous either way.
+  Every mutation confirmation also now names the repository and its local
+  path alongside the profile, so "this repo" is never ambiguous once more
+  than one is open.
+- **Every repo in a multi-root workspace is now kept fresh, not just the
+  selected one.** Previously only the selected repo's `.git/{config,HEAD}`
+  was watched, so a non-selected repo could go unsafe (branch switch, new
+  conflict, identity change) without the workspace aggregate ever
+  refreshing — a stale green result. Watchers are now reconciled per repo
+  (by canonical repo ID) after every scan, covering every in-scope repo's
+  resolved `gitDir`/`gitCommonDir` — not a guessed `<repoRoot>/.git`, which
+  is wrong for linked worktrees — for HEAD/config/index/merge-conflict
+  markers and rebase-in-progress directories, debounced 300ms. A save
+  anywhere in the workspace also nudges a rescan, as a lighter-weight
+  partial mitigation for ordinary working-tree edits (still not a full
+  recursive working-tree watch, which would be expensive across every
+  repo — documented as a limitation).
+- **The status bar's click can no longer contradict its own badge.** In a
+  multi-root workspace, clicking the status bar now shows the workspace
+  verdict (`workspaceState`) — "N of M repositories need attention" — not
+  just the selected repo's status, which could previously read "Safe to
+  work here" while the badge itself showed "Not Safe (1/2 repos)". The
+  status bar's multi-root problem count also now includes unresolved
+  (`not_checked`) repos, not only blocking ones — `formatWorkspaceProblems`
+  fixes a bug where it could otherwise show "Not Safe (0/2 repos)" when
+  the only problem was an unresolved repo.
+- Per-repo scanning during aggregation is now isolated with
+  `Promise.allSettled` plus a per-target try/catch, converting any
+  unexpected failure into that repo's own inspection-failed result instead
+  of risking the whole workspace scan rejecting and hiding every repo.
 - **New capability-based result model**, replacing the old flat
   blocking/warning/info `Issue` list. Every scan now evaluates exactly six
   capabilities (Commit Identity, Push Destination, Push Account, Branch

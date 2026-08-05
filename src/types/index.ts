@@ -16,6 +16,11 @@ export interface RepoFacts {
   isLinkedWorktree?: boolean;
   /** Whether this repo has `extensions.worktreeConfig` on; null/undefined means unknown/not queried. */
   worktreeConfigEnabled?: boolean;
+  /** From `git worktree list --porcelain`; >1 means other worktrees are attached to this repository, even from its main worktree. */
+  worktreeCount?: number;
+  /** Resolved `--git-dir`/`--git-common-dir`, kept so callers can watch the actual Git state directories, not a guessed `<repoRoot>/.git`. */
+  gitDir?: string;
+  gitCommonDir?: string;
 
   /** Effective author identity Git would use right now (`git var GIT_AUTHOR_IDENT`), including env overrides. */
   effectiveGitName?: string;
@@ -188,6 +193,16 @@ export interface RepoMemory {
 export function emptyRepoMemory(): RepoMemory {
   return { notes: [], commands: [] };
 }
+
+/**
+ * Which Git config file `Fix Commit Identity` writes to. `--local` writes
+ * the repo-level config shared by every worktree attached to a repo;
+ * `--worktree` writes `config.worktree`, which is only actually
+ * per-worktree when `extensions.worktreeConfig` is on. Never assume
+ * `--local` is worktree-scoped just because a repo happens to be a linked
+ * worktree — see `resolveIdentityConfigScope`.
+ */
+export type IdentityConfigScope = "local" | "worktree";
 
 export interface SafetyPreferences {
   requireLocalIdentity: boolean;

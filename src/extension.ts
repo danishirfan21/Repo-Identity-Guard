@@ -5,8 +5,8 @@ import * as vscode from "vscode";
 import { buildAiContext, buildWorkspaceSafetySummary } from "./core/aiContext";
 import { canonicalRepoKey, findOverlappingProfiles, resolveProfiles } from "./core/profileResolver";
 import { computeStatus } from "./core/statusEngine";
-import { computeWorkspaceSafetyState } from "./core/workspaceAggregate";
-import { collectRepoFacts } from "./services/gitService";
+import { computeWorkspaceSafetyState, workspaceProblemCount } from "./core/workspaceAggregate";
+import { collectRepoFacts, resolveIdentityConfigScope } from "./services/gitService";
 import { copyToClipboard, runSavedCommand } from "./services/commandRunner";
 import { SafeActionRunner } from "./services/safeActionRunner";
 import {
@@ -44,8 +44,9 @@ let workspaceState: WorkspaceSafetyState = emptyWorkspaceState();
 /** The repo mutating/executing actions apply to. Always a concrete repo from `workspaceState.repos`, never ambiguous. */
 let selectedRepoId: string | undefined;
 let scanSequence = 0;
-let repoGitConfigWatcher: vscode.FileSystemWatcher | undefined;
-let watchedRepoRoot: string | undefined;
+/** One or more watchers per repo (its gitDir and, for linked worktrees, gitCommonDir too), reconciled by repoId after every scan — see `reconcileRepoWatchers`. */
+let repoWatchers = new Map<string, vscode.Disposable[]>();
+let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let globalGitConfigWatchers: vscode.FileSystemWatcher[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -208,7 +209,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
       statusBar.update(workspaceState);
       refreshSidebar();
-      updateRepoGitConfigWatcher(latestSummary.facts.repoRoot, scan);
+      reconcileRepoWatchers(repos);
     } catch (error) {
       if (sequence !== scanSequence) return;
       workspaceState = emptyWorkspaceState();
@@ -216,8 +217,71 @@ export function activate(context: vscode.ExtensionContext): void {
       latestSummary = emptyNotCheckedSummary(getErrorMessage(error));
       statusBar.update(workspaceState);
       refreshSidebar();
-      updateRepoGitConfigWatcher(undefined, scan);
+      reconcileRepoWatchers([]);
     }
+  }
+
+  function scheduleDebouncedScan(): void {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => void scan(), 300);
+  }
+
+  /**
+   * Keeps one set of Git-state watchers per repo in sync with what the last
+   * scan actually found — added for newly discovered repos, disposed for
+   * repos that dropped out (closed folder, no longer a Git repo). Every
+   * in-scope repo gets watched, not just the currently selected one, so a
+   * non-selected repo going unsafe (branch switch, new conflict, identity
+   * change) still triggers a rescan and the aggregate can't go stale.
+   *
+   * Watches the resolved `gitDir`/`gitCommonDir` (not a guessed
+   * `<repoRoot>/.git`, which is wrong for linked worktrees) for the files
+   * that drive Commit Identity, Branch Policy, and Repo State: HEAD,
+   * config, the index, the merge/cherry-pick/revert markers, and the
+   * rebase-in-progress directories. This does not watch the working tree
+   * itself (recursively watching every file in every repo would be
+   * expensive); `onDidSaveTextDocument` below gives ordinary edits a
+   * lighter-weight nudge instead.
+   */
+  function reconcileRepoWatchers(repos: RepositorySafetyState[]): void {
+    const currentIds = new Set(repos.map((r) => r.repoId));
+
+    for (const [repoId, disposables] of repoWatchers) {
+      if (!currentIds.has(repoId)) {
+        disposables.forEach((d) => d.dispose());
+        repoWatchers.delete(repoId);
+      }
+    }
+
+    for (const repo of repos) {
+      if (repoWatchers.has(repo.repoId)) continue;
+
+      const facts = repo.summary.facts;
+      const dirs = new Set([facts.gitDir, facts.gitCommonDir].filter((d): d is string => !!d));
+      if (dirs.size === 0) continue;
+
+      const disposables: vscode.Disposable[] = [];
+      for (const dir of dirs) {
+        const stateWatcher = vscode.workspace.createFileSystemWatcher(
+          new vscode.RelativePattern(vscode.Uri.file(dir), "{HEAD,config,index,MERGE_HEAD,CHERRY_PICK_HEAD,REVERT_HEAD}"),
+        );
+        const operationWatcher = vscode.workspace.createFileSystemWatcher(
+          new vscode.RelativePattern(vscode.Uri.file(dir), "{rebase-merge,rebase-apply}/**"),
+        );
+        for (const watcher of [stateWatcher, operationWatcher]) {
+          watcher.onDidChange(() => scheduleDebouncedScan());
+          watcher.onDidCreate(() => scheduleDebouncedScan());
+          watcher.onDidDelete(() => scheduleDebouncedScan());
+          disposables.push(watcher);
+        }
+      }
+      repoWatchers.set(repo.repoId, disposables);
+    }
+  }
+
+  function disposeRepoWatchers(): void {
+    for (const disposables of repoWatchers.values()) disposables.forEach((d) => d.dispose());
+    repoWatchers.clear();
   }
 
   /** Workspace folders to scan, or a single ad hoc folder when the window has none open as a workspace. */
@@ -242,31 +306,68 @@ export function activate(context: vscode.ExtensionContext): void {
   async function buildRepositoryStates(
     targets: { path: string; folderName?: string }[],
   ): Promise<RepositorySafetyState[]> {
-    const scans = await Promise.all(
+    // Promise.allSettled, not Promise.all: one target must never be able to
+    // take the rest of the workspace down with it. collectRepoFacts already
+    // catches its own expected failures, but this is defense in depth
+    // against an unanticipated exception from any step below.
+    const outcomes = await Promise.allSettled(
       targets.map(async (target) => ({ target, facts: await collectRepoFacts(target.path) })),
     );
 
     const byRepoId = new Map<string, RepositorySafetyState>();
-    for (const { target, facts } of scans) {
-      if (!facts.isGitRepo || !facts.repoRoot) continue;
+    for (let i = 0; i < outcomes.length; i++) {
+      const outcome = outcomes[i];
+      const target = targets[i];
 
-      const repoId = await canonicalizeRepoRoot(facts.repoRoot);
-      if (byRepoId.has(repoId)) continue;
+      try {
+        if (outcome.status === "rejected") {
+          addInspectionFailedRepo(byRepoId, target, getErrorMessage(outcome.reason));
+          continue;
+        }
 
-      const pinnedNote = memoryStore.getPinnedNote(facts.repoRoot)?.text;
-      const summary = computeStatus({
-        facts,
-        profiles: getProfiles(),
-        protectedBranches: getProtectedBranches(),
-        preferences: getSafetyPreferences(),
-        pinnedMemoryNote: pinnedNote,
-        isWorkspaceTrusted: vscode.workspace.isTrusted,
-      });
+        const { facts } = outcome.value;
+        if (!facts.isGitRepo || !facts.repoRoot) continue;
 
-      byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary });
+        const repoId = await canonicalizeRepoRoot(facts.repoRoot);
+        if (byRepoId.has(repoId)) continue;
+
+        const pinnedNote = memoryStore.getPinnedNote(facts.repoRoot)?.text;
+        const summary = computeStatus({
+          facts,
+          profiles: getProfiles(),
+          protectedBranches: getProtectedBranches(),
+          preferences: getSafetyPreferences(),
+          pinnedMemoryNote: pinnedNote,
+          isWorkspaceTrusted: vscode.workspace.isTrusted,
+        });
+
+        byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary });
+      } catch (error) {
+        // Same guarantee for the synchronous half of the pipeline
+        // (canonicalization, computeStatus): a bug evaluating one repo
+        // must not hide every other repo in the workspace.
+        addInspectionFailedRepo(byRepoId, target, getErrorMessage(error));
+      }
     }
 
     return [...byRepoId.values()];
+  }
+
+  function addInspectionFailedRepo(
+    byRepoId: Map<string, RepositorySafetyState>,
+    target: { path: string; folderName?: string },
+    errorMessage: string,
+  ): void {
+    const repoId = target.path;
+    if (byRepoId.has(repoId)) return;
+    const summary = computeStatus({
+      facts: { isGitRepo: true, repoRoot: repoId, gitError: errorMessage },
+      profiles: getProfiles(),
+      protectedBranches: getProtectedBranches(),
+      preferences: getSafetyPreferences(),
+      isWorkspaceTrusted: vscode.workspace.isTrusted,
+    });
+    byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary });
   }
 
   async function canonicalizeRepoRoot(repoRoot: string): Promise<string> {
@@ -299,15 +400,20 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!repo) return;
     selectedRepoId = repoId;
     latestSummary = repo.summary;
-    updateRepoGitConfigWatcher(latestSummary.facts.repoRoot, scan);
   }
 
-  function worktreeWarning(facts: RepoFacts): string {
-    if (!facts.isLinkedWorktree) return "";
-    if (facts.worktreeConfigEnabled === true) {
-      return " This repo is a linked worktree with per-worktree config enabled, so this change affects only this worktree.";
+  /** Repo/profile identity for a mutation confirmation dialog — never leave "this repo" ambiguous once more than one is open. */
+  function repoIdentityLines(facts: RepoFacts, profile: Profile): string {
+    return `\n\nRepository: ${facts.repoName ?? "Unknown"}\nLocal path: ${facts.repoRoot}\nProfile: ${profile.label}`;
+  }
+
+  function worktreeWarning(facts: RepoFacts, scope: "local" | "worktree"): string {
+    const hasMultipleWorktrees = (facts.worktreeCount ?? 1) > 1;
+    if (!hasMultipleWorktrees) return "";
+    if (scope === "worktree") {
+      return " This repo has other worktrees attached, but per-worktree config is enabled, so this is written with `git config --worktree` and affects only this worktree.";
     }
-    return " This repo is a linked worktree. Per-worktree config isn't enabled here, so this change may affect every worktree attached to this repository, not just this one.";
+    return " This repo has other worktrees attached, and per-worktree config isn't enabled, so this is written with `git config --local` and will be shared by every worktree attached to this repository, not just this one.";
   }
 
   async function fixCommitIdentity(): Promise<void> {
@@ -320,8 +426,10 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     if (!(await requireWorkspaceTrust())) return;
 
+    const scope = resolveIdentityConfigScope(facts.worktreeCount, facts.worktreeConfigEnabled);
+
     const confirmation = await vscode.window.showWarningMessage(
-      `Set this repo's local Git identity to ${matchedProfile.label} (${matchedProfile.gitName ?? ""} <${matchedProfile.gitEmail}>)? This only changes this repo's local Git config — your global Git identity is never touched.${worktreeWarning(facts)}`,
+      `Set this repo's Git identity to ${matchedProfile.label} (${matchedProfile.gitName ?? ""} <${matchedProfile.gitEmail}>)? Your global Git identity is never touched.${worktreeWarning(facts, scope)}${repoIdentityLines(facts, matchedProfile)}`,
       { modal: true },
       "Set Local Identity",
     );
@@ -332,6 +440,7 @@ export function activate(context: vscode.ExtensionContext): void {
         facts.repoRoot,
         matchedProfile.gitName ?? matchedProfile.label,
         matchedProfile.gitEmail,
+        scope,
       );
       await vscode.window.showInformationMessage("Commit identity fixed for this repo.");
       await scan(facts.repoRoot);
@@ -344,7 +453,8 @@ export function activate(context: vscode.ExtensionContext): void {
     const { facts } = latestSummary;
     if (!facts.repoRoot) return;
     if (!(await requireWorkspaceTrust())) return;
-    await safeActionRunner.unsetLocalIdentity(facts.repoRoot);
+    const scope = resolveIdentityConfigScope(facts.worktreeCount, facts.worktreeConfigEnabled);
+    await safeActionRunner.unsetLocalIdentity(facts.repoRoot, scope);
     await scan(facts.repoRoot);
   }
 
@@ -485,15 +595,42 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (affectsRepoIdentityGuardConfig(event)) void scan();
     }),
+    // A lighter-weight nudge for ordinary working-tree edits, which the
+    // Git-dir watchers above don't cover (see reconcileRepoWatchers).
+    vscode.workspace.onDidSaveTextDocument(() => scheduleDebouncedScan()),
     {
       dispose: () => {
-        repoGitConfigWatcher?.dispose();
+        if (debounceTimer) clearTimeout(debounceTimer);
+        disposeRepoWatchers();
         disposeGlobalGitConfigWatchers();
       },
     },
   );
 
+  /**
+   * In a multi-root workspace, this reflects `workspaceState` — the same
+   * thing the status bar badge shows — never just the selected repo. A
+   * status bar reading "Not Safe (1/2 repos)" whose click says "Safe to
+   * work here" would be a trust-breaking contradiction.
+   */
   async function showStatus(): Promise<void> {
+    if (workspaceState.repos.length > 1) {
+      const problems = workspaceProblemCount(workspaceState);
+      const message =
+        workspaceState.level === "safe"
+          ? `Workspace is safe: all ${workspaceState.repos.length} repositories checked and safe.`
+          : `Workspace is not safe: ${problems} of ${workspaceState.repos.length} repositories need attention.`;
+
+      const choice = await (workspaceState.level === "safe"
+        ? vscode.window.showInformationMessage(message, "Show Repositories")
+        : vscode.window.showWarningMessage(message, "Show Repositories"));
+
+      if (choice === "Show Repositories") {
+        await vscode.commands.executeCommand("workbench.view.extension.repoIdentityGuard");
+      }
+      return;
+    }
+
     const summary = latestSummary;
     const message =
       summary.level === "safe"
@@ -518,7 +655,8 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {
-  repoGitConfigWatcher?.dispose();
+  for (const disposables of repoWatchers.values()) disposables.forEach((d) => d.dispose());
+  repoWatchers.clear();
   disposeGlobalGitConfigWatchers();
 }
 
@@ -528,26 +666,6 @@ function getActiveCwd(): string | undefined {
     return path.dirname(activeDocument.uri.fsPath);
   }
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-}
-
-function updateRepoGitConfigWatcher(
-  repoRoot: string | undefined,
-  scan: (cwdOverride?: string) => Promise<void>,
-): void {
-  if (repoRoot === watchedRepoRoot) return;
-
-  repoGitConfigWatcher?.dispose();
-  repoGitConfigWatcher = undefined;
-  watchedRepoRoot = repoRoot;
-
-  if (!repoRoot) return;
-
-  repoGitConfigWatcher = vscode.workspace.createFileSystemWatcher(
-    new vscode.RelativePattern(vscode.Uri.file(repoRoot), ".git/{config,HEAD}"),
-  );
-  repoGitConfigWatcher.onDidChange(() => void scan(repoRoot));
-  repoGitConfigWatcher.onDidCreate(() => void scan(repoRoot));
-  repoGitConfigWatcher.onDidDelete(() => void scan(repoRoot));
 }
 
 function updateGlobalGitConfigWatchers(scan: (cwdOverride?: string) => Promise<void>): void {

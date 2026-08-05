@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { InProgressOperation, RemoteProtocol, RepoFacts } from "../types";
+import { IdentityConfigScope, InProgressOperation, RemoteProtocol, RepoFacts } from "../types";
 
 const execFileAsync = promisify(execFile);
 
@@ -131,6 +131,34 @@ export async function getWorktreeConfigEnabled(repoRoot: string): Promise<boolea
   return value.trim().toLowerCase() === "true";
 }
 
+/**
+ * How many worktrees (main + linked) are attached to this repository, via
+ * `git worktree list --porcelain`. A repo can have other worktrees attached
+ * while itself being the main one (`isLinkedWorktree` false) — that alone
+ * doesn't mean a config write here is safely worktree-scoped.
+ */
+export async function getWorktreeCount(repoRoot: string): Promise<number> {
+  const output = await tryGit(repoRoot, ["worktree", "list", "--porcelain"]);
+  if (!output) return 1;
+  const count = output.split("\n").filter((line) => line.startsWith("worktree ")).length;
+  return count > 0 ? count : 1;
+}
+
+/**
+ * Whether `Fix Commit Identity` should write to `--local` or `--worktree`.
+ * `--local` is repo-level config shared by every worktree attached to a
+ * repo; `--worktree` only actually isolates the change to this worktree
+ * when `extensions.worktreeConfig` is on. With only one worktree, `--local`
+ * is unambiguous and correct either way.
+ */
+export function resolveIdentityConfigScope(
+  worktreeCount: number | undefined,
+  worktreeConfigEnabled: boolean | null | undefined,
+): IdentityConfigScope {
+  const hasMultipleWorktrees = (worktreeCount ?? 1) > 1;
+  return hasMultipleWorktrees && worktreeConfigEnabled === true ? "worktree" : "local";
+}
+
 export async function getOriginRemote(repoRoot: string): Promise<string | null> {
   return tryGit(repoRoot, ["remote", "get-url", "origin"]);
 }
@@ -227,19 +255,28 @@ export async function getEffectiveCommitterIdent(repoRoot: string): Promise<Pars
   return raw ? parseGitIdent(raw) : {};
 }
 
-/** Only allowed mutations: repo-local user.name/user.email. Never touches global config. */
+/**
+ * Only allowed mutations: this repo's own `user.name`/`user.email`, written
+ * to either `--local` or `--worktree` per `scope` — see
+ * `resolveIdentityConfigScope`. Never touches global config, and never
+ * writes `--worktree` unless the caller has confirmed
+ * `extensions.worktreeConfig` actually makes that scope per-worktree.
+ */
 export async function setLocalGitIdentity(
   repoRoot: string,
   name: string,
   email: string,
+  scope: IdentityConfigScope = "local",
 ): Promise<void> {
-  await runGit(repoRoot, ["config", "--local", "user.name", name]);
-  await runGit(repoRoot, ["config", "--local", "user.email", email]);
+  const flag = scope === "worktree" ? "--worktree" : "--local";
+  await runGit(repoRoot, ["config", flag, "user.name", name]);
+  await runGit(repoRoot, ["config", flag, "user.email", email]);
 }
 
-export async function unsetLocalGitIdentity(repoRoot: string): Promise<void> {
-  await tryGit(repoRoot, ["config", "--local", "--unset", "user.name"]);
-  await tryGit(repoRoot, ["config", "--local", "--unset", "user.email"]);
+export async function unsetLocalGitIdentity(repoRoot: string, scope: IdentityConfigScope = "local"): Promise<void> {
+  const flag = scope === "worktree" ? "--worktree" : "--local";
+  await tryGit(repoRoot, ["config", flag, "--unset", "user.name"]);
+  await tryGit(repoRoot, ["config", flag, "--unset", "user.email"]);
 }
 
 export interface ParsedRemote {
@@ -323,6 +360,7 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       gitDir,
       gitCommonDir,
       worktreeConfigEnabled,
+      worktreeCount,
     ] = await Promise.all([
       getCurrentBranch(repoRoot),
       isDetachedHead(repoRoot),
@@ -338,6 +376,7 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       getGitDir(repoRoot),
       getGitCommonDir(repoRoot),
       getWorktreeConfigEnabled(repoRoot),
+      getWorktreeCount(repoRoot),
     ]);
 
     const inProgressOperation = gitDir ? await detectInProgressOperation(gitDir) : undefined;
@@ -360,6 +399,9 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       inProgressOperation,
       isLinkedWorktree: isLinkedWorktree(gitDir, gitCommonDir),
       worktreeConfigEnabled: worktreeConfigEnabled ?? undefined,
+      worktreeCount,
+      gitDir: gitDir ?? undefined,
+      gitCommonDir: gitCommonDir ?? undefined,
 
       effectiveGitName: authorIdent.name,
       effectiveGitEmail: authorIdent.email,

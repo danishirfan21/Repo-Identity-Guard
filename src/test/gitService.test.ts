@@ -5,6 +5,7 @@ import {
   parseGitIdent,
   parseRemoteUrl,
   parseStatusPorcelain,
+  resolveIdentityConfigScope,
 } from "../services/gitService";
 
 test("parses HTTPS remote URLs", () => {
@@ -86,4 +87,27 @@ test("isLinkedWorktree compares git-dir against git-common-dir", () => {
   assert.equal(isLinkedWorktree("/repo/.git/worktrees/feature", "/repo/.git"), true);
   assert.equal(isLinkedWorktree(null, "/repo/.git"), false);
   assert.equal(isLinkedWorktree("/repo/.git", null), false);
+});
+
+test("resolveIdentityConfigScope: single worktree always uses --local", () => {
+  assert.equal(resolveIdentityConfigScope(1, true), "local");
+  assert.equal(resolveIdentityConfigScope(1, false), "local");
+  assert.equal(resolveIdentityConfigScope(undefined, undefined), "local");
+});
+
+test("resolveIdentityConfigScope: multiple worktrees + worktreeConfig on -> --worktree", () => {
+  assert.equal(resolveIdentityConfigScope(2, true), "worktree");
+});
+
+test("resolveIdentityConfigScope: multiple worktrees + worktreeConfig off/unknown -> --local (shared, must be warned about)", () => {
+  assert.equal(resolveIdentityConfigScope(2, false), "local");
+  assert.equal(resolveIdentityConfigScope(2, undefined), "local");
+  assert.equal(resolveIdentityConfigScope(2, null), "local");
+});
+
+test("resolveIdentityConfigScope: this is the correction to earlier guidance — isLinkedWorktree alone is not enough", () => {
+  // A repo can be the *main* worktree (isLinkedWorktree === false) while
+  // still having other worktrees attached. worktreeCount, not
+  // isLinkedWorktree, is what must gate --worktree vs --local.
+  assert.equal(resolveIdentityConfigScope(3, true), "worktree");
 });

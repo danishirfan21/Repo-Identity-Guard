@@ -120,6 +120,13 @@ restrictions for every repo in the workspace, not a combined dump of every
 repo's full checklist or Repo Memory notes. Copy Context for AI still
 describes only the currently selected repo, in full detail.
 
+Every in-scope repo is watched for Git state changes (HEAD, config, index,
+merge/conflict markers, rebase-in-progress), not only the currently
+selected one — so a repo you're not looking at can't go unsafe without the
+aggregate noticing. The status bar's own click action reflects the same
+aggregate a multi-root badge shows; it never reports "safe" based on only
+the selected repo while the badge itself reads Not Safe.
+
 ## Views
 
 - **Main** — compact status, matched profile, issue count, next fix, one
@@ -151,11 +158,25 @@ managers, or keychains, and it never runs `push`, `push --force`,
 Memory always run in a visible integrated terminal — never silently, and
 never at all when the workspace isn't [trusted](#workspace-trust).
 
-Fixing commit identity on a repo that's a linked Git worktree shows an
-extra warning first: depending on whether `extensions.worktreeConfig` is
-on for that repo, the change may affect only this worktree or every
-worktree attached to it. Full per-worktree config management isn't built —
-this is deliberately just an honest warning before you confirm.
+When a repo has more than one worktree attached (checked via `git worktree
+list --porcelain`, not just whether the current one is linked — a *main*
+worktree can have others attached to it too), Fix Commit Identity resolves
+an explicit config scope before writing anything, and the confirmation
+dialog says exactly which scope it's about to use:
+
+- Worktree config on (`extensions.worktreeConfig`) → writes `git config
+  --worktree`, scoped to this worktree only.
+- Worktree config off/unknown → still writes `git config --local`, but the
+  dialog says plainly that this is shared across every worktree attached
+  to the repo, not narrower — `--local` is repository-level config no
+  matter how many worktrees exist.
+- Only one worktree → ordinary `--local`, unambiguous either way.
+
+Every confirmation also names the repository and its local path alongside
+the matched profile, so "this repo" is never ambiguous once more than one
+is open in the same workspace. Full per-worktree config management isn't
+built — this is deliberately just an honest, correctly-scoped mutation and
+warning before you confirm.
 
 **Shield Mode** (local Git hooks that would block unsafe commits/pushes) is
 not built yet. There is no toggle for it — a disabled "Coming soon" card in

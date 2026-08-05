@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { computeWorkspaceSafetyState } from "../core/workspaceAggregate";
+import { computeWorkspaceSafetyState, formatWorkspaceProblems, workspaceProblemCount } from "../core/workspaceAggregate";
 import { RepositorySafetyState, StatusSummary } from "../types";
 
 function repoState(id: string, level: StatusSummary["level"]): RepositorySafetyState {
@@ -46,4 +46,26 @@ test("a safe active repo must not make the workspace green while another repo is
 test("single safe repo -> workspace is safe (single-repo workspace behaves like before)", () => {
   const result = computeWorkspaceSafetyState([repoState("a", "safe")]);
   assert.equal(result.level, "safe");
+});
+
+test("workspaceProblemCount includes unresolved (not_checked) repos, not just not_safe ones", () => {
+  const result = computeWorkspaceSafetyState([repoState("a", "not_safe"), repoState("b", "not_checked")]);
+  // Regression check for the bug where a status bar built only from
+  // notSafeCount could show "Not Safe (0/2 repos)" when the only problem
+  // was an unresolved (not_checked) repo.
+  assert.equal(workspaceProblemCount(result), 2);
+});
+
+test("formatWorkspaceProblems reports unsafe and unresolved counts separately", () => {
+  const result = computeWorkspaceSafetyState([
+    repoState("a", "not_safe"),
+    repoState("b", "not_checked"),
+    repoState("c", "safe"),
+  ]);
+  assert.equal(formatWorkspaceProblems(result), "1 unsafe · 1 unresolved");
+});
+
+test("formatWorkspaceProblems reports only unsafe when there are no unresolved repos", () => {
+  const result = computeWorkspaceSafetyState([repoState("a", "not_safe"), repoState("b", "safe")]);
+  assert.equal(formatWorkspaceProblems(result), "1 unsafe");
 });

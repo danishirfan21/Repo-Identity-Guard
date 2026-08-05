@@ -33,3 +33,21 @@ export function computeWorkspaceSafetyState(repos: RepositorySafetyState[]): Wor
 
   return { level, repos, safeCount, notSafeCount, uncheckedCount };
 }
+
+/**
+ * How many repos need attention — blocking (`not_safe`) *and* unresolved
+ * (`not_checked`, e.g. a failed inspection) both count. Using only
+ * `notSafeCount` here would let the status bar show "Not Safe (0/2 repos)"
+ * when the only problem is an unresolved repo.
+ */
+export function workspaceProblemCount(workspace: WorkspaceSafetyState): number {
+  return workspace.notSafeCount + workspace.uncheckedCount;
+}
+
+/** A short "N unsafe · M unresolved" fragment for compact UI (status bar text/tooltip). */
+export function formatWorkspaceProblems(workspace: WorkspaceSafetyState): string {
+  const parts: string[] = [];
+  if (workspace.notSafeCount > 0) parts.push(`${workspace.notSafeCount} unsafe`);
+  if (workspace.uncheckedCount > 0) parts.push(`${workspace.uncheckedCount} unresolved`);
+  return parts.length > 0 ? parts.join(" · ") : "0 issues";
+}

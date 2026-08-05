@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { formatWorkspaceProblems } from "./core/workspaceAggregate";
 import { WorkspaceSafetyState } from "./types";
 
 export class IdentityStatusBar implements vscode.Disposable {
@@ -29,7 +30,7 @@ export class IdentityStatusBar implements vscode.Disposable {
         : `$(shield) Safe${profileSuffix}`;
     } else {
       this.item.text = multiRoot
-        ? `$(warning) Not Safe (${workspace.notSafeCount}/${workspace.repos.length} repos)`
+        ? `$(warning) Not Safe (${formatWorkspaceProblems(workspace)})`
         : "$(warning) Not Safe";
       this.item.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
     }
