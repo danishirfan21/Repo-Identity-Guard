@@ -1,232 +1,364 @@
-# Repo ID
+# Repo Identity Guard
 
-Never commit with the wrong Git author identity.
+**"Am I safe to work, commit, push, and let an AI agent run commands in this
+repo right now?"**
 
-Repo ID is a VS Code / Google Antigravity extension that helps you avoid
-committing to a repository with the wrong Git author identity.
+Repo Identity Guard is a local-first VS Code sidebar for AI-assisted
+developers ("vibe coders") using tools like Claude Code, Codex, Cursor,
+Copilot, or Antigravity. It hides Git identity, SSH, and push-setup
+complexity behind one plain-English answer:
 
-It checks the repository remote, evaluates the Git identity that would actually
-be used for a commit, and gives you a clear Safe / Wrong / Local Needed /
-Unknown signal in the status bar and Activity Bar sidebar.
+- 🟢 **SAFE**
+- 🔴 **NOT SAFE**
+- ⚪ **NOT CHECKED** — only shown when the folder isn't a Git repo yet
 
-> Product philosophy: global Git identity is a fallback. Local Git identity is
-> safety.
+If anything important is ambiguous, missing, or unverified, Repo Identity
+Guard calls it **NOT SAFE** rather than guessing.
 
-## Why this matters
+This is not a Git GUI, a terminal replacement, a compliance dashboard, a
+GitHub account manager, a credential manager, or a cloud product. Everything
+it knows lives on your machine.
 
-Developers often use one machine for personal, company, and client work. Git
-does not automatically know which identity belongs to each repository.
+## What it checks
 
-It is easy to be in the correct GitHub account, open the correct repository,
-and still create commits authored with the wrong `user.name` or `user.email`.
+Every scan evaluates six **capabilities**. Each one always produces exactly
+one result — never zero, never more than one — so Review Details is always
+a complete checklist, not just a list of problems:
 
-The important distinction:
+| Capability | Question it answers |
+| --- | --- |
+| **Commit Identity** | Who will appear as the author *and* committer of commits? |
+| **Push Destination** | Where would a plain `git push` actually go? |
+| **Push Account** | Can the account that authenticates the push be trusted? |
+| **Branch Policy** | Is the current branch safe for this repo? |
+| **Repo State** | Is there an unfinished merge/rebase/conflict, or just ordinary uncommitted changes? |
+| **Workspace Trust** | Is this VS Code workspace trusted to run commands in? |
 
-- Switching GitHub CLI accounts does not necessarily change Git commit author
-  identity.
-- Switching SSH keys does not necessarily change Git commit author identity.
-- Changing IDE account/session does not necessarily change Git commit author
-  identity.
+Repo Memory and Shield Mode are shown too, but as separate **info notes** —
+they're context data and feature-availability metadata, not safety
+verdicts, so they never affect the SAFE/NOT SAFE result.
 
-Repo ID focuses on the commit author identity Git will use locally.
+Each capability result carries one of five states — **Confirmed**,
+**Contradicted**, **Unverified**, **Warning**, or **Not applicable** — plus
+a separate `blocksOverallSafety` flag. The two are intentionally not the
+same thing: an unverified push account only blocks SAFE when its profile
+requires strict push setup, while a contradicted result (like being on a
+protected branch) always blocks. Review Details shows the full state per
+capability; Main only ever shows the binary SAFE/NOT SAFE headline built
+from whichever results actually block.
+
+Commit identity is read from Git's *effective* author/committer identity
+(`git var GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT`), which reflects any
+environment-variable overrides — not just `git config user.name/email`.
+Author and committer are checked and reported separately, since they can
+diverge (e.g. mid-rebase). This still reflects the environment checked at
+scan time; an explicit command-line override can always change what
+actually gets used for a given commit.
+
+If the *configured* identity (worktree/local/global config) already
+matches the profile but the effective identity doesn't, that can only mean
+an environment variable (`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL`, etc.) or
+a command-line override is winning — Repo Identity Guard reports this as
+its own **"Commit identity overridden by the environment"** result, with
+no config-writing action offered, since writing config again wouldn't fix
+it. **Fix Commit Identity** itself checks its own outcome: it writes
+config, rescans, and only reports success once the commit-identity
+capability is actually confirmed — if the environment is still overriding
+it afterward, it says so instead of claiming a fix that didn't take.
+
+**What "effective identity" does and doesn't cover:** `git var
+GIT_AUTHOR_IDENT`/`GIT_COMMITTER_IDENT` runs in the VS Code extension
+host's own process, so this reflects that process's environment at the
+moment of the scan — nothing more. It is not a guarantee about every
+process that might create a commit in this repo. A separate integrated
+terminal tab, an external AI agent process, a shell profile sourced only
+in interactive shells, or a future `git commit --author=...`/`-c
+user.email=...` can each carry a different environment or an explicit
+override that this scan never saw and couldn't have. Treat a Confirmed
+result as "this is what the extension host would use right now," not as
+a promise about every other place a commit could originate from.
+
+Repo Identity Guard matches the open repo against **Profiles** you define
+(Work, Personal, one per freelance client, one per employer — as many as
+you need) in Settings, in this order:
+
+1. **Exact-repository override** (`Profile.exactRepos`, canonicalized as
+   `host/owner/repo`, e.g. `github.com/AcmeSoftware/secret-project`) —
+   always wins outright when present. This is how you pin one specific
+   repo to a profile regardless of its owner, e.g. to resolve a
+   fork/upstream conflict (see below).
+2. **Owner/org pattern** (`Profile.expectedRemoteOwners`) matched against
+   the repo's `origin` remote.
+3. **Unresolved** — treated as **NOT SAFE**, "Repo profile is unknown,"
+   with a one-click **Add Profile for This Repo**.
+
+If a repo's owner matches *more than one* profile at the same tier (e.g.
+two clients' owner patterns overlap, or two profiles claim the same exact
+repo), that's also **NOT SAFE** — "Multiple profiles match this repo" —
+rather than silently picking one. Saving a profile whose owners or exact
+repos overlap with an existing one warns you immediately, before it ever
+shows up as an unsafe repo.
+
+**Fork/upstream conflicts:** if the repo has an `upstream` remote (the
+conventional name for the repo a fork was created from) and its owner
+unambiguously implies a *different* profile than `origin`'s owner does —
+e.g. your personal fork of a company repo — that's reported as **NOT
+SAFE**, "Origin and upstream imply different profiles," rather than
+silently trusting `origin`. `upstream` is only ever used as evidence for
+this conflict check; it never wins a match by itself. **Assign This Repo**
+resolves it by writing an exact-repository override to your chosen
+profile.
+
+## Multi-root workspaces
+
+When a workspace has more than one Git repository open as separate folders
+(or a repo plus a linked worktree), Repo Identity Guard evaluates each one
+independently and rolls the results up conservatively, not with a plain OR:
+
+- **SAFE** only when every detected repository has been checked and is SAFE.
+- **NOT SAFE** when any repository is blocking, unresolved, or couldn't be
+  checked reliably. A safe active repo never makes the workspace read green
+  while another repo in the workspace is unresolved.
+- **NOT CHECKED** only when no repositories have been evaluated, or none
+  were detected.
+
+Workspace folders that resolve to the same repo root are deduplicated;
+linked worktrees always get their own entry, since branch and working-tree
+state can differ between worktrees. A folder that isn't a Git repo is
+excluded from the count entirely.
+
+Capability results stay strictly scoped to the repository that produced
+them — nothing here synthesizes a workspace-wide `CapabilityResult` by
+mixing checks from different repos. The Main view shows an aggregate badge
+and repo counts, followed by a repository list; each row selects that repo
+for Review Details and for every mutating or executing action (Fix Commit
+Identity, saved commands, Repo Memory) — there's always exactly one
+selected repository, so no action ever runs against an ambiguous mix.
+Single-repo workspaces look exactly as before; this extra UI only appears
+once there's more than one repo to show.
+
+**Copy Workspace Safety Summary** is a separate action from Copy Context
+for AI: a compact per-repo SAFE/NOT SAFE line with blocking reasons and
+restrictions for every repo in the workspace, not a combined dump of every
+repo's full checklist or Repo Memory notes. Copy Context for AI still
+describes only the currently selected repo, in full detail.
+
+Every in-scope repo is watched for Git state changes (HEAD, config, index,
+merge/conflict markers, rebase-in-progress), not only the currently
+selected one — so a repo you're not looking at can't go unsafe without the
+aggregate noticing. The status bar's own click action reflects the same
+aggregate a multi-root badge shows; it never reports "safe" based on only
+the selected repo while the badge itself reads Not Safe.
+
+## Views
+
+- **Main** — compact status, matched profile, issue count, next fix, one
+  pinned memory note, and quick actions. In a multi-root workspace, also
+  shows the aggregate workspace badge and a repository list (see above).
+- **Review Details** — the full six-capability checklist in plain English
+  (why it matters, what we expected, what we found, and any agent
+  restrictions that follow from it), with raw Git facts tucked behind an
+  expandable "Technical Details" section.
+- **Repo Memory** — pinned notes, general notes, and saved commands (label +
+  command + Run/Copy), stored locally and privately.
+- **Settings** — profiles, branch rules, and safety preferences.
+
+## Safe by design
+
+Repo Identity Guard only ever runs read-only Git commands to inspect a repo,
+with one exception: the **Fix Commit Identity** action, which is limited to
 
 ```text
-Repo ID checks:
-  Git commit author
-  user.name / user.email
-  checked
-
-Repo ID does not check:
-  Repository access
-  GitHub CLI / SSH / credentials
-  not checked
+git config --local user.name "<name>"
+git config --local user.email "<email>"
+git config --local --unset user.name
+git config --local --unset user.email
 ```
 
-## What Repo ID shows
+It never modifies global Git config, remotes, SSH config, credential
+managers, or keychains, and it never runs `push`, `push --force`,
+`reset --hard`, `clean -fd`, `rebase`, or `merge`. Saved commands in Repo
+Memory always run in a visible integrated terminal — never silently, and
+never at all when the workspace isn't [trusted](#workspace-trust).
 
-Repo ID displays three Git identity layers:
+Fix Commit Identity resolves an explicit config scope before writing
+anything, based only on whether `extensions.worktreeConfig` is on — not on
+how many worktrees currently exist:
 
-- **Effective identity**: what Git will use if you commit in this repo now.
-- **Repo-specific local identity**: `user.name` and `user.email` stored in this
-  repo's `.git/config`.
-- **Global fallback identity**: user-level Git config used when the repo has no
-  local identity.
+- Worktree config on → writes `git config --worktree`, even if this repo
+  only has one worktree right now. That's necessary, not overcautious:
+  when worktree config is enabled, Git reads `config.worktree` *after*
+  the shared repo config and lets it override, so a stale value there
+  would keep winning over a `--local` fix even with a single worktree.
+- Worktree config off/unknown → writes `git config --local`. If more than
+  one worktree is attached (checked via `git worktree list --porcelain`,
+  not just whether the *current* one is linked — a main worktree can have
+  others attached to it too), the confirmation dialog says plainly that
+  this is shared across every worktree, not narrower.
 
-For v0.1, Repo ID never edits global Git config. It only writes repo-local Git
-identity when you explicitly choose to set or fix it.
+The confirmation dialog always states which scope is about to be
+written, and also names the repository and its local path alongside the
+matched profile, so "this repo" is never ambiguous once more than one is
+open in the same workspace. The strict "require identity to be locked
+locally" preference (below) checks both scopes too, so it won't keep
+reporting "not locked" after a worktree-scoped fix. Full per-worktree
+config management isn't built — this is deliberately just an honest,
+correctly-scoped mutation and warning before you confirm.
 
-## States
+**Shield Mode** (local Git hooks that would block unsafe commits/pushes) is
+not built yet. There is no toggle for it — a disabled "Coming soon" card in
+Settings makes that explicit, rather than showing a switch that looks live
+but does nothing (see Limitations).
 
-- **Safe**: Git commits will use the expected author identity for this repo.
-  This does not verify repository access, pull, push, or authentication.
-- **Wrong Identity**: Git would commit with a name or email that does not match
-  the repo's rule.
-- **Local Needed**: the effective identity currently matches, but strict local
-  mode requires this repo to pin the expected identity locally.
-- **Unknown**: no matching rule was found, no origin remote exists, or the repo
-  cannot be evaluated yet.
-- **Not a Git Repo**: the current folder is not inside a Git repository.
-- **Error**: Repo ID could not complete the scan.
+## Push setup: destination vs. account
 
-## Sidebar and modal
+Push safety is really two separate questions, and Repo Identity Guard
+answers them separately instead of collapsing them into one claim:
 
-Repo ID adds a compact Activity Bar panel named **Repo ID**. The sidebar shows:
+- **Push destination** — where would a plain `git push` actually go? This
+  follows Git's own resolution order (`branch.<name>.pushRemote` →
+  `remote.pushDefault` → `branch.<name>.remote` → `origin`), not just
+  `origin`'s fetch URL. If it resolves to an owner that doesn't match the
+  matched profile (e.g. a branch's push remote points at an upstream fork),
+  that's **NOT SAFE** — "Push destination does not match `<Profile>`". If it
+  can't be resolved at all, that's **NOT SAFE** too — "Push destination is
+  not verified" — regardless of any profile's strictness setting, because
+  an unresolved destination isn't a judgment call.
+- **Push account** — once the destination is confirmed, can we tell which
+  account will actually authenticate? HTTPS (credential manager) and a
+  generic SSH host (`github.com` with no dedicated alias) can't be
+  confirmed locally, so they're reported as "Push account is unverified."
+  Whether that's **NOT SAFE** or just a warning depends on the profile's
+  **Strict push setup** setting. This is never phrased as verifying the
+  account — only ever "trusted from your profile configuration."
 
-- current safety state;
-- effective, local, and global identities;
-- repository remote/path;
-- matched rule;
-- actions for setting identity, adding rules, copying diagnostics, rescanning,
-  opening settings, and viewing details.
+## Copy Context for AI
 
-When you choose **Set Local Identity** or **Fix Local Git Identity**, Repo ID
-opens an in-sidebar confirmation modal. You can:
+One click copies a summary for pasting into an AI agent's context, built
+from the *same* capability results Review Details shows — not a separate,
+independently-maintained rule list, so the two can't silently drift apart.
+Each capability's state is translated into an operational section:
 
-- set the matched rule identity exactly;
-- edit name/email before saving a custom repo-local identity;
-- reset the edit form back to the matched rule identity;
-- cancel without changing anything.
+- **Contradictions** — capability results with positive evidence of a
+  problem (wrong identity, wrong push destination, protected branch, etc.)
+- **Unverified facts** — things that couldn't be checked (unknown profile,
+  unresolved push destination, unverified push account)
+- **Warnings** — non-blocking findings (uncommitted changes, identity only
+  safe via global config)
+- **Confirmed facts** — what passed
+- **Rules for AI** — a fixed baseline (no `git push`, no changing Git
+  identity/remotes/SSH/credentials) plus restrictions *derived* from this
+  scan's specific findings (e.g. an in-progress rebase adds "don't switch
+  branches" and "don't commit"; a protected branch adds "ask before
+  committing here"), deduplicated when multiple findings imply the same
+  restriction
 
-All identity writes use:
+`Not applicable` results are omitted entirely. Every finding that blocks
+overall safety is guaranteed to show up here — as an issue or as a derived
+restriction — checked by an automated test, not just by convention.
 
-```text
-git config --local user.name ...
-git config --local user.email ...
-```
+It never includes secrets, tokens, `.env` values, SSH key contents, or raw
+Git config — the fields copied are an explicit allowlist, not a best-effort
+filter. The exact text is always opened in a preview tab so you can check
+it before pasting anywhere, in addition to being copied to the clipboard.
+Your pinned Repo Memory note is **not** included by default — it's free
+text you wrote for yourself and may contain sensitive info. Turn on
+"Include pinned memory note in Copy Context for AI" in Settings if you want
+it included.
 
-## Rules
+## Workspace Trust
 
-Rules match normalized `origin` remotes. The first matching rule wins.
+Read-only scanning still runs in an untrusted workspace — you'll see an
+honest NOT SAFE with "Workspace is not trusted" rather than nothing at all.
+But **Fix Commit Identity** and running a saved command are both blocked
+until the workspace is trusted, since both execute something in that
+folder.
 
-Example Settings JSON:
+## Settings
+
+Configure profiles, protected branches, and preferences either from the
+Settings view in the sidebar, or directly in `settings.json`:
 
 ```json
 {
-  "repoIdentityGuard.rules": [
+  "repoIdentityGuard.profiles": [
     {
-      "match": "github.com/AcmeSoftware/*",
+      "id": "work",
       "label": "Work",
-      "name": "Danish Irfan",
-      "email": "work@example.com"
+      "gitName": "Jane Doe",
+      "gitEmail": "jane@acme.com",
+      "expectedRemoteOwners": ["AcmeSoftware"],
+      "exactRepos": ["github.com/some-other-org/one-specific-repo"],
+      "expectedBranchPatterns": ["feature/*", "fix/*"],
+      "strictPushSetup": true
     },
     {
-      "match": "github.com/Danish-Irfan/*",
+      "id": "personal",
       "label": "Personal",
-      "name": "Danish Irfan",
-      "email": "personal@example.com"
-    },
-    {
-      "match": "github-work/AcmeSoftware/*",
-      "label": "Work SSH",
-      "name": "Danish Irfan",
-      "email": "work@example.com"
+      "gitEmail": "jane@example.com",
+      "expectedRemoteOwners": ["jane-doe"]
     }
-  ]
+  ],
+  "repoIdentityGuard.protectedBranches": ["main", "master"],
+  "repoIdentityGuard.requireLocalIdentity": false,
+  "repoIdentityGuard.includeMemoryInAiContext": false
 }
 ```
 
-Repo ID supports `*` wildcards and normalizes common remote formats:
-
-- `https://github.com/org/repo.git` -> `github.com/org/repo`
-- `git@github.com:org/repo.git` -> `github.com/org/repo`
-- `git@github-work:org/repo.git` -> `github-work/org/repo`
-
-## Strict local identity mode
-
-By default, Repo ID evaluates the effective identity:
-
-```json
-{
-  "repoIdentityGuard.requireLocalIdentity": false
-}
-```
-
-That means a repo can be considered Safe because Git falls back to your global
-identity.
-
-If you want matched repositories to pin their own local identity, enable:
-
-```json
-{
-  "repoIdentityGuard.requireLocalIdentity": true
-}
-```
-
-With strict local identity enabled, Repo ID shows **Local Needed** when:
-
-1. the effective identity matches the rule, but
-2. repo-local `user.name` or `user.email` is missing or different.
-
-This is intentionally softer than **Wrong Identity**. The repo is safe right
-now, but it could become unsafe later if global Git config changes.
+`expectedRemoteOwners`, `exactRepos`, and `expectedBranchPatterns` all
+support `*` wildcards and are matched case-insensitively. `exactRepos`
+always takes precedence over `expectedRemoteOwners` for the same repo.
+`protectedBranches` is a **local** branch policy Repo Identity Guard
+enforces on this machine — it is not synced with, and does not check,
+GitHub's own branch protection settings.
 
 ## Commands
 
-- **Repo ID: Rescan**
-- **Repo ID: Show Status**
-- **Repo ID: Fix Local Git Identity**
-- **Repo ID: Add Rule for Current Repo**
-- **Repo ID: Copy Diagnostic Report**
-- **Repo ID: Open Settings**
-
-## Screenshots
-
-Screenshots are not included yet for v0.1 packaging. Suggested screenshots:
-
-- status sidebar showing Local Needed;
-- Set Local Identity confirmation modal;
-- Edit Local Identity modal;
-- Wrong Identity state with action buttons.
+- **Repo Identity Guard: Rescan**
+- **Repo Identity Guard: Show Status**
+- **Repo Identity Guard: Fix Commit Identity**
+- **Repo Identity Guard: Add Profile for Current Repo**
+- **Repo Identity Guard: Copy Context for AI**
+- **Repo Identity Guard: Copy Workspace Safety Summary**
+- **Repo Identity Guard: Open Settings**
 
 ## Run locally
 
-```powershell
-npm install
-npm run compile
-```
-
-Then open this folder in VS Code or Antigravity and press `F5` to launch the
-Extension Development Host.
+1. Run `npm install`.
+2. Run `npm run compile`.
+3. Open this project in VS Code or Antigravity.
+4. Press `F5` to launch the Extension Development Host.
+5. In that window, open a Git repository and open the **Repo Identity
+   Guard** icon in the Activity Bar.
 
 See [TESTING.md](TESTING.md) for the manual scenario matrix.
 
-## Package locally
+## Limitations in this build
 
-```powershell
-npx @vscode/vsce package
-```
-
-The packaged VSIX includes the compiled webview CSS at `media/sidebar.css`.
-
-## Limitations in v0.1
-
-Repo ID only checks Git commit author identity.
-
-It does not switch or manage:
-
-- switch GitHub CLI accounts;
-- GitHub HTTPS credentials or tokens;
-- SSH keys;
-- Git Credential Manager entries;
-- repository permissions;
-- pull/push authentication;
-- install Git hooks;
-- change remotes;
-- rewrite commits;
-- authenticate users;
-- edit global Git identity;
-- provide a large dashboard.
-
-If `git pull` or `git push` fails with "Repository not found", your commit
-author identity may be correct, but your GitHub authentication may be using the
-wrong account or credentials.
-
-Authentication systems outside Repo ID v0.1 scope include:
-
-- GitHub CLI;
-- SSH keys;
-- HTTPS credentials;
-- Git Credential Manager.
-
-Repo ID intentionally does not run account switching or credential commands in
-v0.1.
+- **Shield Mode is not built.** No Git hooks are installed, and there is no
+  toggle that could be mistaken for one — just a disabled "Coming soon"
+  card. That's intentionally left as clean, opt-in-only architecture for a
+  later pass.
+- **Fork detection is naming-convention-based, not verified.** The
+  fork/upstream conflict check only looks for a remote literally named
+  `upstream` — there's no reliable way to detect a fork relationship from
+  Git alone. A fork set up with a differently-named remote won't trigger
+  the conflict check.
+- **Multi-root repo discovery starts with workspace folders.** Repos are
+  found from `vscode.workspace.workspaceFolders` — Repo Identity Guard
+  doesn't recursively crawl nested directories looking for `.git` folders
+  that aren't themselves workspace folders (e.g. repos several levels deep
+  inside one open folder, never added as their own workspace folder).
+- **No cryptographic account verification.** "Push account is unverified"
+  never upgrades to "verified" — Repo Identity Guard doesn't make network
+  calls (e.g. an SSH test connection) to confirm which account a key or
+  credential belongs to. SSH host aliases are trusted from your own profile
+  configuration, not cryptographically checked.
+- **Worktree config isn't fully modeled.** Fixing identity on a linked
+  worktree shows a warning about scope (this worktree vs. every worktree)
+  based on `extensions.worktreeConfig`, but doesn't manage per-worktree
+  config for you.
+- It does not switch GitHub CLI accounts, switch SSH keys, manage HTTPS
+  credentials, or touch OS keychains/credential managers.
+- It never runs `push`, `reset --hard`, `clean`, `rebase`, `merge`, or edits
+  remotes/SSH config — those stay in your own terminal.
