@@ -459,3 +459,105 @@ test("a profile without expectedGitHubLogin never runs account verification (rou
     await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
   }
 });
+
+// ====================================================================
+// Phase 8 — the SSH route must be verified, not just its ALIAS NAME.
+//
+// Confirmed defect: verification checked only (a) the alias is listed in
+// trustedSshHostAliases, (b) `IdentitiesOnly yes` appears anywhere in
+// `ssh -G` output, and (c) the `ssh -T` reply is GitHub-shaped. None of
+// those establishes that the alias actually goes to GitHub. An alias is a
+// label in the user's own ~/.ssh/config: `Host github-work` can carry
+// `HostName anything-at-all`, and whatever answers there is free to reply
+// with GitHub's exact greeting. Shield would then report the GitHub
+// account VERIFIED on the word of a host it never identified.
+//
+// Verification now resolves the effective route with `ssh -G` first and
+// refuses to read a non-GitHub endpoint's self-report as a GitHub
+// account. `ssh -G` is local-only: it reads the effective client
+// configuration, makes no connection, reads no key material, and writes
+// nothing.
+// ====================================================================
+
+test("a trusted alias whose EFFECTIVE HostName is not GitHub cannot be verified, even when it returns a perfect GitHub greeting", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
+  const scenario = await setUpScenario();
+  try {
+    const result = await pushWithFakeSsh(scenario, {
+      // The alias is trusted, IdentitiesOnly is set, and the greeting
+      // names exactly the expected login -- every pre-Phase-8 condition
+      // for "verified" is satisfied. The only thing wrong is where the
+      // alias actually points, which is precisely the point.
+      FAKE_SSH_HOSTNAME: "definitely-not-github.example",
+      FAKE_SSH_AUTH_OUTPUT: "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.\n",
+    });
+    assert.notEqual(result.code, 0, "a route that does not reach GitHub must never count as a verified GitHub account");
+    assert.equal(await remoteRefSha(scenario.bare), null);
+    assert.match(result.stderr, /push-account-unverified/);
+    assert.match(result.stderr, /not a GitHub SSH endpoint/);
+    assert.match(result.stderr, /definitely-not-github\.example/);
+  } finally {
+    await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
+  }
+});
+
+test("a look-alike hostname (github.com.evil.example) is not a GitHub endpoint", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
+  const scenario = await setUpScenario();
+  try {
+    const result = await pushWithFakeSsh(scenario, {
+      FAKE_SSH_HOSTNAME: "github.com.evil.example",
+      FAKE_SSH_AUTH_OUTPUT: "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.\n",
+    });
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /not a GitHub SSH endpoint/);
+  } finally {
+    await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
+  }
+});
+
+test("GitHub's documented alternative endpoint (ssh.github.com on port 443) IS accepted", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
+  const scenario = await setUpScenario();
+  try {
+    const result = await pushWithFakeSsh(scenario, {
+      FAKE_SSH_HOSTNAME: "ssh.github.com",
+      FAKE_SSH_PORT: "443",
+      FAKE_SSH_AUTH_OUTPUT: "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.\n",
+    });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(await remoteRefSha(scenario.bare), await git(scenario.repo, ["rev-parse", "HEAD"]));
+  } finally {
+    await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
+  }
+});
+
+test("an `ssh -G` that reports no hostname at all -> unverified, never assumed fine", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
+  const scenario = await setUpScenario();
+  try {
+    const result = await pushWithFakeSsh(scenario, {
+      FAKE_SSH_G_FAIL: "1",
+      FAKE_SSH_AUTH_OUTPUT: "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.\n",
+    });
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /could not resolve this SSH route's effective destination/);
+  } finally {
+    await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
+  }
+});
+
+test("the effective route is resolved BEFORE the network probe: a non-GitHub route never reaches ssh -T at all", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
+  const scenario = await setUpScenario();
+  const probeLog = path.join(scenario.repo.dir, "probe.log");
+  try {
+    const result = await pushWithFakeSsh(scenario, {
+      FAKE_SSH_HOSTNAME: "definitely-not-github.example",
+      FAKE_SSH_PROBE_LOG: probeLog,
+      FAKE_SSH_AUTH_OUTPUT: "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.\n",
+    });
+    assert.notEqual(result.code, 0);
+    // No `ssh -T` was ever run: Shield does not open a connection to a
+    // host it has already established cannot answer the question.
+    const probed = await fs.readFile(probeLog, "utf8").catch(() => "");
+    assert.equal(probed, "", `no ssh -T probe should have been attempted, got: ${probed}`);
+  } finally {
+    await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
+  }
+});

@@ -728,16 +728,25 @@ This has two consequences worth calling out:
   hook, the next `inspect()` sees exactly that — policy present, hook
   absent — and reports `degraded`. There is no cached "I finished
   installing" flag that could go stale relative to reality.
-- **A later `core.hooksPath` redirect is caught for free.** If something
-  changes `core.hooksPath` (repo- or worktree-scoped) after Shield
-  installed, `inspect()` resolves `hooksDir` fresh via Git every time —
-  it will simply stop finding Shield's owned hook at the new location and
-  report `degraded`, with no need to remember "where did Shield install
-  to last time." The old hook file left behind at the previous location
-  is inert (nothing invokes it) and cleaned up the next time `disable()`
-  runs from a context that still resolves there, or ignored otherwise —
-  a known, acceptable trade-off given `core.hooksPath` itself is an
-  already-documented full bypass (see the threat boundary table above).
+- **A later `core.hooksPath` redirect is detected.** If something changes
+  `core.hooksPath` (repo- or worktree-scoped) after Shield installed,
+  `inspect()` resolves `hooksDir` fresh via Git every time, stops finding
+  Shield's owned hook at the new location, and reports `degraded`.
+
+  What this section previously claimed — that the hook left behind at the
+  *previous* location is "inert ... a known, acceptable trade-off" — was
+  wrong, and Phase 8 reproduced why. Enable at hooks directory A, point
+  `core.hooksPath` at B, run Disable Shield: `disable()` looked only at B,
+  found nothing of its own, and deleted the policy and evaluator. Shield's
+  hooks stayed in A indefinitely, and pointing `core.hooksPath` back at A
+  made them live again. Harmless while hooks failed open; with fail-closed
+  hooks it would mean every commit and push blocked, permanently, with no
+  Shield installed to repair or disable.
+
+  So Shield now keeps a minimal **durable installation record**
+  (`src/shield/installRecord.ts`) — see "Phase 8: installation metadata"
+  below. `inspect()` still re-derives state from disk; the record only
+  says *where else to look*.
 
 ### Existing-hook safety
 
@@ -773,15 +782,12 @@ Found: author Danish Irfan <personal@example.com>
 Fix the repository identity or disable Shield for this repository.
 ```
 
-If the evaluator copy is missing (a half-removed install), the hook
-fails **open** (`exit 0`) rather than blocking an ordinary commit because
-of Shield's own incomplete state — the same "never manufacture false
-confidence, but also never manufacture a false block" posture as the
-evaluator's own fail-closed behavior applies at a different layer (the
-evaluator fails *closed* on a broken/missing *policy* once it's actually
-running; the hook fails *open* on a missing *evaluator*, since at that
-point there's no Shield installation left to trust either way, and the
-existing behavior — no Shield hook at all — is the honest fallback).
+If the evaluator copy is missing or unreadable, or the repository's
+git-common-dir cannot be resolved, the hook **fails closed** — see
+"Phase 8: fail-closed enforcement" below. (Up to artifact v4 it failed
+*open*, `exit 0`, on exactly these conditions; that was the bug, not the
+design: deleting one file with Shield reported ACTIVE silently disabled
+enforcement entirely.)
 
 Because the evaluator copy and the policy both live under the shared
 git-common-dir (Phase 1's storage decision) and the hook itself is
@@ -881,9 +887,8 @@ Reason: Push destination changed since Shield approval (this push would go to ac
 Fix the push destination/route or disable Shield for this repository.
 ```
 
-Like the pre-commit hook, it fails **open** (`exit 0`) if the evaluator
-copy is missing — a half-removed Shield install must never be the reason
-an ordinary push is blocked.
+Like the pre-commit hook, it **fails closed** if the evaluator copy is
+missing or unreadable — see "Phase 8: fail-closed enforcement" below.
 
 ### Push destination now fails closed (changed from Phase 2)
 
@@ -1267,12 +1272,11 @@ supported Git version alike. This finding is why nothing in this phase is
 gated behind a Git version check: there was no newer feature found that
 would justify one.
 
-Shield's minimum supported Git version is **2.9** (when `core.hooksPath`
-— which `getHooksDir`'s `git rev-parse --git-path hooks` fundamentally
-depends on for correct worktree/hooksPath resolution — was introduced).
-Every other Git invocation Shield makes (`rev-parse`, `config`, `var`,
-`symbolic-ref`, `status --porcelain=v2`, `worktree list`) predates that by
-a wide margin. Nothing in Phase 6 raises this floor.
+> **Superseded in Phase 8.** This section previously claimed Shield's
+> minimum supported Git version was **2.9** (when `core.hooksPath` was
+> introduced). That was wrong on two independent counts — see
+> "Phase 8: Shield's real minimum Git version" below. The floor is
+> **2.31.0**.
 
 ### Hook coexistence: chaining is explicit opt-in, never automatic
 
@@ -1673,7 +1677,7 @@ wrong `user.name` alone, wrong author-only/committer-only (env-based),
 `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` alone, `git -c user.name=...`,
 `--amend`, a real non-fast-forward merge, both cherry-pick outcomes,
 hand-corrupted policy blocking a real commit (not just the standalone
-script test), a deleted evaluator failing open, a hand-tampered hook
+script test), a deleted evaluator (which as of Phase 8 fails CLOSED), a hand-tampered hook
 actually running its tamper (and still being caught by `inspect()`),
 `branch.pushRemote`, `remote.pushDefault`, `remote.pushurl`, force push,
 ref deletion, and a missing policy at push time producing a concise
@@ -1752,3 +1756,421 @@ one case that was previously indistinguishable from a policy decision.
 - A real (non-mocked) live-network latency measurement against GitHub,
   for a human to run manually per `TESTING.md`'s new Windows/macOS/Linux
   Shield matrix — never automated, to keep CI network-free.
+
+---
+
+## Phase 8 — core correctness hardening
+
+Everything in this section was **reproduced before it was fixed**. Each
+subsection names the defect, how it was demonstrated, and what the rule is
+now. Nothing here changes Shield's UI, and nothing here weakens a Shield
+semantic to make a test pass — several tests that asserted the *old*
+behavior were replaced, and each such reversal is called out.
+
+### Phase 8: fail-closed enforcement
+
+**Defect.** Both generated hook shims (v4) contained:
+
+```sh
+GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+...
+[ -f "$EVAL_SCRIPT" ] || exit 0
+```
+
+so a hook that could not locate the repository, or whose evaluator copy
+was missing, exited **0** — allowing the operation. Reproduced directly:
+enable Shield (reported `active`), set a mismatched `user.email`, confirm
+the commit is blocked, then `rm
+<gitCommonDir>/repo-identity-guard/shield-evaluate.sh` — the identical
+commit then succeeded silently, with no output at all. One `rm`, no
+privileges, complete bypass of the feature.
+
+**Rule now.** Three distinct situations, three distinct answers:
+
+| Situation | Answer |
+| --- | --- |
+| No Shield hook installed | Shield is off. Git behaves normally. Correct and unchanged. |
+| Hook installed, evaluator present, policy reached a verdict | The verdict. Unchanged. |
+| Hook installed, but git-common-dir unresolvable / evaluator missing / evaluator unreadable | **FAIL CLOSED.** Block, framed as `"... BLOCKED (Shield internal error: broken installation)"`, naming the exact path and offering Repair Shield / Disable Shield. Never framed as a policy verdict about the user's commit or push. |
+
+A broken enforcement mechanism that silently no-ops is strictly worse than
+one that was never installed, because it produces false confidence. This
+is the same posture the `broken` lifecycle state has committed to since
+Phase 0 (see "On fail-open vs. fail-closed for `broken`" above); the hook
+shims simply had not implemented it.
+
+**Why this cannot strand a user.** Fail-closed hooks are only safe if a
+*completed* disable is complete. Two guarantees make that true:
+
+1. **Ordering.** `disable()` removes/disarms every hook it can prove it
+   owns **before** deleting the evaluator, policy, and installation
+   record. If the process dies between those two phases, the state it dies
+   in is "some hooks gone, evaluator still present" — which over-enforces
+   slightly (safe) rather than blocking everything (unsafe). Never the
+   reverse.
+2. **Coverage.** `disable()` reaches the currently-resolved hooks
+   directory *and* every hooks directory in the installation record (next
+   section).
+
+`--no-verify` remains the documented escape hatch, as it has since Phase 0.
+
+### Phase 8: installation metadata (`core.hooksPath` drift, orphaned hooks)
+
+**Defect.** Shield kept no record of where it had installed hooks, by
+design ("no manifest file", above). Reproduced:
+
+1. Enable Shield with `core.hooksPath` unset → hooks land in
+   `<gitCommonDir>/hooks` (A).
+2. `git config core.hooksPath <B>`.
+3. Disable Shield → `disable()` inspects only B, finds nothing of its own,
+   deletes policy + evaluator, reports success.
+4. Shield's three hook shims are still in A. Unset `core.hooksPath` and
+   they are live again.
+
+Under v4's fail-open shims that was silent non-enforcement. Under v5's
+fail-closed shims it would be a permanent, unrepairable block.
+
+**Rule now.** A minimal durable record at
+`<gitCommonDir>/repo-identity-guard/installations.json`:
+
+```json
+{ "recordVersion": 1, "hookDirs": ["/abs/path/to/hooks"], "updatedAt": 1730000000000 }
+```
+
+Constraints, each deliberate:
+
+- **Under Git metadata, never the working tree.** Never tracked, never
+  committed, never pushed; identical from every worktree of the
+  repository, for the same reason the policy is (Phase 1's storage
+  decision).
+- **No secrets.** Absolute hook-directory paths and a timestamp. The
+  parser accepts nothing else.
+- **Written atomically** (same-directory temp file + rename), and written
+  *before* the hooks it describes — a record naming a directory Shield has
+  not finished installing into is harmless; a hook with no record pointing
+  at it is the orphan this exists to prevent.
+- **Never authoritative for enforcement.** Lifecycle state is still
+  re-derived entirely from disk. The record only supplies extra places to
+  look, and every path it yields is independently re-read and re-verified
+  as carrying Shield's ownership marker before Shield will touch it. A
+  hand-edited record pointing at `/etc` gets Shield to look there and do
+  nothing. Covered by a test.
+- **Best-effort.** Missing, unreadable, or malformed reads as "no record"
+  and never fails an operation.
+
+Behavior it buys: `inspect()` reports orphaned Shield hooks as `degraded`
+with their exact paths; `enable()`/`repair()` consolidate onto the current
+location by cleaning previous ones; `disable()` cleans every recorded
+location. Locations that could not be fully cleaned stay on the record so
+a later attempt tries again rather than forgetting them.
+
+Worktrees are correct by construction: the record lives under the shared
+git-common-dir and the hooks directory is shared, so enabling from one
+worktree and disabling from another is the same record and the same files
+(covered by a real `git worktree add` test).
+
+### Phase 8: approved push destination came from the wrong remote
+
+**Defect.** `RepoFacts` carefully separates origin/fetch (`remoteHost`,
+`remoteOwner`, `remoteRepo`) from the actual plain-push destination
+(`pushRemoteName`, `pushRemoteHost`, `pushRemoteOwner`, `pushRemoteRepo`,
+resolved through Git's own `branch.<name>.pushRemote` →
+`remote.pushDefault` → `branch.<name>.remote` → `origin` precedence, plus
+`remote get-url --push`). `ShieldManager.buildPolicyForRepo` then built
+`approvedPushDestination` from the **origin fetch** facts.
+
+Git offers four independent ways for the two to differ, and Shield
+approved the wrong place in every one:
+
+| Arrangement | What Shield approved (v4) | What a plain `git push` actually reaches |
+| --- | --- | --- |
+| `branch.<name>.pushRemote` | origin's owner/repo | the named remote's |
+| `remote.pushDefault` | origin's owner/repo | the default push remote's |
+| `remote.<name>.pushurl` | origin's *fetch* owner/repo | the push URL's |
+| `branch.<name>.remote` ≠ origin | origin's owner/repo | the tracked remote's |
+
+**Rule now.** `approvedPushDestination` is built **only** from the
+`pushRemote*` facts. `approvedRepositoryKey` deliberately stays
+origin-based — that is the repository's canonical *identity*, what profile
+matching and `exactRepos` compare against, and conflating identity with
+push destination is the mistake being fixed. There is no fallback to
+origin when the push destination is unresolvable: an absent approved
+destination already fails closed at push time, and substituting origin
+would reintroduce the bug.
+
+### Phase 8: one coherent push-destination rule (sidebar and Shield)
+
+**Defect.** `checkPushDestination` in the non-Shield status engine read:
+
+```ts
+matchesExactRepo || expectedOwners.length === 0 || ownerPatternMatches
+```
+
+The middle term is an unconditional `true` for any profile that lists
+`exactRepos` but no `expectedRemoteOwners` — so such a profile reported
+"destination confirmed" for **any** destination whatsoever, and also for
+one whose owner could not be parsed at all.
+
+**The rule, stated once and shared:**
+
+1. A profile that declares **no** destination constraint (neither
+   `exactRepos` nor `expectedRemoteOwners`) makes no claim about where
+   pushes may go. (In practice such a profile can never *become* the
+   matched profile — profile resolution matches by exactly those two
+   fields — so this branch exists for totality, not as a loophole.)
+2. Otherwise the destination must **positively** match an `exactRepos`
+   pattern (against its canonical `host/owner/repo` key) or an
+   `expectedRemoteOwners` pattern. Owner-level matching is kept on purpose
+   so a fork, a mirror, or a new repository under an already-trusted owner
+   still works.
+3. **Missing evidence is never a match.** An unparseable owner cannot
+   satisfy an owner pattern; an unparseable owner/repo cannot produce a
+   canonical key.
+
+**How this never contradicts Shield.** The sidebar answers *"is this
+destination within the profile's declared scope?"*. Shield's
+`push-destination-mismatch` answers the strictly narrower *"is this the
+exact owner/repo approved when Shield was last enabled or repaired?"*.
+Shield's approved destination is always one concrete owner/repo drawn from
+the push remote, so **anything Shield allows, the sidebar also allows**;
+the converse does not hold. When they diverge — the repository moved
+within a trusted owner — Shield reports `pushDestinationDrift` and asks
+for an explicit Repair rather than either side silently overruling the
+other.
+
+### Phase 8: no durable policy from stale UI facts
+
+**Defect.** Enable Shield and Repair Shield built the durable policy from
+`latestSummary.facts` — the module-level snapshot that a background
+watcher, a sidebar scan, or a workspace-folder switch overwrites. That
+snapshot is right for painting UI (refreshed constantly, harmless when
+stale). It is wrong for `approvedPushDestination`, `approvedRepositoryKey`,
+`expectedGitEmail`, and the matched profile, which are written to disk and
+then enforced by hooks with VS Code closed until someone explicitly
+repairs them. A stale fact there is a silently wrong enforcement rule with
+a long lifetime.
+
+**Rule now.** Both commands call `collectRepoFacts(repoRoot)` again,
+re-read profiles and protected branches from Settings, and re-resolve the
+push destination immediately before the write. The repo root from the
+summary is used only as a *starting directory*; the freshly collected
+facts' own `repoRoot` is what is acted on. A regression test builds a
+policy from a stale snapshot and from fresh facts against the same
+repository and proves the fresh facts win.
+
+### Phase 8: the health check performed no integrity checks
+
+**Defect.** `ShieldManager.inspect` supports three integrity checks —
+evaluator content drift, matched-profile drift, push-destination drift —
+and all three are opt-in via inputs the caller must supply. The
+`Check Shield Health` command called `healthCheck(repoRoot)` with **no
+options**, so all three were silently skipped. The checks existed and were
+tested at the manager level; nothing in the product ever turned them on. A
+Shield whose evaluator had been hand-edited (ownership and version markers
+left intact), whose profile had since changed `trustedSshHostAliases` /
+`expectedGitHubLogin` / `strictPushSetup` / Git identity, or whose push
+destination had moved, reported a confident "Shield is active."
+
+**Rule now.** The command gathers all three live: the bundled evaluator
+source path (byte-for-byte comparison), the current profile list from
+Settings, and the freshly resolved push destination. `inspect()` itself
+remains strictly read-only — it reports drift and never repairs it;
+turning `degraded` back into `active` stays an explicit Repair Shield.
+
+### Phase 8: foreign-hook chaining safety
+
+Three defects, all reproduced:
+
+| Foreign hook | v4 behavior | Consequence |
+| --- | --- | --- |
+| Binary/native executable | read as UTF-8, written back to the sidecar | `ff fe 80 81` came back as four U+FFFD (`ef bf bd`) — a "preserved" hook that no longer runs |
+| Symlink | followed, contents copied to a regular-file sidecar | the link was replaced by a snapshot; edits to the target stopped taking effect |
+| Non-executable regular file | chained anyway | Shield's shim `exec`'d it and every commit died with `exec: ...: Permission denied`, with nothing indicating where it came from |
+
+**Rule now** — option (B) of "preserve exactly, or refuse and explain",
+applied per file type:
+
+- **Executable regular file** → chained, preserved **byte-for-byte** with
+  its mode. All hook I/O, ownership detection, and content comparison in
+  `ShieldManager` are now byte-level (`Buffer`), never decoded text.
+- **Symlink, non-executable regular file, anything not a regular file** →
+  **refused**. Left completely untouched, Shield does not install its own
+  hook in that slot, and `inspect()` reports `degraded` with a reason that
+  names the specific file type and what to do about it.
+
+Shield never converts a file type, never decodes bytes it did not write,
+and never installs a chain it cannot run. The shim additionally refuses to
+execute a sidecar that is not an executable regular file *at run time*,
+so a sidecar that loses its permission bit afterwards produces an
+attributable Shield message rather than a bare shell error.
+
+The executable-bit rule is POSIX-only: Windows has no meaningful
+executable bit (`lstat().mode` reports 0o666/0o444 for everything) and Git
+for Windows runs any hook file it finds, so requiring one there would
+refuse to chain every foreign hook for no benefit.
+
+### Phase 8: no predictable pre-push temp file
+
+**Defect.** The pre-push shim captured Git's stdin ref lines to a temp
+file and, when `mktemp` failed, fell back to:
+
+```sh
+STDIN_CAPTURE="${TMPDIR:-/tmp}/repo-identity-guard-prepush-stdin.$$"
+: > "$STDIN_CAPTURE"
+```
+
+A guessable path in a shared, world-writable directory, unconditionally
+truncated and then written. Another local user who pre-creates or
+symlinks that path gets Shield to clobber a file of their choosing and can
+read the pushed ref lines.
+
+**Rule now.** Removed entirely. If no secure temp file can be created, the
+push fails closed as a Shield internal error explaining that Shield
+deliberately does not fall back to a predictable name. Nothing is created
+or truncated on that path. Tested by shadowing `mktemp` with one that
+always fails and asserting the temp directory is left empty.
+
+### Phase 8: Shield's real minimum Git version
+
+**Defect.** The docs claimed **2.9** (`core.hooksPath`). Two things Shield
+actually depends on are newer:
+
+| Feature | Introduced | Why Shield needs it |
+| --- | --- | --- |
+| `git rev-parse --path-format` | **2.31** | Both hook shims *and* the standalone evaluator locate the repository with `git rev-parse --path-format=absolute --git-common-dir`. Below 2.31 that invocation simply fails — under v4's shims that meant every hook silently exited 0 while Shield reported ACTIVE. |
+| `pre-merge-commit` hook | **2.24** | The only hook that fires for a real (non-fast-forward) merge commit; `git merge` does not run `pre-commit` for the commit it creates (confirmed empirically in Phase 7). |
+
+2.31 subsumes 2.24, so **Shield's floor is 2.31.0**.
+
+**Rule now.** *Shield is never reported ACTIVE on a Git that cannot run
+the hooks Shield claims to enforce.* Below the floor `inspect()` reports
+`degraded` with the specific missing coverage named, and
+`enable()`/`repair()` refuse and write nothing. A Git version that cannot
+be read or parsed is treated as unsupported, never as "probably fine".
+
+This is **Shield-specific**: it does not change the extension's VS Code
+engine requirement, and it does not affect the sidebar/status engine,
+which only uses long-established plumbing.
+
+### Phase 8: GitHub SSH verification checks the effective route
+
+**Defect.** Strict account verification checked three things: the alias is
+listed in `trustedSshHostAliases`, `IdentitiesOnly yes` appears in
+`ssh -G` output, and the `ssh -T` reply is GitHub-shaped. None of those
+establishes that the alias goes to GitHub. An alias is a label in the
+user's own `~/.ssh/config`: `Host github-work` may carry
+`HostName anything.example`, and whatever answers there is free to reply
+`Hi <expected-login>! You've successfully authenticated...`. All three
+conditions would hold and Shield would report the GitHub account
+**verified**. Separately, an explicit port in an `ssh://host:2222/...`
+remote was dropped entirely, so the probe could not even reach the same
+endpoint the push would.
+
+**Rule now.** Before any network probe, the effective route is resolved
+with `ssh -G` (local only: reads the effective client configuration, makes
+no connection, reads no key material, writes nothing) and:
+
+- the effective `HostName` must be a GitHub SSH endpoint — `github.com`,
+  `ssh.github.com` (GitHub's documented port-443 endpoint), or
+  `*.github.com`. Anything else, including a look-alike domain, an IP
+  literal, or a GitHub Enterprise Server host, is `push-account-unverified`
+  with the resolved `hostname:port` named in the message. Enterprise is
+  excluded on purpose: `expectedGitHubLogin` is a github.com username, and
+  comparing it against a different namespace would be a guess.
+- an `ssh -G` that reports no `hostname` at all is "route unresolvable",
+  never "probably fine".
+- the probe travels the alias itself (so every `Host`/`Match` block
+  applies identically) and carries `-p <port>` whenever the remote URL
+  named one, so `ssh -G` and `ssh -T` agree with each other and with the
+  push.
+
+A non-GitHub route is rejected **before** `ssh -T` runs, so Shield never
+opens a connection to a host it has already established cannot answer the
+question. Unchanged: no private key contents are read, no SSH config is
+written, `StrictHostKeyChecking` is not weakened.
+
+### Phase 8: missing evidence is not a match (push repository parsing)
+
+**Defect.** `destinationReasons()` in both implementations read the repo
+comparison as "match if either side is absent":
+
+```ts
+const repoMatches = !approved.repo || !repo || approved.repo === repo;
+```
+
+so a policy naming a specific repository was satisfied by a push URL that
+produced an owner but no repository name — it matched purely because the
+owner happened to parse.
+
+**Rule now**, identical in `src/shield/evaluator.ts` and
+`resources/shield/shield-evaluate.sh`: if the policy names a repository,
+the push URL must produce one and it must match; an unparseable owner
+never matches either. Absence in the **policy** (Shield never recorded a
+repository) still means owner-only matching — that is a property of what
+was approved, not of what Shield failed to read at push time. Cross-check
+tests run the same URLs through both implementations.
+
+### Phase 8: strict policy parsing in the standalone evaluator
+
+The evaluator may not depend on jq, Node, Python, or `gh` — that
+constraint is unchanged and is what makes standalone enforcement work with
+VS Code closed. The previous parser was two small awk programs that
+scanned for `"key":` line-wise. Adversarial testing found **two fail-OPEN
+holes** (exit 0, action allowed):
+
+1. **Arrays packed onto one line.** `"enabledActions": ["commit","push"]`
+   made `policy_array` return nothing, so the `enabledActions` membership
+   test failed and the script exited 0 — enforcement silently off. It only
+   ever worked because `serializeShieldPolicy` happens to emit one element
+   per line.
+2. **A truncated policy** (interrupted write, full disk) kept a valid
+   `policyVersion` and a non-empty `expectedGitEmail` prefix and hit the
+   same path — again exit 0.
+
+Two more were fail-closed but wrong: a one-line nested object made
+`policy_scalar host/owner/repo` return the entire object blob, and any
+non-`true` text in `strictPushSetup` (`"yes"`, `1`, `True`) silently
+downgraded the profile to non-strict, skipping every route and account
+check.
+
+**Rule now.** A real recursive-descent JSON parser in POSIX awk. It parses
+the whole document and rejects — as `policy-corrupt`, which fails closed —
+truncation, trailing content, unterminated strings and containers, invalid
+escapes, raw control characters inside strings, invalid numbers, and
+**duplicate keys within one object** (JSON permits those; Shield refuses
+to guess which of two `"owner"` fields was meant). Formatting is now
+irrelevant. Schema validation mirrors `validateShieldPolicy()` field for
+field, including the secret-shaped-field guard (`token`, `accessToken`,
+`password`, `privateKey`, `sshKey`, `credentials`, `secret`).
+
+**Trust boundary, stated explicitly.** The parser is strict about
+structure and schema. Its flattened output is one
+`path<TAB>type<TAB>value` line per node, so an escaped control character
+(`\n`, `\t`) inside a string value is normalized to a single space, and a
+non-ASCII `\uXXXX` escape becomes `?`. No field Shield *compares*
+(`expectedGitEmail`, owner, repo, host, aliases, branch names, actions,
+logins) can legitimately contain either, so this affects only the
+human-readable `profileLabel` echoed back in a block message. What remains
+outside the boundary is unchanged and unchangeable from here: anyone who
+can write the policy file can also write the hook that reads it, so the
+file is not a security boundary against a local attacker. It is protected
+against **corruption and malformedness**, and corruption now fails closed
+instead of silently disabling enforcement.
+
+### Phase 8: threat boundary (unchanged)
+
+Still fully outside what any client-side hook tool can close, and still
+documented rather than pretended away:
+
+- `git commit --no-verify` / `git push --no-verify`.
+- Deliberately pointing `core.hooksPath` at a directory with no Shield
+  hooks (or removing Shield's hook files by hand).
+- Anything with arbitrary local shell access — it can rewrite Shield's own
+  artifacts, shadow `git`/`ssh`/`mktemp` on `PATH`, or edit the policy.
+- HTTPS remotes under strict account verification: there is no local
+  equivalent of `ssh -T` self-identification, so the authenticating
+  account stays unverifiable.
+
+Phase 8 narrows a different class entirely — **Shield being wrong or
+silently inert while reporting that it is protecting you** — not the
+deliberate-bypass class.

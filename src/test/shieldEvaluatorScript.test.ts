@@ -375,3 +375,277 @@ test("no reason message from the script ever claims cryptographic account verifi
     await cleanup(repo);
   }
 });
+
+// ====================================================================
+// Phase 8 — FINDING 10: incomplete push-URL parsing must not count as a
+// match, in EITHER implementation.
+//
+// Confirmed defect: destinationReasons() matched when the actual push
+// URL produced no repository name (`!repo`), so a policy naming a
+// specific repository was satisfied purely because the OWNER happened to
+// parse. Both the TypeScript reference implementation and the shell
+// evaluator had the same hole, and both are asserted together here so
+// they can never drift apart on it.
+// ====================================================================
+
+async function writeRawPolicy(repo: string, raw: string): Promise<void> {
+  const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  await fs.mkdir(shieldStorageDir(commonDir), { recursive: true });
+  await fs.writeFile(shieldPolicyFilePath(commonDir), raw);
+}
+
+const INCOMPLETE_PUSH_URLS: ReadonlyArray<readonly [string, string]> = [
+  ["owner-only scp-like path", "git@github.com:AcmeSoftware"],
+  ["owner-only https path", "https://github.com/AcmeSoftware"],
+  ["a bare path with no owner segment at all", "git@github.com:acme-frontend.git"],
+  ["a local filesystem path with no owner/repo structure", "/srv/git/bare.git"],
+];
+
+for (const [label, url] of INCOMPLETE_PUSH_URLS) {
+  test(`push destination fails CLOSED when the policy names a repository but the URL cannot produce one -- ${label} (shell evaluator)`, async () => {
+    const repo = await makeTempRepo();
+    try {
+      await writePolicy(repo, defaultPolicy());
+      const result = await runScript(repo, ["push", "origin", url]);
+      assert.notEqual(result.code, 0, `"${url}" must not satisfy an approved owner/repo`);
+      assert.match(result.stderr, /push-destination-mismatch/);
+    } finally {
+      await cleanup(repo);
+    }
+  });
+
+  test(`push destination fails CLOSED for the same URL in the TypeScript reference evaluator -- ${label} (1:1 cross-check)`, () => {
+    const decision = evaluatePush(defaultPolicy(), { remoteName: "origin", remoteUrl: url, sshCommandOverrides: [] }, 1);
+    assert.equal(decision.allowed, false, `"${url}" must not satisfy an approved owner/repo`);
+    assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+  });
+}
+
+test("a policy that never recorded a repository name IS still satisfied by owner alone -- absence in the POLICY is different from absence in the URL", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const ownerOnlyPolicy = defaultPolicy({
+      approvedPushDestination: { host: "github.com", owner: "AcmeSoftware" },
+      profile: { ...workProfile, strictPushSetup: false },
+    });
+    await writePolicy(repo, ownerOnlyPolicy);
+    const result = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/anything.git"]);
+    assert.equal(result.code, 0, result.stderr);
+
+    const decision = evaluatePush(
+      ownerOnlyPolicy,
+      { remoteName: "origin", remoteUrl: "git@github.com:AcmeSoftware/anything.git", sshCommandOverrides: [] },
+      1,
+    );
+    assert.equal(decision.allowed, true);
+  } finally {
+    await cleanup(repo);
+  }
+});
+
+// ====================================================================
+// Phase 8 — FINDING 11: the standalone evaluator's policy parsing.
+//
+// The previous awk line-scanning parser had two reproduced FAIL-OPEN
+// holes (exit 0, action allowed): arrays packed onto a single line, and a
+// truncated policy file. Both are now `policy-corrupt`, which fails
+// closed. These tests pin down the whole adversarial matrix.
+// ====================================================================
+
+const VALID_ONE_LINE_POLICY =
+  '{ "policyVersion": 1, "generatedAt": 1, "matchedProfileId": "work", "profileLabel": "Work",' +
+  ' "expectedGitName": "Danish Irfan", "expectedGitEmail": "work@example.com",' +
+  ' "approvedPushDestination": { "host": "github.com", "owner": "AcmeSoftware", "repo": "acme-frontend" },' +
+  ' "trustedSshHostAliases": [], "strictPushSetup": false, "protectedBranches": [],' +
+  ' "expectedBranchPatterns": [], "enabledActions": ["commit","push"] }';
+
+test("policy parsing: a VALID policy formatted entirely on one line is honoured (formatting is no longer load-bearing)", async () => {
+  const repo = await makeTempRepo();
+  try {
+    await writeRawPolicy(repo, VALID_ONE_LINE_POLICY);
+    // Governed and matching -> allowed.
+    const allowed = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"]);
+    assert.equal(allowed.code, 0, allowed.stderr);
+    // Governed and NOT matching -> blocked. This is the half that used to
+    // fail open: enabledActions parsed as empty, so nothing was enforced.
+    const blocked = await runScript(repo, ["push", "origin", "git@github.com:Attacker/acme-frontend.git"]);
+    assert.notEqual(blocked.code, 0);
+    assert.match(blocked.stderr, /push-destination-mismatch/);
+  } finally {
+    await cleanup(repo);
+  }
+});
+
+test("policy parsing: a TRUNCATED policy (partial write) fails CLOSED as policy-corrupt, never silently allowing the action", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const full = JSON.stringify(defaultPolicy(), null, 2);
+    await writeRawPolicy(repo, full.slice(0, Math.floor(full.length * 0.6)));
+    const result = await runScript(repo, ["commit"]);
+    assert.notEqual(result.code, 0, "a truncated policy must never allow a commit");
+    assert.match(result.stderr, /policy-corrupt/);
+  } finally {
+    await cleanup(repo);
+  }
+});
+
+const ADVERSARIAL_POLICIES: ReadonlyArray<readonly [string, string, RegExp]> = [
+  [
+    "duplicate approved-destination field (which of the two owners was meant?)",
+    VALID_ONE_LINE_POLICY.replace('"owner": "AcmeSoftware"', '"owner": "AcmeSoftware", "owner": "Attacker"'),
+    /duplicate key/,
+  ],
+  [
+    "duplicate top-level field",
+    `{ "policyVersion": 1, ${VALID_ONE_LINE_POLICY.slice(1)}`,
+    /duplicate key/,
+  ],
+  [
+    "trailing content after the policy object",
+    `${VALID_ONE_LINE_POLICY} and then some junk`,
+    /trailing content/,
+  ],
+  [
+    "malformed boolean strictPushSetup (used to silently mean non-strict, disabling every route and account check)",
+    VALID_ONE_LINE_POLICY.replace('"strictPushSetup": false', '"strictPushSetup": "yes"'),
+    /strictPushSetup must be a boolean/,
+  ],
+  [
+    "enabledActions is not an array",
+    VALID_ONE_LINE_POLICY.replace('"enabledActions": ["commit","push"]', '"enabledActions": "commit"'),
+    /enabledActions must be an array/,
+  ],
+  [
+    "enabledActions contains a non-string element",
+    VALID_ONE_LINE_POLICY.replace('"enabledActions": ["commit","push"]', '"enabledActions": ["commit", 7]'),
+    /enabledActions must contain only strings/,
+  ],
+  [
+    "protectedBranches is not an array",
+    VALID_ONE_LINE_POLICY.replace('"protectedBranches": []', '"protectedBranches": null'),
+    /protectedBranches must be an array/,
+  ],
+  [
+    "approvedPushDestination.owner is not a string",
+    VALID_ONE_LINE_POLICY.replace('"owner": "AcmeSoftware"', '"owner": 12345'),
+    /approvedPushDestination\.owner must be a string/,
+  ],
+  [
+    "approvedPushDestination is not an object",
+    VALID_ONE_LINE_POLICY.replace(
+      '"approvedPushDestination": { "host": "github.com", "owner": "AcmeSoftware", "repo": "acme-frontend" }',
+      '"approvedPushDestination": "github.com/AcmeSoftware/acme-frontend"',
+    ),
+    /approvedPushDestination must be an object/,
+  ],
+  [
+    "missing required expectedGitEmail",
+    VALID_ONE_LINE_POLICY.replace('"expectedGitEmail": "work@example.com", ', ""),
+    /expectedGitEmail/,
+  ],
+  [
+    "empty required profileLabel",
+    VALID_ONE_LINE_POLICY.replace('"profileLabel": "Work"', '"profileLabel": ""'),
+    /profileLabel/,
+  ],
+  [
+    "wrong policyVersion",
+    VALID_ONE_LINE_POLICY.replace('"policyVersion": 1', '"policyVersion": 2'),
+    /policyVersion/,
+  ],
+  [
+    "a secret-shaped field that should never have been persisted",
+    VALID_ONE_LINE_POLICY.replace('"generatedAt": 1', '"generatedAt": 1, "token": "ghp_example"'),
+    /must not contain a "token" field/,
+  ],
+  [
+    // A file whose last line ends mid-string trips the raw-control-
+    // character rule first (JSON forbids a literal newline inside a
+    // string); with no trailing newline at all it trips "unterminated
+    // string". Both are correct, both fail closed -- the assertion
+    // accepts either rather than pinning down which one wins.
+    "unterminated string",
+    '{ "policyVersion": 1, "profileLabel": "Work',
+    /unterminated string|raw control character inside a string/,
+  ],
+  [
+    "invalid escape sequence inside a string",
+    VALID_ONE_LINE_POLICY.replace('"profileLabel": "Work"', '"profileLabel": "Wo\\qrk"'),
+    /invalid escape/,
+  ],
+  [
+    "invalid number",
+    VALID_ONE_LINE_POLICY.replace('"generatedAt": 1', '"generatedAt": 01'),
+    /policy-corrupt/,
+  ],
+  [
+    "the whole file is a JSON array, not an object",
+    "[1, 2, 3]",
+    /must contain a JSON object/,
+  ],
+];
+
+for (const [label, raw, expected] of ADVERSARIAL_POLICIES) {
+  test(`policy parsing: ${label} -> policy-corrupt, action BLOCKED`, async () => {
+    const repo = await makeTempRepo();
+    try {
+      await writeRawPolicy(repo, raw);
+      const commitResult = await runScript(repo, ["commit"]);
+      assert.notEqual(commitResult.code, 0, "a malformed policy must never allow a commit");
+      assert.match(commitResult.stderr, /policy-corrupt/);
+      assert.match(commitResult.stderr, expected);
+
+      // And identically for a push -- corruption is never action-specific.
+      const pushResult = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"]);
+      assert.notEqual(pushResult.code, 0, "a malformed policy must never allow a push");
+      assert.match(pushResult.stderr, /policy-corrupt/);
+    } finally {
+      await cleanup(repo);
+    }
+  });
+}
+
+test("policy parsing: a nested key can never be mistaken for a top-level one, and an escaped quote inside a string value cannot forge a key", async () => {
+  const repo = await makeTempRepo();
+  try {
+    // The label deliberately contains the exact text of a destination key.
+    // A substring-scanning parser could be fooled by this; a real parse
+    // cannot, because it is a string VALUE, not a key.
+    const raw = VALID_ONE_LINE_POLICY.replace(
+      '"profileLabel": "Work"',
+      '"profileLabel": "evil \\"owner\\": \\"Attacker\\" label"',
+    );
+    await writeRawPolicy(repo, raw);
+    const result = await runScript(repo, ["push", "origin", "git@github.com:Attacker/acme-frontend.git"]);
+    assert.notEqual(result.code, 0, "the real approved owner (AcmeSoftware) must still win");
+    assert.match(result.stderr, /push-destination-mismatch/);
+    // The escaped quotes are decoded for display, not left as raw backslashes.
+    assert.match(result.stderr, /evil "owner": "Attacker" label/);
+  } finally {
+    await cleanup(repo);
+  }
+});
+
+test("policy parsing: arbitrary whitespace, tabs, and newlines between every token are accepted", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const spaced = VALID_ONE_LINE_POLICY.replace(/([{}[\],:])/g, "\n \t$1\t \n");
+    await writeRawPolicy(repo, spaced);
+    const result = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"]);
+    assert.equal(result.code, 0, result.stderr);
+  } finally {
+    await cleanup(repo);
+  }
+});
+
+test("policy parsing: an empty policy file fails CLOSED", async () => {
+  const repo = await makeTempRepo();
+  try {
+    await writeRawPolicy(repo, "");
+    const result = await runScript(repo, ["commit"]);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /policy-corrupt/);
+  } finally {
+    await cleanup(repo);
+  }
+});

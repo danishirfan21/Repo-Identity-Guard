@@ -609,3 +609,140 @@ test("nextFix prefers a blocking result over a warning", () => {
   );
   assert.equal(summary.nextFix?.blocksOverallSafety, true);
 });
+
+// ====================================================================
+// Phase 8 — FINDING 4 (second half): one coherent push-destination rule.
+//
+// Confirmed defect: the rule read
+//
+//   matchesExactRepo || expectedOwners.length === 0 || ownerPatternMatches
+//
+// whose middle term is an unconditional `true` for any profile that lists
+// `exactRepos` but no `expectedRemoteOwners`. Such a profile reported
+// "destination confirmed" for LITERALLY ANY destination -- a repository
+// it does not list, under an owner it has never heard of -- and likewise
+// confirmed a destination whose owner could not be parsed at all.
+//
+// The rule now: a profile that declares NO destination constraint
+// confirms any resolvable destination; otherwise the destination must
+// POSITIVELY match an exactRepos pattern or an owner pattern, and missing
+// evidence never counts as a match. Owner-level matching is retained on
+// purpose so forks/mirrors under a trusted owner keep working.
+// ====================================================================
+
+function pushDestinationState(facts: RepoFacts, profile: Profile) {
+  const summary = computeStatus({
+    facts,
+    profiles: [profile],
+    protectedBranches: [],
+    preferences: defaultPreferences,
+  });
+  return summary.capabilityResults.find((r) => r.capability === "push_destination")?.state;
+}
+
+test("push destination: a profile listing exactRepos but NO owner patterns must NOT confirm a stranger's repository", () => {
+  const exactOnlyProfile: Profile = {
+    ...workProfile,
+    expectedRemoteOwners: [],
+    exactRepos: ["github-work/acmesoftware/acme-frontend"],
+  };
+
+  // The listed repo is confirmed...
+  assert.equal(
+    pushDestinationState(
+      safeFacts({ pushRemoteHost: "github-work", pushRemoteOwner: "AcmeSoftware", pushRemoteRepo: "acme-frontend" }),
+      exactOnlyProfile,
+    ),
+    "confirmed",
+  );
+
+  // ...and an entirely unrelated destination is NOT. This is the case
+  // that used to read as "confirmed".
+  assert.equal(
+    pushDestinationState(
+      safeFacts({ pushRemoteHost: "github-work", pushRemoteOwner: "TotalStranger", pushRemoteRepo: "some-other-repo" }),
+      exactOnlyProfile,
+    ),
+    "contradicted",
+  );
+
+  // Nor is a DIFFERENT repository under the same owner, since this
+  // profile constrained itself to exact repositories only.
+  assert.equal(
+    pushDestinationState(
+      safeFacts({ pushRemoteHost: "github-work", pushRemoteOwner: "AcmeSoftware", pushRemoteRepo: "not-listed" }),
+      exactOnlyProfile,
+    ),
+    "contradicted",
+  );
+});
+
+test("push destination: a constrained profile never confirms a destination whose owner could not be parsed", () => {
+  const constrained: Profile = { ...workProfile, expectedRemoteOwners: ["AcmeSoftware"] };
+  assert.equal(
+    pushDestinationState(
+      safeFacts({ pushRemoteUrl: "/srv/git/bare.git", pushRemoteHost: undefined, pushRemoteOwner: undefined, pushRemoteRepo: undefined }),
+      constrained,
+    ),
+    "contradicted",
+    "missing evidence is never a match",
+  );
+});
+
+test("push destination: owner-pattern matching still confirms forks and mirrors under a trusted owner (deliberately NOT narrowed)", () => {
+  const ownerProfile: Profile = { ...workProfile, expectedRemoteOwners: ["AcmeSoftware"], exactRepos: [] };
+  for (const repo of ["acme-frontend", "acme-frontend-fork", "a-brand-new-repo"]) {
+    assert.equal(
+      pushDestinationState(
+        safeFacts({ pushRemoteHost: "github-work", pushRemoteOwner: "AcmeSoftware", pushRemoteRepo: repo }),
+        ownerProfile,
+      ),
+      "confirmed",
+      `${repo} under a trusted owner should stay confirmed`,
+    );
+  }
+});
+
+test("push destination: a wildcard owner pattern still works, and a profile with an exactRepos match under an untrusted owner is still confirmed by that exact listing", () => {
+  const wildcard: Profile = { ...workProfile, expectedRemoteOwners: ["Acme*"], exactRepos: [] };
+  assert.equal(
+    pushDestinationState(
+      safeFacts({ pushRemoteHost: "github-work", pushRemoteOwner: "AcmeLabs", pushRemoteRepo: "x" }),
+      wildcard,
+    ),
+    "confirmed",
+  );
+
+  const both: Profile = {
+    ...workProfile,
+    expectedRemoteOwners: ["AcmeSoftware"],
+    exactRepos: ["github-work/vendorco/shared-lib"],
+  };
+  assert.equal(
+    pushDestinationState(
+      safeFacts({ pushRemoteHost: "github-work", pushRemoteOwner: "VendorCo", pushRemoteRepo: "shared-lib" }),
+      both,
+    ),
+    "confirmed",
+    "an explicitly listed exact repo is confirmed even though its owner is not an owner pattern",
+  );
+});
+
+test("push destination: a profile that declares NO destination constraint at all can never be MATCHED to a repository in the first place, so the permissive branch is unreachable in practice", () => {
+  // Documented consequence of the new rule, worth pinning down: profile
+  // resolution itself (resolveProfiles) matches a repository by owner
+  // pattern or exact-repo listing, so a profile that declares neither can
+  // never become the matched profile -- push destination then reports
+  // not_applicable rather than confirming anything. The permissive branch
+  // in checkPushDestination therefore exists only so the rule stays total
+  // and honest, never as a way for an under-specified profile to wave a
+  // destination through.
+  const unconstrained: Profile = { ...workProfile, expectedRemoteOwners: [], exactRepos: [] };
+  assert.equal(
+    pushDestinationState(
+      safeFacts({ pushRemoteHost: "github-work", pushRemoteOwner: "AnyoneAtAll", pushRemoteRepo: "anything" }),
+      unconstrained,
+    ),
+    "not_applicable",
+  );
+});

@@ -253,10 +253,31 @@ A repository that already runs Husky, `pre-commit`, or another hook
 manager is never silently overridden — by default Shield simply won't
 install into an occupied hook slot (reported degraded), and an explicit
 opt-in (`chainForeignHooks`, not yet exposed as a command prompt) chains
-the existing hook exactly, restoring it byte-for-byte on disable. Full
-details — threat model, policy schema, worktree handling, the evaluator,
-the installation lifecycle, hook coexistence, and integrity detection —
-are in [docs/SHIELD_MODE.md](docs/SHIELD_MODE.md).
+the existing hook exactly, restoring it byte-for-byte on disable. Chaining
+is limited to executable regular files, which Shield preserves
+byte-for-byte; a symlinked or non-executable hook is left completely
+untouched and reported degraded with the reason, rather than being
+converted into something Shield can handle.
+
+Shield's hooks **fail closed**: if a hook is installed but Shield's
+evaluator is missing or unreadable, the commit or push is blocked with a
+"broken Shield installation" message pointing at Repair Shield / Disable
+Shield — never silently allowed. Disable Shield is correspondingly
+complete: it removes every hook it owns (including at hooks directories a
+later `core.hooksPath` change moved away from) *before* removing the
+evaluator and policy, so a finished disable can never leave you blocked.
+
+**Shield requires Git 2.31 or newer** — `git rev-parse --path-format`
+(2.31) is what its hooks and evaluator use to find the repository, and
+`pre-merge-commit` (2.24) is the only hook that covers a real merge
+commit. On an older Git, Shield reports degraded and refuses to install
+rather than claiming protection it cannot provide. This floor is
+Shield-specific; the rest of the extension works against much older Git.
+
+Full details — threat model, policy schema, worktree handling, the
+evaluator, the installation lifecycle, hook coexistence, integrity
+detection, and the Phase 8 correctness-hardening pass — are in
+[docs/SHIELD_MODE.md](docs/SHIELD_MODE.md).
 
 ## Push setup: destination vs. account
 
@@ -414,7 +435,16 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
   This is Git's own documented hook-bypass mechanism, not a Shield defect
   — no client-side hook tool can prevent it. Shield's promise is blocking
   ordinary accidental unsafe operations, not containing a process acting
-  with intent to bypass a local hook.
+  with intent to bypass a local hook. Anything with arbitrary local shell
+  access is likewise outside the boundary: it can rewrite Shield's own
+  artifacts or shadow `git`/`ssh` on `PATH`.
+- **Shield requires Git 2.31+.** Below that it reports degraded and
+  refuses to install, rather than reporting active while enforcing
+  nothing. Shield-specific; the rest of the extension is unaffected.
+- **HTTPS remotes cannot have their account verified.** Strict
+  `expectedGitHubLogin` verification relies on GitHub's SSH
+  self-identification; there is no local equivalent over HTTPS, so such a
+  route reads as unverified under a strict profile.
 - **Fork detection is naming-convention-based, not verified.** The
   fork/upstream conflict check only looks for a remote literally named
   `upstream` — there's no reliable way to detect a fork relationship from

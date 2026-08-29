@@ -2,6 +2,128 @@
 
 ## Unreleased
 
+### Fixed — Shield core correctness hardening
+
+Every item below was reproduced against a real repository before being
+fixed, and each has a regression test that fails against the previous
+behavior. Full write-ups, including the exact reproductions, are in
+[docs/SHIELD_MODE.md](docs/SHIELD_MODE.md) under "Phase 8".
+
+- **Shield's hooks fail closed on a broken installation.** Both hook shims
+  exited 0 when `git rev-parse --git-common-dir` failed or when Shield's
+  evaluator copy was missing. With Shield reported ACTIVE, deleting one
+  file (`<gitCommonDir>/repo-identity-guard/shield-evaluate.sh`) let a
+  commit with a deliberately mismatched identity through silently — a
+  one-command, no-privileges bypass of the whole feature. A hook that is
+  installed but cannot reach its evaluator is now a *broken installation*:
+  the operation is blocked and framed as a Shield internal error pointing
+  at Repair Shield / Disable Shield, never as a verdict about the user's
+  commit or push. (Generated hook contents changed;
+  `SHIELD_ARTIFACT_VERSION` is now 5.)
+
+- **Disable Shield is now complete, which is what makes fail-closed safe.**
+  `disable()` removes every hook it can prove it owns *before* deleting
+  the evaluator and policy, so an interrupted disable can only ever
+  over-enforce, never permanently block. It also reaches hooks directories
+  Shield installed into previously, via a new durable installation record
+  — see the next item.
+
+- **Orphaned hooks after a `core.hooksPath` change.** Shield kept no
+  record of where it installed. Reproduced: enable with hooks directory A,
+  point `core.hooksPath` at B, disable — Shield's hooks stayed in A
+  forever and became live again the moment `core.hooksPath` pointed back.
+  Shield now keeps a minimal, non-secret, atomically written installation
+  record under Git metadata (never the working tree, shared correctly
+  across worktrees). It is never authoritative: every path it names is
+  re-verified as Shield-owned before being touched, so a tampered record
+  can only send Shield somewhere useless. Health now reports orphans;
+  enable/repair consolidate; disable cleans every recorded location.
+
+- **The approved push destination came from the wrong remote.** Shield's
+  `approvedPushDestination` was built from origin's *fetch* facts, so any
+  repository using `branch.<name>.pushRemote`, `remote.pushDefault`,
+  `remote.<name>.pushurl`, or a non-origin `branch.<name>.remote` had
+  Shield approving a destination nobody pushes to. It is now built from
+  the actual plain-push destination. The repository's canonical identity
+  (`approvedRepositoryKey`) deliberately still tracks origin — the two are
+  different facts and were being conflated.
+
+- **The sidebar could call a push destination "confirmed" when it wasn't.**
+  A profile listing `exactRepos` but no `expectedRemoteOwners` confirmed
+  *any* destination whatsoever, and an unparseable owner also read as
+  confirmed. The rule is now stated once and shared: an unconstrained
+  profile makes no claim; otherwise the destination must positively match
+  an exact-repo or owner pattern, and missing evidence is never a match.
+  Owner-level matching is deliberately retained so forks and mirrors under
+  a trusted owner keep working. Documented so the sidebar and Shield can
+  never contradict each other about a destination.
+
+- **Enable/Repair Shield built durable policy from possibly-stale UI
+  facts.** Both commands used the shared scan snapshot a background
+  watcher can overwrite. They now re-collect repository facts, re-resolve
+  the profile, and re-resolve the push destination immediately before
+  writing the policy.
+
+- **Check Shield Health performed no integrity checks.** All three of
+  `inspect()`'s drift checks are opt-in, and the command supplied none —
+  so a Shield with a hand-edited evaluator (markers intact), a profile
+  edited after enable, or a moved push destination reported a confident
+  "Shield is active." The command now supplies all three from live state.
+  `inspect()` remains strictly read-only and never self-repairs.
+
+- **Foreign hooks could be destroyed or made un-runnable by chaining.** A
+  binary hook was read as UTF-8 and written back with U+FFFD replacement
+  characters; a symlinked hook was flattened into a regular-file copy; a
+  non-executable hook was chained anyway, so every commit died with a bare
+  `exec: ...: Permission denied`. Chaining is now limited to executable
+  regular files, preserved byte-for-byte with their mode; every other file
+  type is left completely untouched and reported degraded with a precise
+  explanation.
+
+- **Predictable pre-push temp file removed.** When `mktemp` failed, the
+  pre-push shim fell back to a guessable `...prepush-stdin.$$` path in a
+  shared temp directory and truncated it — a symlink/pre-creation hazard
+  that also exposed the pushed ref lines. It now fails closed as a Shield
+  internal error and creates nothing.
+
+- **Strict account verification did not check where the SSH alias
+  actually goes.** A trusted alias name plus `IdentitiesOnly yes` plus a
+  GitHub-shaped greeting counted as verified, even though an alias can
+  resolve anywhere and any host can produce that greeting. Verification
+  now resolves the effective route with `ssh -G` first and requires a real
+  GitHub SSH endpoint; an explicit port in an `ssh://` remote (previously
+  dropped) is carried through so the probe travels the same route the push
+  would. Read-only throughout: no key contents read, no SSH config
+  written, `StrictHostKeyChecking` unchanged.
+
+- **A push URL that produced no repository name satisfied a policy that
+  named one.** Missing evidence is no longer a match, in both the
+  TypeScript reference evaluator and the shell evaluator (kept 1:1).
+
+- **The standalone evaluator's policy parsing could fail open.** Two
+  reproduced holes let a corrupt policy allow the action outright: arrays
+  packed onto a single line, and a truncated policy file. Two more
+  silently weakened enforcement (a one-line nested object, and any
+  non-`true` `strictPushSetup` reading as non-strict). Replaced with a
+  strict recursive-descent JSON parser in POSIX awk — no jq, Node, or
+  Python dependency added — that rejects truncation, trailing content,
+  bad escapes, raw control characters, invalid numbers, and duplicate
+  keys, and validates the schema field-for-field against the TypeScript
+  validator. Corruption now fails closed. The exact remaining trust
+  boundary is documented in the script and in docs/SHIELD_MODE.md.
+
+### Changed
+
+- **Shield now requires Git 2.31 or newer.** The docs previously claimed
+  2.9. Shield's hooks and evaluator depend on `git rev-parse
+  --path-format` (Git 2.31), and merge-commit coverage depends on the
+  `pre-merge-commit` hook (Git 2.24). Below the floor Shield reports
+  degraded with the missing coverage named and refuses to install, rather
+  than reporting ACTIVE while enforcing nothing. This is Shield-specific
+  and does not change the extension's VS Code engine requirement or affect
+  any non-Shield feature.
+
+
 ### Added
 
 - **CI**: a GitHub Actions workflow (`.github/workflows/ci.yml`) runs
