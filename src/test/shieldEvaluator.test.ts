@@ -266,6 +266,91 @@ test("evaluatePush never claims cryptographic account verification in any reason
   }
 });
 
+// ---------------- push: GitHub account verification (Phase 5) ----------------
+
+function workProfileWithLogin(overrides: Partial<Profile> = {}): Profile {
+  return { ...workProfile, expectedGitHubLogin: "danish-work", ...overrides };
+}
+
+test("evaluatePush: no expectedGitHubLogin means Shield never asserts anything about WHO authenticated (Phase 0-4 behavior unchanged)", () => {
+  const decision = evaluatePush(policy(), pushFacts({ githubAccountCheck: { kind: "authenticated-user", login: "someone-else" } }));
+  assert.equal(decision.allowed, true);
+});
+
+test("evaluatePush: expectedGitHubLogin set, authenticated login matches -> allowed", () => {
+  const decision = evaluatePush(
+    policy({ profile: workProfileWithLogin() }),
+    pushFacts({ githubAccountCheck: { kind: "authenticated-user", login: "danish-work" } }),
+  );
+  assert.equal(decision.allowed, true);
+});
+
+test("evaluatePush: expectedGitHubLogin set, matches case-insensitively", () => {
+  const decision = evaluatePush(
+    policy({ profile: workProfileWithLogin() }),
+    pushFacts({ githubAccountCheck: { kind: "authenticated-user", login: "Danish-Work" } }),
+  );
+  assert.equal(decision.allowed, true);
+});
+
+test("evaluatePush: expectedGitHubLogin set, authenticated as the wrong account -> push-account-mismatch, names both accounts", () => {
+  const decision = evaluatePush(
+    policy({ profile: workProfileWithLogin() }),
+    pushFacts({ githubAccountCheck: { kind: "authenticated-user", login: "danish-personal" } }),
+  );
+  assert.equal(decision.allowed, false);
+  const reason = decision.reasons.find((r) => r.id === "push-account-mismatch");
+  assert.ok(reason);
+  assert.match(reason!.message, /danish-work/);
+  assert.match(reason!.message, /danish-personal/);
+});
+
+test("evaluatePush: verification never attempted (required but missing) -> push-account-unverified, never an implicit pass", () => {
+  const decision = evaluatePush(policy({ profile: workProfileWithLogin() }), pushFacts());
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-account-unverified"));
+});
+
+test("evaluatePush: deploy-key-style identity can never be compared to a personal login -> unverified, never guessed", () => {
+  const decision = evaluatePush(
+    policy({ profile: workProfileWithLogin() }),
+    pushFacts({ githubAccountCheck: { kind: "authenticated-deploy-key", identity: "AcmeSoftware/acme-frontend" } }),
+  );
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-account-unverified"));
+});
+
+test("evaluatePush: permission-denied/host-key-unverified/timeout/identities-not-isolated/malformed all block as push-account-unverified", () => {
+  const outcomes: PushEvalFacts["githubAccountCheck"][] = [
+    { kind: "permission-denied" },
+    { kind: "host-key-unverified" },
+    { kind: "timeout" },
+    { kind: "identities-not-isolated" },
+    { kind: "malformed", raw: "garbage" },
+  ];
+  for (const githubAccountCheck of outcomes) {
+    const decision = evaluatePush(policy({ profile: workProfileWithLogin() }), pushFacts({ githubAccountCheck }));
+    assert.equal(decision.allowed, false, `outcome ${JSON.stringify(githubAccountCheck)} should block`);
+    assert.ok(decision.reasons.some((r) => r.id === "push-account-unverified"));
+  }
+});
+
+test("evaluatePush: account verification is strict-only — a non-strict profile never checks expectedGitHubLogin", () => {
+  const relaxedProfile = workProfileWithLogin({ strictPushSetup: false });
+  const decision = evaluatePush(policy({ profile: relaxedProfile }), pushFacts());
+  assert.equal(decision.allowed, true);
+});
+
+test("evaluatePush: account verification never runs (and never duplicates) when the route itself is already untrusted", () => {
+  const decision = evaluatePush(
+    policy({ profile: workProfileWithLogin() }),
+    pushFacts({ remoteUrl: "git@github.com:AcmeSoftware/acme-frontend.git" }),
+  );
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-route-unverified"));
+  assert.ok(!decision.reasons.some((r) => r.id === "push-account-mismatch" || r.id === "push-account-unverified"));
+});
+
 // ---------------- evaluateFromPolicyLoad ----------------
 
 test("evaluateFromPolicyLoad denies with policy-missing when no policy file was found, without touching Git state", () => {

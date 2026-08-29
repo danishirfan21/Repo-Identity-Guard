@@ -238,7 +238,9 @@ correctly-scoped mutation and warning before you confirm.
 **Shield Mode** (local pre-commit AND pre-push Git hooks that block unsafe
 commits and pushes — wrong identity, a protected branch, detached HEAD, an
 in-progress merge/rebase, a push to a destination or over a route that
-doesn't match what Shield approved for this repo) exists behind
+doesn't match what Shield approved for this repo, or — for a strict GitHub
+SSH profile with `expectedGitHubLogin` set — a route that authenticates
+live as the wrong GitHub account) exists behind
 command-palette commands only: `Repo Identity Guard: Enable/Disable/Repair
 Shield` and `...: Check Shield Health`. There is still no Settings/sidebar
 toggle for it — a disabled "Coming soon" card in Settings remains the only

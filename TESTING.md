@@ -188,6 +188,67 @@ Confirm status updates after:
 - pinning/unpinning a Repo Memory note;
 - granting Workspace Trust to a previously untrusted folder.
 
+## Shield Mode Phase 5: verified GitHub SSH account binding (manual, real GitHub)
+
+Everything above (and `src/test/shieldGitHubAccountBinding.test.ts`) uses
+a mocked SSH transport by design — CI never contacts real GitHub. The
+scenarios below are the only place this feature is meant to be exercised
+against the real thing, and they require two real GitHub accounts (a
+"work" and a "personal" one) each with their own SSH key, since that's
+the exact situation Phase 5 exists for. Do this on a machine you don't
+mind adding temporary SSH config/keys to, and remove them afterward if
+they're just for this test.
+
+### One-time setup
+
+1. Generate two SSH keys if you don't already have them, one per account:
+   ```sh
+   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_work -C "work"
+   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_personal -C "personal"
+   ```
+   Add each public key to the matching GitHub account (Settings → SSH and
+   GPG keys) on github.com.
+2. Add two aliased `Host` entries to `~/.ssh/config`:
+   ```
+   Host github-work
+     HostName github.com
+     User git
+     IdentityFile ~/.ssh/id_ed25519_work
+     IdentitiesOnly yes
+
+   Host github-personal
+     HostName github.com
+     User git
+     IdentityFile ~/.ssh/id_ed25519_personal
+     IdentitiesOnly yes
+   ```
+3. Confirm both work *before* involving Shield at all:
+   ```sh
+   ssh -T git@github-work       # expect: Hi <work-username>! ...
+   ssh -T git@github-personal   # expect: Hi <personal-username>! ...
+   ```
+   The first time you run each, you may be prompted to accept github.com's
+   host key — accept it once, interactively, here (not through Shield).
+4. Create (or reuse) a profile with `expectedGitHubLogin` set to your
+   work account's actual GitHub username, `trustedSshHostAliases:
+   ["github-work"]`, and `strictPushSetup: true`.
+5. In a real repo cloned via `git@github-work:<owner>/<repo>.git`, run
+   "Repo Identity Guard: Enable Shield" (or Repair, if already enabled).
+
+### Scenarios
+
+| Scenario | Setup | Expected |
+| --- | --- | --- |
+| Correct account | Push normally over `origin` (pointing at `github-work`). | Push succeeds; no Shield output. |
+| Wrong account, same repo | Temporarily set `git remote set-url origin git@github-personal:<owner>/<repo>.git` (assuming your personal account also has access, or just watch it fail push-account-mismatch before it would even reach GitHub's own permission check) and push. | `PUSH BLOCKED` — `push-account-mismatch`, naming both the expected and the actually-authenticated login. |
+| `IdentitiesOnly` removed | Comment out `IdentitiesOnly yes` under the `github-work` alias in `~/.ssh/config`, push. | `PUSH BLOCKED` — `push-account-unverified`, mentioning `IdentitiesOnly`. No network probe should even be attempted (you can confirm this by watching for a network delay — there shouldn't be one). Restore the config line afterward. |
+| Unknown host key | Remove github.com's entry from `~/.ssh/known_hosts` (`ssh-keygen -R github.com`), push. | `PUSH BLOCKED` — `push-account-unverified`, telling you to verify the host key fingerprint manually. Confirm Shield did **not** silently add the host key itself — check `known_hosts` is still missing the entry afterward. Then verify manually (`ssh -T git@github-work`, accept the prompt) and push again to confirm it now passes. |
+| ssh-agent has both keys loaded, alias correct | `ssh-add ~/.ssh/id_ed25519_personal` (loading the WRONG key into the agent) while `IdentitiesOnly yes` is still set on the alias, push. | Push still authenticates as the **work** account — `IdentitiesOnly yes` is exactly what prevents the agent's other loaded key from being offered. This is the scenario the `identities-not-isolated` check exists to make provable, not just hoped-for. |
+| Network unreachable | Disconnect networking (or block outbound port 22 with a firewall rule) and push. | `PUSH BLOCKED` — `push-account-unverified` (timeout), within roughly `REPO_IDENTITY_GUARD_SHIELD_SSH_TIMEOUT` seconds (default 5) — the push should not hang indefinitely. |
+| Non-strict profile | Set `strictPushSetup: false` on the profile (keep `expectedGitHubLogin` set), push from the wrong account. | Push succeeds — account verification never runs under a non-strict profile, by design. |
+| `--no-verify` | Push from the wrong account with `git push --no-verify`. | Push succeeds — documented, expected bypass, not a Phase 5 gap. |
+| HTTPS remote | Point `origin` at `https://github.com/<owner>/<repo>.git` instead, with the same strict profile and `expectedGitHubLogin` set. | `PUSH BLOCKED` — `push-route-unverified` (HTTPS message), not an account-specific reason. Confirms HTTPS never even reaches account verification in this phase. |
+
 ## Automated checks
 
 Run:

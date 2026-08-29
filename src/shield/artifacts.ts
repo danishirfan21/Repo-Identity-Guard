@@ -27,7 +27,7 @@ export const SHIELD_ARTIFACT_MARKER = "repo-identity-guard-shield-artifact";
  * flags an on-disk artifact whose embedded version is older than this as
  * "repair available," without treating it as broken or non-owned.
  */
-export const SHIELD_ARTIFACT_VERSION = 1;
+export const SHIELD_ARTIFACT_VERSION = 2;
 
 function markerPattern(): RegExp {
   return new RegExp(`${SHIELD_ARTIFACT_MARKER}\\s+v(\\d+)`);

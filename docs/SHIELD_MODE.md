@@ -119,6 +119,8 @@ type ShieldReasonId =
   | "push-route-unverified"
   | "push-route-mismatch"
   | "push-route-override" // Phase 4: an SSH command override makes the route unverifiable
+  | "push-account-mismatch" // Phase 5: the route authenticated, but as the wrong GitHub account
+  | "push-account-unverified" // Phase 5: expectedGitHubLogin is set, but the account couldn't be confirmed
   | "policy-missing"
   | "policy-corrupt"
   | "inspection-failed";
@@ -989,7 +991,7 @@ it's called out here as a real, not merely theoretical, blind spot.
   Phase 1, and outside Shield's accidental-misuse threat model — Phase 4
   does not and cannot close it.
 
-### What's next (not this phase)
+### What's next after Phase 4 (superseded below by Phase 5, except where noted)
 
 - Per-ref push inspection (force-push detection, etc.) using the ref
   lines the hook already forwards but the evaluator doesn't yet inspect.
@@ -998,4 +1000,236 @@ it's called out here as a real, not merely theoretical, blind spot.
   command-palette-only.
 - Coexisting with a pre-existing third-party hook manager, for both hooks.
 - Detecting a shadowed `ssh` executable on `PATH` — an accepted, disclosed
-  limitation for now (see above), not silently ignored.
+  limitation, carried forward unchanged into Phase 5 (see below).
+
+## Phase 5: verified GitHub SSH account binding
+
+Phase 4 gave strict Shield route **trust**: "this SSH alias is one you,
+the user, vouched for." Phase 5 goes one step further for GitHub SSH
+specifically: **verification** — "this SSH route currently authenticates
+to the specific GitHub account this profile expects," checked live,
+against the real GitHub endpoint, at push time.
+
+This phase is deliberately GitHub-first and narrowly scoped. It does not
+attempt to solve account verification for every Git host, and it does
+not touch HTTPS at all.
+
+### Three distinct concepts, never conflated
+
+`Profile` gains one new field:
+
+```ts
+interface Profile {
+  gitEmail: string; // Git commit author/committer email — local only, never authenticated
+  expectedRemoteOwners?: string[]; // the GitHub REPOSITORY's owner/org — who the repo belongs to
+  expectedGitHubLogin?: string; // the GitHub ACCOUNT this route should authenticate as — who is pushing
+  // ...
+}
+```
+
+These are three genuinely different facts, and Shield has always kept
+them separate:
+
+- **Git commit email** (`gitEmail`) — what identity Git writes into a
+  commit. Purely local; nothing authenticates it. Checked by
+  `evaluateCommit`, unrelated to pushing at all.
+- **GitHub repository owner/org** (`expectedRemoteOwners`, and the
+  push-destination's `owner`) — who the *repository* belongs to. Checked
+  by `destinationReasons`, unrelated to who is doing the pushing.
+- **GitHub authenticated username** (`expectedGitHubLogin`, new in this
+  phase) — who the *SSH connection itself* proves to be, live, via
+  GitHub's own SSH self-identification convention. This is the only one
+  of the three that involves a network call or a claim about a real
+  GitHub account.
+
+A repo owned by `AcmeCorp` can still be pushed to by an SSH key
+belonging to any GitHub account with write access; only
+`expectedGitHubLogin` ties the push's *route* to one specific expected
+login.
+
+### Only for SSH, only under strict, only on an already-trusted route
+
+Account verification is never attempted unless **all** of the following
+hold:
+
+1. `strictPushSetup` is true (route trust and account verification are
+   both strict-only features — a relaxed profile never runs either).
+2. `expectedGitHubLogin` is set on the matched profile. Leaving it unset
+   means Shield makes no claim at all about who authenticated — Phase
+   0-4's route-trust-only behavior, unchanged.
+3. The push's route already resolved to a **trusted SSH alias** with
+   **no SSH command override present** (`routeReasons` found nothing
+   wrong). An untrusted host, a generic host, HTTPS, or an active
+   `GIT_SSH`/`GIT_SSH_COMMAND`/`core.sshCommand` override already
+   produces its own blocking reason (`push-route-unverified` /
+   `push-route-override`) — account verification is never attempted on
+   top of those, and never overrides or duplicates them.
+
+HTTPS remotes remain entirely unverified under strict account
+enforcement in this phase, by design — see "What's next" below.
+
+### GitHub's SSH self-test, and its footgun
+
+GitHub supports testing SSH authentication with a well-known
+noninteractive command:
+
+```sh
+ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=<n> git@<host>
+```
+
+which never opens a shell, but replies with a line naming the
+authenticated identity — e.g. `Hi danish-work! You've successfully
+authenticated, but GitHub does not provide shell access.` **GitHub's SSH
+endpoint commonly exits with status 1 even on fully successful
+authentication** (it genuinely has nothing to hand back), so the exit
+code is never treated as a pass/fail signal by itself — only the
+response text is. `parseGitHubSshAuthOutput` (`src/shield/
+githubSshVerification.ts`) — the pure, exhaustively unit-tested reference
+for the shell script's own `verify_github_account` text matching — takes
+no exit-code parameter at all, by design, so a caller can't accidentally
+gate on it.
+
+`StrictHostKeyChecking=yes` means an unknown or changed host key makes
+the connection **fail**, not silently (or interactively) succeed —
+Shield must never auto-accept a host key on the user's behalf. When this
+happens, the push is blocked as `push-account-unverified` with a message
+telling the user to verify the host key fingerprint themselves (e.g. run
+the SSH command once, interactively, outside Shield) and accept it —
+Shield never does this for them.
+
+### `IdentitiesOnly yes`: what makes a route "strongly bound"
+
+Trusting an SSH alias's *host* is not the same as trusting *which key*
+answers for it: without `IdentitiesOnly yes` in that alias's effective
+configuration, `ssh-agent` may offer any key it has loaded, not
+necessarily the one the alias's config file actually names. Before ever
+attempting the network probe, Shield inspects `ssh -G <alias>`'s
+effective configuration (a local, read-only check — no network call) and
+requires an exact `identitiesonly yes` line. Absent that, the route is
+left `push-account-unverified` with an explanation, and the network
+probe is never even attempted — Shield does not invent certainty by
+running a check that couldn't mean anything without this precondition.
+
+### Never inventing certainty: every outcome that isn't a clean match blocks
+
+`GitHubAccountVerificationOutcome` (`src/shield/githubSshVerification.ts`)
+is a closed set, and every member other than a matching
+`authenticated-user` results in `push-account-unverified` under strict
+Shield — never a silent pass:
+
+- **`authenticated-user`** — GitHub named a personal login. Compared
+  case-insensitively against `expectedGitHubLogin`; a mismatch is
+  `push-account-mismatch` (allowed only when it matches exactly).
+- **`authenticated-deploy-key`** — GitHub named a deploy-key/App-
+  installation identity, shaped `owner/repo` rather than a personal
+  username. This can never be soundly compared to a personal
+  `expectedGitHubLogin`, so it's always unverifiable — never guessed at
+  either way.
+- **`permission-denied`** — SSH connected but authentication itself was
+  refused; no identity was ever established.
+- **`host-key-unverified`** — see above.
+- **`timeout`** — the connection didn't complete within
+  `REPO_IDENTITY_GUARD_SHIELD_SSH_TIMEOUT` (default 5 seconds).
+- **`identities-not-isolated`** — see `IdentitiesOnly` above.
+- **`malformed`** — output that doesn't match any recognized GitHub
+  response shape. Never pattern-matched loosely to force a verdict either
+  way; preserved verbatim for a human to look at, not parsed further.
+
+### The exact bounds `verify_github_account` honors
+
+Matching the task's own constraints, byte for byte:
+
+- Only ever invoked for an SSH-protocol push.
+- Only ever invoked when explicitly required by a strict Shield profile
+  with `expectedGitHubLogin` set — never unconditionally, never for a
+  relaxed profile.
+- Never reads private key contents, and never opens any file under
+  `~/.ssh` at all.
+- Never copies, moves, or generates a key.
+- Never modifies `~/.ssh/config`, `known_hosts`, or any other SSH
+  configuration.
+- Never starts, queries, or otherwise touches `ssh-agent` state.
+- Never stores a password or passphrase anywhere.
+- The only network activity is the ordinary SSH connection
+  (`ssh -G`, then `ssh -T`) the push itself would use anyway, to ask
+  GitHub who it authenticated — nothing is sent anywhere else.
+
+### The override rule still holds: verify once, push through the same route
+
+Account verification is only meaningful if the actual `git push` that
+follows uses the exact same SSH behavior that was verified. This is
+already enforced structurally, not by extra bookkeeping:
+`verify_github_account` is only ever reached from inside
+`evaluate_push` after `SSH_OVERRIDES` has already been checked for
+`GIT_SSH`/`GIT_SSH_COMMAND`/`core.sshCommand` (including a
+command-scoped `-c core.sshCommand=...`) — any of those present already
+produces `push-route-override` and short-circuits before account
+verification is ever attempted. Shield never verifies one SSH command
+and then lets Git push using a different one; it makes that structurally
+impossible rather than merely likely.
+
+### Empirical findings from this phase
+
+- **Real captured GitHub SSH response shapes were used to build the
+  parser** (`Hi <user>! You've successfully authenticated, but GitHub
+  does not provide shell access.`, `Permission denied (publickey).`, the
+  `StrictHostKeyChecking=yes` host-key-refusal message, `ssh`'s own
+  `Connection timed out` phrasing) — every shape has a dedicated unit
+  test in `src/test/githubSshVerification.test.ts`, none of which spawns
+  `ssh` or touches a network.
+- **A deploy-key/App-installation identity is genuinely a different data
+  shape than a personal login**, not just an edge case to reject —
+  GitHub literally names it `owner/repo` in the same response format a
+  personal account uses. Comparing it against `expectedGitHubLogin` with
+  ordinary string equality would occasionally produce a false negative
+  that looks like a real mismatch instead of the "this can't be checked
+  at all" verdict it actually is — hence its own `authenticated-
+  deploy-key` outcome, never folded into `authenticated-user`.
+- **CI tests mock the network entirely**, extending Phase 4's PATH-
+  shadowed fake `ssh` technique: the same fake binary now also answers
+  `ssh -G <alias>` and `ssh -T ... <user>@<alias>` with a response
+  scripted per test via environment variables
+  (`src/test/shieldGitHubAccountBinding.test.ts`), so the full real hook
+  → real evaluator → real `ssh -G`/`ssh -T` → real (bare-repo) `git push`
+  path is exercised end-to-end without ever contacting real GitHub.
+
+### Limitations (documented, not hidden)
+
+- **HTTPS remains entirely unverified** under strict account enforcement
+  in this phase, regardless of `expectedGitHubLogin` — solving HTTPS
+  credential-helper/token identity is explicitly out of scope here (see
+  "What's next" below).
+- **A shadowed `ssh` executable on `PATH`** is still invisible to Shield
+  (carried forward from Phase 4, unchanged) — and now, additionally, one
+  could in principle answer `ssh -G`/`ssh -T` with fabricated output
+  convincing enough to pass verification. This is the same class of
+  limitation as Phase 4's, not a new one Phase 5 introduces: anything
+  that can shadow `ssh` on `PATH` already has equivalent control over the
+  push itself.
+- **Network latency/flakiness is a real, expected failure mode.** A
+  strict profile with `expectedGitHubLogin` set means every push pays
+  for a live SSH round-trip; a slow or unreachable network produces
+  `timeout`/unverified, blocking legitimate pushes exactly as
+  designed — this is a deliberate trade-off of this feature, not a bug.
+- **No manual/on-demand "verify now" command yet.** The task allows
+  account verification to run "when explicitly requested" as well as
+  "when required by strict Shield"; only the latter is wired up in this
+  phase (automatically, at push-hook time). A user-facing command to run
+  the same check on demand — useful for diagnosing a `degraded`/blocked
+  setup without attempting a real push — is left for a future phase.
+- **No in-repo caching of a verification result.** Every strict push with
+  `expectedGitHubLogin` set re-verifies from scratch — deliberately, per
+  "decisions are never cached" (see above), but it does mean the network
+  cost is paid every time, not amortized.
+
+### What's next (not this phase)
+
+- A manual/on-demand "Verify GitHub Account" command, independent of a
+  real push.
+- HTTPS account verification (e.g. via a credential helper or `gh api
+  user`) — a different, larger problem deliberately deferred.
+- Per-ref push inspection (force-push detection, etc.).
+- The `profile-unresolved`/`profile-conflict`/`push-route-mismatch` gaps.
+- A Settings/sidebar Shield toggle and status surface — still
+  command-palette-only.
+- Coexisting with a pre-existing third-party hook manager, for both hooks.

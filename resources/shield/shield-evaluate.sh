@@ -1,6 +1,6 @@
 #!/bin/sh
 # shield-evaluate.sh — Shield Mode's standalone enforcement evaluator.
-# repo-identity-guard-shield-artifact v1 (evaluator)
+# repo-identity-guard-shield-artifact v2 (evaluator)
 #
 # This is the actual runtime artifact a future Git hook (pre-commit /
 # pre-push) invokes. It has NO dependency on Node, VS Code, or any running
@@ -18,7 +18,12 @@
 # (stdout is reserved for a future machine-readable mode; nothing writes
 # there today). This script never installs itself, never mutates Git
 # config, and never touches anything outside read-only `git` plumbing
-# commands and its own policy file.
+# commands, its own policy file, and -- as of Phase 5, and only under the
+# narrow conditions `verify_github_account` documents -- the single
+# ordinary SSH connection ("ssh -G", then "ssh -T") the push itself would
+# use anyway, to ask GitHub who it authenticated. No key material is ever
+# read, no SSH config is ever written, and no other network call is ever
+# made.
 #
 # This script's semantics are intentionally mirrored 1:1 by the pure
 # TypeScript reference implementation in src/shield/evaluator.ts — that
@@ -248,6 +253,96 @@ Found: $WHO"
   # operation) are deliberately never checked here — must never block.
 }
 
+# ==================== push: GitHub SSH account verification (Phase 5) ====================
+#
+# Goes beyond "this route is a trusted alias" (route trust, Phase 0-4) to
+# "this route currently authenticates to the specific GitHub login this
+# profile expects" -- but ONLY when the policy actually asked for it
+# (expectedGitHubLogin set) and the route already resolved to a trusted
+# SSH alias with no overrides; an untrusted/unverified/overridden route
+# already has its own blocking reason above, and this function is never
+# reached for those. Only for SSH. Never reads private key contents,
+# copies keys, edits SSH config, touches ssh-agent, or stores a
+# password/passphrase. The only network activity here is the ordinary SSH
+# connection this push would use anyway.
+verify_github_account() {
+  ALIAS="$1"
+  SSH_USER_LOCAL="$2"
+  EXPECTED="$3"
+
+  # A route can only be strongly bound to one account if ssh-agent can't
+  # silently substitute a different key -- IdentitiesOnly must be in
+  # effect for this alias. Local config inspection only, no network call.
+  CONFIG_OUTPUT=$(ssh -G "$ALIAS" 2>/dev/null) || CONFIG_OUTPUT=""
+  if ! printf '%s\n' "$CONFIG_OUTPUT" | tr '[:upper:]' '[:lower:]' | grep -qx 'identitiesonly yes'; then
+    add_reason push-account-unverified "Profile: $PROFILE_LABEL
+Expected GitHub account: $EXPECTED
+Reason: This SSH route's effective configuration does not set \"IdentitiesOnly yes\", so ssh-agent could offer a different, unrelated key than the one this route is meant to use -- the route cannot be strongly bound to an expected account without it."
+    return
+  fi
+
+  # GitHub's SSH endpoint replies to a noninteractive self-test even
+  # though it commonly exits 1 on FULLY SUCCESSFUL authentication (it has
+  # no shell to hand back) -- so the exit code below is deliberately never
+  # consulted, only the response text is. StrictHostKeyChecking=yes means
+  # an unknown/changed host key fails the connection rather than silently
+  # (or interactively) trusting it -- Shield must never auto-accept a host
+  # key on the user's behalf.
+  TIMEOUT="${REPO_IDENTITY_GUARD_SHIELD_SSH_TIMEOUT:-5}"
+  set +e
+  AUTH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout="$TIMEOUT" "${SSH_USER_LOCAL}@${ALIAS}" 2>&1)
+  set -e
+
+  case "$AUTH_OUTPUT" in
+    *"successfully authenticated"*)
+      AUTH_ID=$(printf '%s' "$AUTH_OUTPUT" | sed -nE 's/.*Hi ([^!]+)!.*successfully authenticated.*/\1/p' | head -n1)
+      case "$AUTH_ID" in
+        "")
+          add_reason push-account-unverified "Profile: $PROFILE_LABEL
+Expected GitHub account: $EXPECTED
+Reason: SSH's response while verifying the account could not be parsed."
+          ;;
+        */*)
+          # GitHub names deploy-key/App-installation identities as
+          # "owner/repo", never a personal username -- never comparable to
+          # expectedGitHubLogin, so always unverifiable, never guessed at.
+          add_reason push-account-unverified "Profile: $PROFILE_LABEL
+Expected GitHub account: $EXPECTED
+Reason: This route authenticated using a deploy-key-style identity (\"$AUTH_ID\") rather than a personal GitHub account, so it cannot be confirmed against the expected account."
+          ;;
+        *)
+          if [ "$(lower "$AUTH_ID")" != "$(lower "$EXPECTED")" ]; then
+            add_reason push-account-mismatch "Profile: $PROFILE_LABEL
+Expected GitHub account: $EXPECTED
+Authenticated GitHub account: $AUTH_ID
+Reason: The configured SSH route is authenticating as the wrong GitHub account."
+          fi
+          ;;
+      esac
+      ;;
+    *"Permission denied"*)
+      add_reason push-account-unverified "Profile: $PROFILE_LABEL
+Expected GitHub account: $EXPECTED
+Reason: SSH authentication to GitHub was refused (permission denied), so the account could not be confirmed."
+      ;;
+    *"Host key verification failed"*|*"know the"*"key fingerprint"*|*"host key is known"*)
+      add_reason push-account-unverified "Profile: $PROFILE_LABEL
+Expected GitHub account: $EXPECTED
+Reason: This SSH host's key is not already trusted in known_hosts, so Shield refused to connect automatically. Verify the host key fingerprint yourself (e.g. run \"ssh -T ${SSH_USER_LOCAL}@${ALIAS}\" once interactively) and accept it before relying on strict account verification."
+      ;;
+    *"timed out"*)
+      add_reason push-account-unverified "Profile: $PROFILE_LABEL
+Expected GitHub account: $EXPECTED
+Reason: The SSH connection timed out while verifying the account."
+      ;;
+    *)
+      add_reason push-account-unverified "Profile: $PROFILE_LABEL
+Expected GitHub account: $EXPECTED
+Reason: SSH's response while verifying the account could not be parsed."
+      ;;
+  esac
+}
+
 # ==================== push ====================
 
 evaluate_push() {
@@ -313,6 +408,12 @@ evaluate_push() {
   PARSED_REPO=$(printf '%s' "$REPO_PATH" | awk -F/ '{print $NF}' | sed -E 's/\.git$//')
   PARSED_OWNER=$(printf '%s' "$REPO_PATH" | awk -F/ '{ if (NF>=2) print $(NF-1) }')
 
+  # SSH connection user, e.g. "git" in "git@github-work:owner/repo.git" --
+  # defaults to "git" (GitHub's own convention) when the URL/alias doesn't
+  # specify one, since an SSH alias commonly sets `User git` itself.
+  SSH_USER=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^(ssh://)?([^@/:]+)@.*#\2#p')
+  [ -z "$SSH_USER" ] && SSH_USER=git
+
   # ---- destination: OWNER-based, never host-based (see evaluator.ts's
   # destinationReasons for why a host comparison would falsely flag every
   # trusted-SSH-alias push as a mismatch). Fails CLOSED: if Shield never
@@ -377,6 +478,19 @@ Reason: Push destination changed since Shield approval (this push would go to ${
   # unconditionally) always blocks regardless of strictness.
   if [ "$ROUTE_UNVERIFIED" = 1 ] && [ "$STRICT_PUSH" = "true" ]; then
     add_reason "$ROUTE_REASON_ID" "$ROUTE_MESSAGE"
+  fi
+
+  # ---- account verification (Phase 5) ----
+  # Only ever attempted when: strict, the route above is otherwise already
+  # trusted (ROUTE_UNVERIFIED=0 -- an untrusted/overridden route already
+  # has its own blocking reason and this must never duplicate or override
+  # that), and the profile actually asked for a specific account
+  # (expectedGitHubLogin set). No expectedGitHubLogin means Shield makes
+  # no claim about WHO authenticated -- route trust alone, same as
+  # Phase 0-4.
+  EXPECTED_GH_LOGIN=$(policy_scalar expectedGitHubLogin)
+  if [ "$STRICT_PUSH" = "true" ] && [ "$ROUTE_UNVERIFIED" = 0 ] && [ -n "$EXPECTED_GH_LOGIN" ]; then
+    verify_github_account "$HOST" "$SSH_USER" "$EXPECTED_GH_LOGIN"
   fi
 }
 

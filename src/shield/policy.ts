@@ -46,6 +46,18 @@ export interface ShieldPolicy {
   /** SSH host aliases this profile explicitly trusts as push routes (see Profile.trustedSshHostAliases). Never a private key or its fingerprint. */
   trustedSshHostAliases: string[];
 
+  /**
+   * The GitHub authenticated username a trusted SSH route is expected to
+   * prove itself as (Shield Mode Phase 5) — copied verbatim from
+   * `Profile.expectedGitHubLogin`. Distinct from `expectedGitEmail` (a
+   * local Git commit identity) and from `approvedPushDestination.owner`
+   * (the repository's owner/org) — see `Profile.expectedGitHubLogin`'s doc
+   * comment for why these three must never be conflated. Undefined means
+   * this profile doesn't request account-level verification; route trust
+   * alone (see `trustedSshHostAliases`) is all Shield checks in that case.
+   */
+  expectedGitHubLogin?: string;
+
   strictPushSetup: boolean;
 
   /** Local branch-protection list in effect when this policy was generated (global config, not profile-specific). */
@@ -85,6 +97,7 @@ export function buildShieldPolicy(input: ShieldPolicyInput): ShieldPolicy {
     approvedRepositoryKey: input.approvedRepositoryKey,
     approvedPushDestination: input.approvedPushDestination,
     trustedSshHostAliases: [...(profile.trustedSshHostAliases ?? [])],
+    expectedGitHubLogin: profile.expectedGitHubLogin,
     strictPushSetup: !!profile.strictPushSetup,
     protectedBranches: [...input.protectedBranches],
     expectedBranchPatterns: [...(profile.expectedBranchPatterns ?? [])],
@@ -161,6 +174,9 @@ export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResu
   if (!isStringArray(v.trustedSshHostAliases)) {
     errors.push({ path: "trustedSshHostAliases", message: "trustedSshHostAliases must be an array of strings." });
   }
+  if (v.expectedGitHubLogin !== undefined && typeof v.expectedGitHubLogin !== "string") {
+    errors.push({ path: "expectedGitHubLogin", message: "expectedGitHubLogin must be a string when present." });
+  }
   if (typeof v.strictPushSetup !== "boolean") {
     errors.push({ path: "strictPushSetup", message: "strictPushSetup must be a boolean." });
   }
@@ -204,6 +220,7 @@ export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResu
       approvedRepositoryKey: v.approvedRepositoryKey as string | undefined,
       approvedPushDestination: v.approvedPushDestination as ShieldPolicy["approvedPushDestination"],
       trustedSshHostAliases: v.trustedSshHostAliases as string[],
+      expectedGitHubLogin: v.expectedGitHubLogin as string | undefined,
       strictPushSetup: v.strictPushSetup as boolean,
       protectedBranches: v.protectedBranches as string[],
       expectedBranchPatterns: v.expectedBranchPatterns as string[],

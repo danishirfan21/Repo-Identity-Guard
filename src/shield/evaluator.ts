@@ -1,5 +1,6 @@
 import { parseRemoteUrl } from "../services/gitService";
 import { InProgressOperation } from "../types";
+import { GitHubAccountVerificationOutcome } from "./githubSshVerification";
 import { ShieldPolicy, ShieldPolicyValidationResult } from "./policy";
 import {
   ShieldAction,
@@ -213,6 +214,20 @@ export interface PushEvalFacts {
    * cached: see docs/SHIELD_MODE.md "Phase 4."
    */
   sshCommandOverrides: string[];
+
+  /**
+   * The result of Shield Mode Phase 5's live GitHub SSH account check,
+   * when one was actually run — set only when the policy has an
+   * `expectedGitHubLogin`, the profile is strict, and the route otherwise
+   * resolved to a trusted SSH alias with no overrides (any of those
+   * absent means verification was never attempted, and this is left
+   * undefined; the reasons below then treat "required but never
+   * attempted" as unverified, never as silently passing). Computed
+   * outside this pure module — see `resources/shield/shield-evaluate.sh`'s
+   * `verify_github_account`, which is what actually shells out to `ssh`
+   * at hook time; this module only decides what a given outcome means.
+   */
+  githubAccountCheck?: GitHubAccountVerificationOutcome;
 }
 
 /**
@@ -299,6 +314,71 @@ function routeReasons(
   return [{ id: "push-route-unverified", message, capability: "push_account" }];
 }
 
+/**
+ * Verified GitHub account binding (Phase 5) — goes beyond "this route is a
+ * trusted alias" to "this route currently authenticates as the specific
+ * GitHub login this profile expects." Only ever consulted when:
+ *  - the profile actually set `expectedGitHubLogin` (otherwise Shield
+ *    makes no claim about the authenticated account at all — route trust
+ *    alone, as in Phase 0-4, is what's being asked for); and
+ *  - `isTrustedRoute` is true, i.e. `routeReasons` found nothing wrong —
+ *    an untrusted/unverified/overridden route already produces its own
+ *    blocking reason, and duplicating that here would just repeat it
+ *    under a different id.
+ *
+ * `facts.githubAccountCheck` being absent here means verification was
+ * *required* (the two conditions above held) but never actually ran —
+ * this is deliberately treated the same as any other "could not confirm"
+ * outcome, never as an implicit pass. Do not invent certainty.
+ */
+function accountReasons(policy: ShieldPolicy, isTrustedRoute: boolean, facts: PushEvalFacts): ShieldReason[] {
+  if (!policy.expectedGitHubLogin || !isTrustedRoute) {
+    return [];
+  }
+
+  const header = `Profile: ${policy.profileLabel}\nExpected GitHub account: ${policy.expectedGitHubLogin}`;
+  const unverified = (reason: string): ShieldReason[] => [
+    { id: "push-account-unverified", message: `${header}\nReason: ${reason}`, capability: "push_account" },
+  ];
+
+  const check = facts.githubAccountCheck;
+  if (!check) {
+    return unverified("This push's SSH route was not checked against GitHub before pushing, so the authenticated account is unconfirmed.");
+  }
+
+  switch (check.kind) {
+    case "authenticated-user":
+      if (normalize(check.login) === normalize(policy.expectedGitHubLogin)) {
+        return [];
+      }
+      return [
+        {
+          id: "push-account-mismatch",
+          message: `${header}\nAuthenticated GitHub account: ${check.login}\nReason: The configured SSH route is authenticating as the wrong GitHub account.`,
+          capability: "push_account",
+        },
+      ];
+    case "authenticated-deploy-key":
+      return unverified(
+        `This route authenticated using a deploy-key-style identity ("${check.identity}") rather than a personal GitHub account, so it cannot be confirmed against the expected account.`,
+      );
+    case "permission-denied":
+      return unverified("SSH authentication to GitHub was refused (permission denied), so the account could not be confirmed.");
+    case "host-key-unverified":
+      return unverified(
+        "This SSH host's key is not already trusted in known_hosts, so Shield refused to connect automatically. Verify the host key fingerprint yourself (e.g. run the SSH command once interactively) and accept it before relying on strict account verification.",
+      );
+    case "timeout":
+      return unverified("The SSH connection timed out while verifying the account.");
+    case "identities-not-isolated":
+      return unverified(
+        'This SSH route\'s effective configuration does not set "IdentitiesOnly yes", so ssh-agent could offer a different, unrelated key than the one this route is meant to use — the route cannot be strongly bound to an expected account without it.',
+      );
+    case "malformed":
+      return unverified("SSH's response while verifying the account could not be parsed.");
+  }
+}
+
 export function evaluatePush(policy: ShieldPolicy, facts: PushEvalFacts, now: number = Date.now()): ShieldDecision {
   if (!policy.enabledActions.includes("push")) {
     return decisionFromReasons("push", [], now);
@@ -307,14 +387,21 @@ export function evaluatePush(policy: ShieldPolicy, facts: PushEvalFacts, now: nu
   const parsed = parseRemoteUrl(facts.remoteUrl);
   const reasons = destinationReasons(policy, parsed.owner, parsed.repo);
   const route = routeReasons(policy, parsed.protocol, parsed.host, facts.sshCommandOverrides);
+  // routeReasons returns [] in exactly one case: an ssh protocol, no
+  // overrides, host matched against a trusted alias — i.e. an empty
+  // result IS "trusted route," not merely "no complaints yet."
+  const isTrustedRoute = route.length === 0;
 
   // An unverified/untrusted route only blocks when the profile is strict —
   // same strictPushSetup semantics as Phase 0's push_account capability.
   // A destination mismatch always blocks, regardless of strictness — it
-  // isn't a judgment call the way route trust is.
+  // isn't a judgment call the way route trust is. Account verification
+  // (Phase 5) is likewise strict-only: expectedGitHubLogin never does
+  // anything under a non-strict profile.
   const blockingRoute = policy.strictPushSetup ? route : [];
+  const account = policy.strictPushSetup ? accountReasons(policy, isTrustedRoute, facts) : [];
 
-  return decisionFromReasons("push", [...reasons, ...blockingRoute], now);
+  return decisionFromReasons("push", [...reasons, ...blockingRoute, ...account], now);
 }
 
 /**

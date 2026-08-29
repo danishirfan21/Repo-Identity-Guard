@@ -64,6 +64,14 @@ export const SHIELD_REASON_CATALOG: Record<ShieldReasonId, ShieldReasonDescripto
     description: "An SSH command override (GIT_SSH, GIT_SSH_COMMAND, core.sshCommand, or a command-scoped -c override) was detected at push time, so the route this push would actually use cannot be verified against the profile's trusted SSH host aliases, even if the URL's host would otherwise be trusted.",
     capability: "push_account",
   },
+  "push-account-mismatch": {
+    description: "This push's SSH route authenticated to GitHub successfully, but as a different account than the matched profile's expectedGitHubLogin — the route is trusted, but it belongs to the wrong person.",
+    capability: "push_account",
+  },
+  "push-account-unverified": {
+    description: "The matched profile expects a specific GitHub account (expectedGitHubLogin) for this route, but Shield could not confirm it live (verification wasn't attempted, the SSH config isn't strongly bound to one identity, the host key isn't already trusted, authentication was refused, the connection timed out, or the response couldn't be parsed).",
+    capability: "push_account",
+  },
   "policy-missing": {
     description: "Shield is enabled for this repository, but no policy file could be found where one was expected.",
   },

@@ -88,6 +88,30 @@ export interface Profile {
    * this profile.
    */
   trustedSshHostAliases?: string[];
+  /**
+   * The GitHub *authenticated username* this profile's SSH route is
+   * expected to prove itself as (Shield Mode Phase 5) — e.g. `danish-work`.
+   * This is a THIRD, distinct concept from the other two identity-shaped
+   * fields on this type and must never be confused with either of them:
+   *
+   *  - `gitEmail` is the Git commit author/committer email written into
+   *    commits — purely local, never authenticated by anything.
+   *  - `expectedRemoteOwners`/`exactRepos` describe the GitHub
+   *    *repository's* owner/org — who the repo belongs to, not who is
+   *    pushing to it.
+   *  - `expectedGitHubLogin` is the GitHub *account* an SSH connection
+   *    through this profile's trusted route should authenticate as,
+   *    verified live via `ssh -T` against GitHub at push time. A repo
+   *    owned by `AcmeCorp` can still be pushed to by an account named
+   *    anything; only this field ties the push's *route* to a specific
+   *    expected GitHub login.
+   *
+   * Only meaningful under `strictPushSetup` and only ever checked for an
+   * SSH route already trusted via `trustedSshHostAliases` (see
+   * docs/SHIELD_MODE.md "Phase 5") — never for HTTPS, which stays
+   * unverified regardless of this field.
+   */
+  expectedGitHubLogin?: string;
 }
 
 export type SuggestedActionCommand =
