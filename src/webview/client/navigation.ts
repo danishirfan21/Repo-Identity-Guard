@@ -1,0 +1,207 @@
+/**
+ * Router + event wiring. Assembled last in the client script since it calls
+ * into every view module's render function and starts the app.
+ *
+ * First-run onboarding: shown whenever the current repo has no usable
+ * profile ({@link shouldShowOnboarding}, from onboardingView.ts) and the
+ * user hasn't deliberately navigated to Details/Memory/Settings — i.e. only
+ * while sitting on Main or already on Onboarding. That is the entire rule;
+ * there's no separate "have I onboarded" flag stored anywhere.
+ */
+export const NAVIGATION_JS = `
+const app = document.getElementById("app");
+const headerTitle = document.getElementById("headerTitle");
+const headerSubtitle = document.getElementById("headerSubtitle");
+const backButton = document.getElementById("backButton");
+
+let state = null;
+let view = "main";
+
+function headerFor(v) {
+  if (v === "onboarding") return ["Repo Identity Guard", "Quick setup"];
+  if (v === "main") return ["Repo Identity Guard", "Safe to work, commit, push?"];
+  if (v === "details") return ["Review Details", "Full issue list"];
+  if (v === "memory") return ["Repo Memory", "Notes and saved commands"];
+  return ["Settings", "Profiles and safety rules"];
+}
+
+function render() {
+  if (!state) { app.innerHTML = '<p class="p-1 text-[12px] text-on-surface-variant">Loading…</p>'; return; }
+
+  if ((view === "main" || view === "onboarding")) {
+    view = shouldShowOnboarding() ? "onboarding" : (view === "onboarding" ? "main" : view);
+  }
+
+  const [title, subtitle] = headerFor(view);
+  headerTitle.textContent = title;
+  headerSubtitle.textContent = subtitle;
+  backButton.classList.toggle("hidden", view === "main" || view === "onboarding");
+
+  if (view === "onboarding") app.innerHTML = renderOnboarding();
+  else if (view === "main") app.innerHTML = renderMain();
+  else if (view === "details") app.innerHTML = renderDetails();
+  else if (view === "memory") app.innerHTML = renderMemory();
+  else app.innerHTML = renderSettings();
+}
+
+function navigate(next) {
+  view = next;
+  render();
+}
+
+backButton.addEventListener("click", () => navigate("main"));
+document.addEventListener("click", (event) => {
+  const el = event.target.closest("[data-nav]");
+  if (el) { navigate(el.dataset.nav); return; }
+});
+document.getElementById("rescanButton").addEventListener("click", () => send("rescan"));
+
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+
+  const issueAction = target.closest("[data-issue-action]");
+  if (issueAction) { handleSuggestedAction(issueAction.dataset.issueAction); return; }
+
+  if (target.closest("#copyContextButton")) { send("copyContextForAI"); return; }
+  if (target.closest("#copyWorkspaceSummaryButton")) { send("copyWorkspaceSafetySummary"); return; }
+
+  const selectRepoBtn = target.closest("[data-select-repo]");
+  if (selectRepoBtn) { send("selectRepo", { id: selectRepoBtn.dataset.selectRepo }); navigate("details"); return; }
+
+  // ---- Repo Memory ----
+  if (target.closest("#addNoteButton")) { document.getElementById("newNoteText").focus(); return; }
+  if (target.closest("#addNoteSubmit")) {
+    const input = document.getElementById("newNoteText");
+    const text = input.value.trim();
+    if (text) { send("addMemoryNote", { text, pinned: false }); input.value = ""; }
+    return;
+  }
+  const pinBtn = target.closest("[data-pin-note]");
+  if (pinBtn) { send("togglePinMemoryNote", { id: pinBtn.dataset.pinNote }); return; }
+  const removeNoteBtn = target.closest("[data-remove-note]");
+  if (removeNoteBtn) { send("removeMemoryNote", { id: removeNoteBtn.dataset.removeNote }); return; }
+
+  if (target.closest("#addCommandToggle")) { document.getElementById("newCommandLabel").focus(); return; }
+  if (target.closest("#addCommandButton")) {
+    const label = document.getElementById("newCommandLabel").value.trim();
+    const command = document.getElementById("newCommandText").value.trim();
+    if (label && command) {
+      send("addSavedCommand", { label, command });
+      document.getElementById("newCommandLabel").value = "";
+      document.getElementById("newCommandText").value = "";
+    }
+    return;
+  }
+  const runBtn = target.closest("[data-run-command]");
+  if (runBtn) { send("runSavedCommand", { id: runBtn.dataset.runCommand }); return; }
+  const copyBtn = target.closest("[data-copy-command]");
+  if (copyBtn) { send("copySavedCommand", { id: copyBtn.dataset.copyCommand }); return; }
+  const removeCmdBtn = target.closest("[data-remove-command]");
+  if (removeCmdBtn) { send("removeSavedCommand", { id: removeCmdBtn.dataset.removeCommand }); return; }
+
+  // ---- Settings: profiles ----
+  const selectProfileBtn = target.closest("[data-select-profile]");
+  if (selectProfileBtn) { selectedProfileId = selectProfileBtn.dataset.selectProfile; render(); return; }
+
+  if (target.closest("#addProfileButton")) {
+    const profile = { id: "profile-" + Date.now().toString(36), label: "New Profile", gitEmail: "", expectedRemoteOwners: [], exactRepos: [], expectedBranchPatterns: [], strictPushSetup: false };
+    selectedProfileId = profile.id;
+    send("saveProfile", { profile });
+    return;
+  }
+
+  const removeChipBtn = target.closest("[data-remove-chip]");
+  if (removeChipBtn) {
+    const profile = currentProfile();
+    if (profile) removeChip(profile.id, removeChipBtn.dataset.removeChip, removeChipBtn.dataset.removeChipValue);
+    return;
+  }
+
+  if (target.closest("#detectFromRepoButton")) {
+    const profile = currentProfile();
+    const facts = state.facts || {};
+    if (profile) {
+      const container = document.querySelector('[data-profile-id="' + CSS.escape(profile.id) + '"]');
+      if (container) {
+        if (facts.effectiveGitName) container.querySelector('[data-field="gitName"]').value = facts.effectiveGitName;
+        if (facts.effectiveGitEmail) container.querySelector('[data-field="gitEmail"]').value = facts.effectiveGitEmail;
+      }
+      if (facts.remoteOwner && !(profile.expectedRemoteOwners || []).includes(facts.remoteOwner)) {
+        patchProfile(profile.id, { expectedRemoteOwners: [...(profile.expectedRemoteOwners || []), facts.remoteOwner] });
+      }
+    }
+    return;
+  }
+
+  const saveProfileBtn = target.closest("[data-save-profile]");
+  if (saveProfileBtn) {
+    const id = saveProfileBtn.dataset.saveProfile;
+    const profile = state.profiles.find((p) => p.id === id);
+    const container = document.querySelector('[data-profile-id="' + CSS.escape(id) + '"]');
+    const field = (name) => container.querySelector('[data-field="' + name + '"]');
+    send("saveProfile", {
+      profile: Object.assign({}, profile, {
+        id,
+        label: field("label").value.trim(),
+        gitName: field("gitName").value.trim(),
+        gitEmail: field("gitEmail").value.trim(),
+        strictPushSetup: field("strictPushSetup").checked,
+      }),
+    });
+    return;
+  }
+  const deleteProfileBtn = target.closest("[data-delete-profile]");
+  if (deleteProfileBtn) {
+    selectedProfileId = null;
+    send("deleteProfile", { id: deleteProfileBtn.dataset.deleteProfile });
+    return;
+  }
+
+  if (target.closest("#saveBranchesButton")) {
+    const branches = document.getElementById("protectedBranchesInput").value.split(",").map((s) => s.trim()).filter(Boolean);
+    send("saveProtectedBranches", { branches });
+    return;
+  }
+  if (target.closest("#openSettingsJsonButton")) { send("openSettingsJson"); return; }
+
+  // ---- Onboarding ----
+  const obLabelBtn = target.closest("[data-ob-label]");
+  if (obLabelBtn) { obLabel = obLabelBtn.dataset.obLabel; render(); if (obLabel === "Other") document.getElementById("obCustomLabelInput").focus(); return; }
+  if (target.closest("#obCreateButton")) { submitOnboarding(); return; }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  if (target.id === "newNoteText") { document.getElementById("addNoteSubmit").click(); return; }
+  const chipInput = target.closest("[data-add-chip]");
+  if (chipInput) {
+    const profile = currentProfile();
+    if (profile) addChipFromInput(profile.id, chipInput.dataset.addChip, chipInput);
+    event.preventDefault();
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  if (target.id === "requireLocalIdentityCheckbox") { send("saveRequireLocalIdentity", { value: target.checked }); return; }
+  if (target.id === "includeMemoryCheckbox") { send("saveIncludeMemoryInAiContext", { value: target.checked }); return; }
+  if (target.id === "obCustomLabelInput") { obCustomLabel = target.value; return; }
+  if (target.name === "obScope") { obScope = target.value; return; }
+});
+
+window.addEventListener("message", (event) => {
+  const message = event.data;
+  if (message.type === "state") {
+    const hadNoState = !state;
+    state = message.payload;
+    if (hadNoState && shouldShowOnboarding()) view = "onboarding";
+    render();
+  }
+});
+
+render();
+`;

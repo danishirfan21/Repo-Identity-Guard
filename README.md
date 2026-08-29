@@ -152,16 +152,46 @@ the selected repo while the badge itself reads Not Safe.
 
 ## Views
 
-- **Main** — compact status, matched profile, issue count, next fix, one
-  pinned memory note, and quick actions. In a multi-root workspace, also
-  shows the aggregate workspace badge and a repository list (see above).
-- **Review Details** — the full six-capability checklist in plain English
-  (why it matters, what we expected, what we found, and any agent
-  restrictions that follow from it), with raw Git facts tucked behind an
-  expandable "Technical Details" section.
+- **Main** — the SAFE / NOT SAFE / NOT CHECKED verdict is the single most
+  prominent thing on screen, followed by repository / profile / branch
+  identity, the one most important next action (with its fix as a primary
+  button), a compact six-check grid, and secondary actions (Review
+  Details, Repo Memory, Copy Context for AI). In a multi-root workspace,
+  the dominant verdict shown here is always the workspace aggregate — a
+  SAFE selected repository is never allowed to visually stand in for a
+  NOT SAFE workspace — with the repository list underneath it so the
+  unsafe repo is easy to find.
+- **Review Details** — one card per capability, always in the fixed
+  Commit Identity → Push Destination → Push Account → Branch Policy →
+  Repo State → Workspace Trust order, each with its state badge, a
+  "Blocks safety" indicator when applicable, Expected/Found, any agent
+  restrictions, a suggested action, and raw Git facts tucked behind a
+  collapsed "Technical Details" section.
 - **Repo Memory** — pinned notes, general notes, and saved commands (label +
   command + Run/Copy), stored locally and privately.
-- **Settings** — profiles, branch rules, and safety preferences.
+- **Settings** — profiles as chip-based tabs with an owners/exact-repos/
+  branch-pattern chip editor, a "Detect from current repo" prefill button,
+  branch rules, safety preferences, and the disabled Shield Mode card.
+- **First-run onboarding** — shown automatically the first time you open
+  Repo Identity Guard in a Git repository with no profiles configured yet.
+  It shows the detected repository and your current effective Git
+  identity, asks which profile (Personal/Work/Other) should use it and
+  whether to scope that profile to this repository only (`exactRepos`) or
+  every repository owned by the detected owner (`expectedRemoteOwners`),
+  then creates the profile and rescans. There's no separate "have I
+  onboarded" flag — it's shown whenever there are zero usable profiles and
+  hidden the moment one exists.
+
+### Theme support
+
+The sidebar has no hardcoded colors. Every visual token it uses (surfaces,
+borders, text, primary/error/warning accents) is a CSS custom property
+derived from VS Code's own semantic theme variables (`--vscode-foreground`,
+`--vscode-sideBar-background`, `--vscode-panel-border`,
+`--vscode-button-background`, `--vscode-focusBorder`,
+`--vscode-errorForeground`, `--vscode-editorWarning-foreground`, etc. — see
+`src/webview/sidebar.css`), so it repaints correctly for dark, light, and
+high-contrast themes with no separate light/dark CSS branches.
 
 ## Safe by design
 

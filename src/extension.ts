@@ -62,6 +62,7 @@ export function activate(context: vscode.ExtensionContext): void {
     profiles: getProfiles(),
     protectedBranches: getProtectedBranches(),
     preferences: getSafetyPreferences(),
+    isWorkspaceTrusted: vscode.workspace.isTrusted,
   });
 
   const sidebarProvider = new RepoIdentitySidebarProvider(context.extensionUri, {

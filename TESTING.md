@@ -206,6 +206,25 @@ CI (`.github/workflows/ci.yml`) runs `npm ci`, `npm run compile`, and
 `npm test` on every PR and push to `main` — the automated result is
 independently enforced on GitHub, not only self-reported.
 
+## First-run onboarding
+
+| Scenario | Setup | Expected |
+| --- | --- | --- |
+| No profiles, Git repo open | Remove all entries from `repoIdentityGuard.profiles`, open a folder that is a Git repo. | Onboarding view appears automatically instead of Main: repository found (canonical `host/owner/repo`, when a remote exists), current effective Git identity, profile-name choice (Personal/Work/Other), and scope choice (this repository only / repositories owned by `<owner>`). |
+| No profiles, no remote configured | Same as above, but the repo has no `origin` remote. | Onboarding still appears; "Repository Found" explains there's no remote to detect, and "this repository only" scope is disabled since there's no canonical repo key to pin to yet. |
+| No profiles, not a Git repo | Open a plain folder with no `.git`. | Onboarding does **not** appear — Main shows the ordinary NOT CHECKED state instead. |
+| Create Profile & Check Repository | From onboarding, pick a profile name and scope, click the CTA. | A profile is saved via the same configuration path Settings uses (`repoIdentityGuard.profiles`), the repo rescans, and the view transitions immediately to the real Main view (SAFE/NOT SAFE per the new profile match). |
+| Profiles already exist | Add at least one profile, reopen the sidebar. | Onboarding never appears — Main renders directly, even for a brand-new repo that doesn't match any profile yet (that repo instead shows "Repo profile is unknown" in the ordinary NOT SAFE flow). |
+
+## Theme support
+
+| Scenario | Setup | Expected |
+| --- | --- | --- |
+| Dark theme | Use a built-in dark theme (e.g. Dark+). | Sidebar matches the editor's dark palette; no washed-out or mismatched colors. |
+| Light theme | Switch to a built-in light theme (e.g. Light+). | Sidebar repaints to light colors automatically — text stays legible, borders and status colors remain visible. No separate configuration needed. |
+| High contrast | Switch to a high-contrast theme. | Borders and focus outlines remain visible; badges and the verdict banner stay legible. |
+| Narrow widths | Resize the sidebar to roughly 240px, 280px, 320px, and 360px. | No horizontal scrollbar/overflow at any width; the verdict, next action, and primary buttons stay usable; long repo/profile/branch names truncate rather than overflow; secondary text wraps instead of clipping illegibly. |
+
 ## Extension Host / manual beta matrix
 
 The automated suite only covers pure logic (`core/`, most of `services/`)

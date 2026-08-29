@@ -2,43 +2,83 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Semantic color scale for the sidebar, derived entirely from VS Code's own
+ * theme variables (--vscode-*), never a fixed hex value. Because these are
+ * plain CSS custom properties (not a light/dark media query), the sidebar
+ * repaints automatically whenever the editor's active color theme changes —
+ * dark, light, or high-contrast — with no JS or duplicate rule sets needed.
+ * See README.md "Theme support".
+ */
 @layer base {
   :root {
-    --vscode-sideBar-background: #181818;
-    --vscode-foreground: #cccccc;
-    --vscode-panel-border: #2b2b2b;
-    --vscode-focusBorder: #007fd4;
-    --vscode-list-hoverBackground: #2a2d2e;
-    --vscode-input-background: #3c3c3c;
-    --vscode-button-background: #007acc;
-    --vscode-button-foreground: #ffffff;
-    --vscode-button-hoverBackground: #0062a3;
-    --vscode-button-secondaryBackground: #37373d;
-    --vscode-button-secondaryForeground: #cccccc;
-    --vscode-warningForeground: #cca700;
-    --vscode-errorForeground: #f14c4c;
+    --rig-bg: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    --rig-surface: var(--vscode-sideBar-background, var(--vscode-editor-background));
+    --rig-surface-container: var(--vscode-editorWidget-background, var(--rig-surface));
+    --rig-surface-container-low: var(--rig-surface);
+    --rig-surface-container-lowest: var(--vscode-input-background, var(--rig-surface));
+    --rig-surface-container-high: var(--vscode-list-hoverBackground, var(--rig-surface));
+    --rig-surface-container-highest: var(--vscode-list-activeSelectionBackground, var(--rig-surface-container-high));
+
+    --rig-fg: var(--vscode-foreground);
+    --rig-fg-muted: var(--vscode-descriptionForeground, var(--rig-fg));
+
+    --rig-border: var(--vscode-panel-border, var(--vscode-widget-border));
+    --rig-border-strong: var(--vscode-focusBorder);
+
+    --rig-primary: var(--vscode-textLink-foreground, var(--vscode-button-background));
+    --rig-primary-container: color-mix(in srgb, var(--rig-primary) 16%, var(--rig-surface));
+
+    --rig-button-bg: var(--vscode-button-background);
+    --rig-button-fg: var(--vscode-button-foreground);
+    --rig-button-hover: var(--vscode-button-hoverBackground);
+    --rig-button-secondary-bg: var(--vscode-button-secondaryBackground, var(--rig-surface-container-high));
+    --rig-button-secondary-fg: var(--vscode-button-secondaryForeground, var(--rig-fg));
+    --rig-button-secondary-hover: var(--vscode-button-secondaryHoverBackground, var(--rig-button-hover));
+
+    --rig-input-bg: var(--vscode-input-background);
+    --rig-input-fg: var(--vscode-input-foreground);
+    --rig-input-border: var(--vscode-input-border, var(--rig-border));
+
+    --rig-error: var(--vscode-errorForeground, #f14c4c);
+    --rig-error-bg: color-mix(in srgb, var(--rig-error) 14%, var(--rig-surface));
+
+    --rig-warning: var(--vscode-editorWarning-foreground, #cca700);
+    --rig-warning-bg: color-mix(in srgb, var(--rig-warning) 14%, var(--rig-surface));
+
+    --rig-success: var(--vscode-terminal-ansiGreen, #3fb950);
+    --rig-success-bg: color-mix(in srgb, var(--rig-success) 14%, var(--rig-surface));
+
+    --rig-chip-bg: var(--rig-surface-container-high);
   }
 
   body {
     min-height: 100dvh;
-    background-color: var(--vscode-sideBar-background);
-    color: var(--vscode-foreground);
-    font-family:
-      var(--vscode-font-family), -apple-system, BlinkMacSystemFont, "Segoe UI",
-      sans-serif;
+    background-color: var(--rig-bg);
+    color: var(--rig-fg);
+    font-family: var(--vscode-font-family), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     margin: 0;
     padding: 0;
     overflow-x: hidden;
     user-select: none;
   }
 
-  button {
+  button,
+  input {
     font: inherit;
+    color: inherit;
   }
 
-  button:focus-visible {
-    outline: 1px solid var(--vscode-focusBorder);
-    outline-offset: 2px;
+  button:focus-visible,
+  input:focus-visible,
+  [tabindex]:focus-visible {
+    outline: 1px solid var(--rig-border-strong);
+    outline-offset: 1px;
+  }
+
+  input[type="text"],
+  input[type="checkbox"] {
+    accent-color: var(--rig-primary);
   }
 
   .custom-scrollbar::-webkit-scrollbar {
@@ -46,34 +86,110 @@
   }
 
   .custom-scrollbar::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
+    background: color-mix(in srgb, var(--rig-fg) 12%, transparent);
   }
 
   .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.2);
+    background: color-mix(in srgb, var(--rig-fg) 22%, transparent);
   }
 }
 
 @layer components {
+  /* Base bordered surface used by every card-like block. */
   .vs-card {
-    background-color: var(--vscode-sideBar-background);
-    border: 1px solid var(--vscode-panel-border);
+    background-color: var(--rig-surface-container-low);
+    border: 1px solid var(--rig-border);
   }
 
-  .vs-button-secondary {
-    background-color: var(--vscode-button-secondaryBackground);
-    color: var(--vscode-button-secondaryForeground);
+  .vs-button-primary {
+    background-color: var(--rig-button-bg);
+    color: var(--rig-button-fg);
     border: 1px solid transparent;
   }
 
-  .vs-button-secondary:hover {
-    background-color: var(--vscode-button-hoverBackground);
-    color: var(--vscode-button-foreground);
+  .vs-button-primary:hover {
+    background-color: var(--rig-button-hover);
   }
 
-  .material-symbols-outlined {
-    font-size: 18px;
-    vertical-align: middle;
-    font-family: inherit;
+  .vs-button-secondary {
+    background-color: transparent;
+    color: var(--rig-fg);
+    border: 1px solid var(--rig-border);
+  }
+
+  .vs-button-secondary:hover {
+    background-color: var(--rig-surface-container-high);
+    border-color: var(--rig-primary);
+    color: var(--rig-primary);
+  }
+
+  .vs-input {
+    background-color: var(--rig-input-bg);
+    color: var(--rig-input-fg);
+    border: 1px solid var(--rig-input-border);
+  }
+
+  .vs-input:focus {
+    outline: none;
+    border-color: var(--rig-border-strong);
+  }
+
+  .vs-chip {
+    background-color: var(--rig-chip-bg);
+    border: 1px solid var(--rig-border);
+    color: var(--rig-fg);
+  }
+
+  .vs-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .vs-icon svg {
+    width: 1em;
+    height: 1em;
+  }
+
+  /* Status badges (Confirmed / Contradicted / Unverified / Warning / N/A) */
+  .badge-confirmed {
+    background-color: var(--rig-success-bg);
+    color: var(--rig-success);
+    border: 1px solid color-mix(in srgb, var(--rig-success) 40%, transparent);
+  }
+
+  .badge-contradicted {
+    background-color: var(--rig-error-bg);
+    color: var(--rig-error);
+    border: 1px solid color-mix(in srgb, var(--rig-error) 40%, transparent);
+  }
+
+  .badge-warning,
+  .badge-unverified {
+    background-color: var(--rig-warning-bg);
+    color: var(--rig-warning);
+    border: 1px solid color-mix(in srgb, var(--rig-warning) 40%, transparent);
+  }
+
+  .badge-not_applicable {
+    background-color: var(--rig-surface-container-high);
+    color: var(--rig-fg-muted);
+    border: 1px solid var(--rig-border);
+  }
+
+  .verdict-safe {
+    background-color: var(--rig-success-bg);
+    border: 1px solid color-mix(in srgb, var(--rig-success) 35%, transparent);
+  }
+
+  .verdict-not_safe {
+    background-color: var(--rig-error-bg);
+    border: 1px solid color-mix(in srgb, var(--rig-error) 35%, transparent);
+  }
+
+  .verdict-not_checked {
+    background-color: var(--rig-surface-container-low);
+    border: 1px solid var(--rig-border);
   }
 }
