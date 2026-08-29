@@ -2,6 +2,100 @@
 
 ## Unreleased
 
+### Fixed — Shield pre-manual-test hardening (Phase 9)
+
+Every item below was reproduced empirically before being fixed, and each
+has a regression test that fails against the previous behavior. Six of
+them were found by new differential/fuzz harnesses that run the shipped
+POSIX-shell evaluator and the TypeScript reference implementation against
+the same generated cases and require them to agree.
+
+- **Installing Shield without being able to record where is now refused.**
+  With Shield's installation record un-writable, `enable()` installed all
+  three fail-closed hook shims, reported ACTIVE, and left nothing naming
+  the directory those hooks live in. Move `core.hooksPath` afterwards and
+  Disable Shield could no longer reach them; move it back and they were
+  live again with no evaluator beside them — blocking every commit and
+  push with no Shield left to repair or disable. Enable/repair are now a
+  transaction (prepare → persist lifecycle metadata → install → verify →
+  commit): the record is written first as a superset, a failure to persist
+  it aborts before anything is installed or moved, and every artifact
+  write rolls back in reverse order on a later failure.
+
+- **Shield no longer reports ACTIVE when its installation record is
+  corrupt or missing.** A corrupt record reads as *absent* by design, and
+  absent meant "nowhere else to look" — so the one state the record exists
+  to prevent, live hooks nothing is tracking, was the one state Shield
+  could not report. Now DEGRADED, with enforcement still running, cleared
+  by Repair Shield.
+
+- **The policy parser accepted two classes of corrupt policy that the
+  extension rejects — and both failed OPEN.** Raw control characters
+  (U+0001–U+001F, DEL) inside a JSON string were accepted, and
+  `enabledActions` was never checked against the known action set, so a
+  policy naming an action this build cannot enforce (e.g. from a newer
+  version) was honoured as if it named only the ones it knows. Both are
+  now `policy-corrupt`, which fails closed.
+
+- **The remote-URL parser accepted two hostless/scheme-less shapes and
+  approved the wrong destination.** `:owner/repo.git` and
+  `://github.com/owner/repo.git` both parsed to a real owner and repo in
+  the shell evaluator — and so satisfied an approved push destination —
+  while the extension parses both as unparseable and blocks. Host
+  matching and scheme detection now mirror the TypeScript parser exactly.
+
+- **A remote URL written in upper case blocked a legitimate push.** The
+  `.git` suffix was stripped case-sensitively in the evaluator and
+  case-insensitively in the extension, so `git@GITHUB.COM:ACME/REPO.GIT`
+  read as repository `REPO.GIT` and Shield reported the destination had
+  "changed since Shield approval".
+
+- **A stray space in a profile's expected Git name blocked every commit.**
+  The evaluator compared identities without trimming whitespace while the
+  extension trimmed, producing a baffling `Expected:   Danish Irfan /
+  Found: Danish Irfan`.
+
+- **A diverging SSH transport is now detected.** `ssh.variant` /
+  `GIT_SSH_VARIANT` change how Git drives the SSH program even with no
+  `GIT_SSH`/`GIT_SSH_COMMAND`/`core.sshCommand` override, so a push could
+  travel a PuTTY/plink-style transport while Shield's verification probe
+  used OpenSSH syntax. A non-OpenSSH effective variant now makes the route
+  unverifiable, exactly like a command override. `auto` and `ssh` are not
+  overrides, so ordinary setups are unaffected.
+
+- **Two filesystem robustness bugs.** A plain file occupying a path
+  component made `inspect()` throw ENOTDIR straight out of `enable()`, so
+  such a repository could not even be diagnosed; and a failed atomic write
+  left its temp file stranded where `disable()`'s deliberately non-forcing
+  cleanup could never remove it.
+
+### Changed — Shield is no longer described as unbuilt
+
+- Removed the static "Shield Mode is not built yet — nothing is enforcing
+  this automatically" safety note. It was shown in **every** repository,
+  including ones where Shield was installed and actively blocking pushes.
+  The safety engine now makes no claim about Shield at all; Shield's real,
+  per-repository state comes from Check Shield Health.
+- Replaced the disabled "Coming soon" Settings panel with plain copy
+  pointing at the Command Palette commands. No dashboard was built.
+- README, TESTING.md and docs/SHIELD_MODE.md updated; the phase-by-phase
+  history in docs/SHIELD_MODE.md is retained but explicitly labelled as
+  superseded, under a new CURRENT STATUS header.
+- The documented threat boundary is unchanged and now enforced by a test:
+  `--no-verify`, a deliberate `core.hooksPath` override, and arbitrary
+  local shell access all bypass Shield, and nothing in the product claims
+  otherwise.
+
+### Added
+
+- `expectedGitHubLogin` is now documented in the settings schema and
+  editable in the Settings profile editor, instead of requiring a
+  hand-edited `settings.json`. Its copy spells out that it is not the
+  commit email, not the repository owner/org, and not the SSH host alias.
+- `exactRepos` is now documented in the settings schema.
+- ShellCheck (POSIX `sh` mode) runs in CI and over every generated hook in
+  the test suite.
+
 ### Fixed — Shield core correctness hardening
 
 Every item below was reproduced against a real repository before being

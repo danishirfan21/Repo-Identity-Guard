@@ -280,7 +280,7 @@ async function pushWithFakeSsh(scenario: Scenario, extraEnv: NodeJS.ProcessEnv):
 // ubuntu-latest/macos-latest.
 const SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS =
   process.platform === "win32"
-    ? "Git for Windows does not resolve ssh via PATH search -- this suite's PATH-shadow fake-ssh technique cannot intercept it here. Covered on ubuntu-latest/macos-latest."
+    ? "Git for Windows does not resolve ssh via PATH search -- this suite's PATH-shadow fake-ssh technique cannot intercept GIT'S OWN TRANSPORT here, so a real DNS/auth failure surfaces before Shield's pre-push hook runs. Only the 'and the real push then did/didn't move the remote ref' half is lost: Phase 9 moved the whole account-verification DECISION matrix onto every platform in shieldAccountVerificationCrossPlatform.test.ts, which drives the evaluator directly under `sh` (whose ssh lookup DOES use PATH, including Git for Windows' bundled sh). Covered on ubuntu-latest/macos-latest."
     : false;
 
 // ==================== verified account matches ====================
