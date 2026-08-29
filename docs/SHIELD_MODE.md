@@ -424,17 +424,252 @@ reading and writing the policy file, and actually installing hooks into
 | A process editing or deleting the policy file or hook scripts directly | **No** | Filesystem write access to `.git/` is filesystem write access; Shield cannot defend against a process that already has it. |
 | A push made via the GitHub API or a Git implementation that skips local hooks | **No** | Local hooks only run for local Git operations; this is a structural limitation of the mechanism, not a bug. |
 
-## What's next (not this phase)
+## Phase 2: the standalone evaluator
 
-- Actually reading/writing the policy file (`fs` I/O layered on top of
-  `src/shield/storage.ts`'s pure paths).
-- An evaluator that turns current `RepoFacts` + a loaded `ShieldPolicy`
-  into a `ShieldDecision`, reusing the same underlying checks as
-  `statusEngine.ts` wherever the logic is identical, rather than
-  duplicating it.
+**Status: implemented, not yet wired to a Git hook.** This phase builds the
+thing a future hook will invoke — the actual decision logic — without
+installing anything into `<git-common-dir>/hooks/` and without any Shield
+UI. Settings still shows "Coming Soon."
+
+### Evaluator runtime decision
+
+**The evaluator's shipped runtime is a POSIX shell script,
+`resources/shield/shield-evaluate.sh`, using only `git` plus the shell
+utilities that ship alongside `git` on every platform it runs on (`sh`,
+`awk`, `sed`, `grep`, `tr`).** No Node, no Python, no `jq`, no `gh`.
+
+This isn't a default — it follows from the hard requirement that **Shield
+enforcement must work when VS Code is completely closed**, and from being
+told explicitly not to assume `node`/`python`/`jq`/`gh` on `PATH`:
+
+- **Linux / macOS**: `/bin/sh` is part of the base OS; Git itself already
+  requires a POSIX shell to run its own plumbing (`git-sh-setup`, various
+  bundled scripts), so a hook written in POSIX `sh` needs nothing beyond
+  what a working `git` install already implies.
+- **Windows, via Git for Windows**: Git for Windows always executes hook
+  scripts through the POSIX shell interpreter it bundles with its own
+  installer (the MSYS2-based `sh.exe`/`bash.exe` that also ships `awk`,
+  `sed`, and `grep`) — **not** `cmd.exe` or PowerShell, and regardless of
+  what shell the user's own terminal happens to be. This is how every
+  other shell-based Git hook (Husky, `pre-commit`, Lefthook, and Git's own
+  sample hooks, which ship with a `#!/bin/sh` shebang) already works
+  cross-platform without asking a Windows user to install anything extra.
+  A hook that shells out to `resources/shield/shield-evaluate.sh` therefore
+  runs on Windows the same way it runs everywhere else, using tooling Git
+  for Windows already installed for its own use.
+
+**Why not a self-contained helper binary (compiled Go/Rust, or a bundled
+Node runtime)?** It would solve a problem this project doesn't have. The
+three platforms above already guarantee a POSIX shell is available
+wherever `git` itself is; a compiled binary would mean maintaining
+per-platform (and per-architecture) build artifacts, code-signing concerns
+on macOS/Windows, and a meaningfully larger `.vsix` — real, ongoing packaging
+and release cost — to duplicate functionality `sh` already provides for
+free. The instruction "do not introduce a runtime dependency merely because
+development happens to use Node" cuts the same way against a bundled Node
+binary: this codebase being TypeScript doesn't make Node the right choice
+for an artifact whose entire job is to run when the TypeScript extension
+that built it may not even be installed. If a future requirement genuinely
+needs POSIX shell can't provide (real JSON schema validation, complex
+per-ref push inspection at scale), that would be the moment to revisit this
+decision — not preemptively now.
+
+**A known, deliberate trade-off**: the shell script does lightweight
+field-presence/version checks on the policy file (`policyVersion` must be
+exactly `1`; `expectedGitEmail` must be present), not the full structural
+JSON validation `validateShieldPolicy()` performs in TypeScript. Writing a
+general-purpose JSON parser in portable POSIX shell is not a reasonable
+scope for a hook script, and the policy file is always machine-generated
+by `serializeShieldPolicy` (a stable, predictable `JSON.stringify(...,
+null, 2)` layout — one scalar field per line, one array element per line)
+that the shell script's `awk`-based line scanner is written against. A
+hand-edited or otherwise unusually-shaped JSON file could in principle
+slip past this lighter check; this is documented, not hidden.
+
+### Interface
+
+```
+shield-evaluate.sh commit
+shield-evaluate.sh push <remote-name> <remote-url>   [ref lines on stdin]
+```
+
+- **Exit 0** → allow the Git action. **Exit non-zero** → block it. This is
+  the entire contract — nothing else about the process's behavior is part
+  of the interface.
+- A concise, human-readable reason is always written to **stderr**,
+  prefixed with the stable machine-readable reason id(s) in brackets
+  (e.g. `[protected-branch]`), never to stdout.
+- The push interface matches Git's real `pre-push` hook contract exactly
+  (`<remote-name>` and `<remote-url>` as argv, ref update lines on stdin)
+  so wiring an actual hook in a later phase is a drop-in, not a redesign.
+  Per-ref stdin inspection is accepted (drained, not left hanging) but not
+  yet acted on in this phase — see "Push evaluation" below.
+
+A pure TypeScript reference implementation of the same decision semantics
+lives in `src/shield/evaluator.ts` (`evaluateCommit`, `evaluatePush`,
+`evaluateFromPolicyLoad`). It is **not** what ships or runs at hook time —
+its purpose is fast, exhaustive unit testing of the decision logic and a
+single readable source of truth that the shell script is written against.
+`src/test/shieldEvaluatorScript.test.ts` runs the *actual* shell script
+against real temporary repositories and, for several scenarios, cross-checks
+its verdict against the TypeScript evaluator fed equivalent facts, so the
+two can't silently drift apart.
+
+Both deliberately **do not call `computeStatus`**. That function mixes in
+VS Code-specific concepts (Workspace Trust) that must never gate a
+standalone hook decision, and it predicts a plain push from
+`RepoFacts.pushRemoteUrl` computed by an earlier scan rather than
+evaluating the actual remote/URL a real `pre-push` invocation provides.
+Both problems would defeat the point of a standalone, action-time
+evaluator. Where the underlying *rule* is identical to something
+`statusEngine.ts`/`capabilityFactory.ts` already implements (generic SSH
+hosts, wildcard-free trusted-alias matching, protected-branch exact
+matching), the evaluator mirrors that rule faithfully — reusing
+`parseRemoteUrl` directly in the TypeScript evaluator, and reimplementing
+the same rule by hand in the shell script, since shell can't import a
+TypeScript module — rather than reinventing new semantics.
+
+### Commit evaluation: facts re-read at action time
+
+Every fact below is re-read fresh by the evaluator itself, in the Git
+action's own process/environment, at the moment of the action — never a
+value cached from an earlier VS Code sidebar scan:
+
+- effective author identity (`git var GIT_AUTHOR_IDENT`)
+- effective committer identity (`git var GIT_COMMITTER_IDENT`)
+- configured identity, `--worktree` ?? `--local` ?? `--global` (same
+  precedence `RepoFacts` collection uses)
+- current branch / detached HEAD (`git symbolic-ref -q --short HEAD`)
+- in-progress merge/rebase/cherry-pick/revert (markers under the
+  **current worktree's own** `--git-dir`, not the shared common dir —
+  operation state is per-worktree, unlike the policy itself)
+- unresolved merge conflicts (`git status --porcelain=v2`, `u` entries)
+
+Because the evaluator runs *inside* the Git action's own invocation
+(rather than being told about the environment secondhand by an extension
+host), any `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/etc. environment
+override or `-c user.email=...` passed on that exact command line is
+already reflected in `git var`'s output — there's no separate step needed
+to "detect" it.
+
+**Commit blocks when:**
+
+| Condition | Reason id |
+| --- | --- |
+| No policy file found | `policy-missing` |
+| Policy file present but invalid/wrong version | `policy-corrupt` |
+| Git state couldn't be read | `inspection-failed` |
+| Effective identity wrong AND configured identity also wrong | `commit-identity-mismatch` |
+| Effective identity wrong but configured identity is correct (environment/command-line override) | `commit-identity-override` |
+| HEAD is detached | `detached-head` |
+| Current branch is in `protectedBranches` | `protected-branch` |
+| A merge/rebase/cherry-pick/revert is in progress | `repo-operation-in-progress` |
+| Unresolved merge conflicts exist | `merge-conflicts` |
+
+**Commit does NOT block on:**
+
+- **Ordinary dirty working-tree state alone** (staged/unstaged/untracked
+  changes, no conflicts, no in-progress operation) — this is normal
+  mid-development state, exactly as `repoOperationDirtyResult` treats it
+  as a non-blocking warning in the main engine.
+- **Branch-pattern mismatch** (`expectedBranchPatterns`) — this is a
+  non-blocking warning in the main engine
+  (`branchPolicyPatternMismatchResult`), and this phase does not silently
+  upgrade it into a hard Shield block. If a future phase wants Shield to
+  treat pattern mismatches as blocking, that must be an explicit,
+  documented architecture change with its own tests — not an incidental
+  side effect of the evaluator's implementation.
+
+**Not re-derived at hook time**: `profile-unresolved` and `profile-conflict`
+exist as reason ids (Phase 1) but are not produced by this phase's
+evaluator. A valid `ShieldPolicy` can only exist if a profile was already
+resolved unambiguously at policy-*generation* time (by whatever future
+phase writes the policy file from Settings/config) — the policy itself
+carries exactly one matched profile's fields, not the full set of
+configured profiles, wildcard owner patterns, or exact-repo overrides
+needed to re-run full profile resolution. Re-deriving those ids at hook
+time would mean either bundling substantially more (still non-secret, but
+much larger and more complex) data into the policy, or re-implementing
+`profileResolver.ts`'s wildcard/overlap logic a second time in POSIX shell.
+Neither is justified by this phase's scope; a missing or invalid policy
+already surfaces as `policy-missing`/`policy-corrupt`, which is the
+closest honest signal available without that additional work.
+
+### Push evaluation
+
+The push evaluator's interface is built now, evaluated against real
+action-time facts, with actual `pre-push` hook installation left for a
+later phase (per the task's explicit scope for this phase). It accepts:
+
+- **remote name** and **remote URL**, exactly as Git passes them to a real
+  `pre-push` hook's argv — never `RepoFacts.pushRemoteUrl` predicted by an
+  earlier sidebar scan, which could be stale or simply wrong for the
+  specific push actually happening (a branch's `pushRemote` can differ
+  from `origin`, `git push <url>` can target an arbitrary URL on the
+  command line, etc.).
+- **ref update lines on stdin**, matching the real hook contract
+  (`<local-ref> <local-sha1> <remote-ref> <remote-sha1>` per line). This
+  phase drains stdin (so a real hook invocation never hangs) but does not
+  yet inspect individual ref updates — see "What's next" below.
+
+**Destination matching is owner-based, not host-based.** A push through a
+trusted SSH alias (`github-work`) has a literally different hostname than
+the repo's canonical remote host (`github.com`) despite authenticating the
+exact same account — comparing hosts would flag every alias-based push
+(the very thing `trustedSshHostAliases` exists to allow) as a destination
+mismatch. This mirrors `checkPushDestination` in `statusEngine.ts`
+exactly, which also matches on owner/exact-repo-key, never on host alone.
+
+**Push blocks when:**
+
+| Condition | Reason id | Blocking regardless of `strictPushSetup`? |
+| --- | --- | --- |
+| No/invalid policy | `policy-missing` / `policy-corrupt` | Yes |
+| Push owner (and repo, if known) doesn't match the approved destination | `push-destination-mismatch` | **Yes, always** |
+| HTTPS, unrecognized protocol, a generic host (`github.com`/`gitlab.com`/`bitbucket.org`), or a custom SSH alias not listed in `trustedSshHostAliases` | `push-route-unverified` | No — only when `strictPushSetup` is true |
+
+If the policy never recorded an approved destination at all (e.g. the repo
+had no resolvable remote when the policy was generated), the destination
+check is skipped rather than guessed at — no reason is reported for a
+comparison that can't actually be made.
+
+`push-route-mismatch` (an alias trusted only under a *different* profile
+than the one matched here) is defined as a reason id but is **not**
+produced by this phase's evaluator, for the same reason as
+`profile-conflict` above: detecting it would require the policy to carry
+other profiles' `trustedSshHostAliases` too, which the current
+minimal-non-secret-policy design deliberately doesn't include. Left as a
+named gap for a future phase to close deliberately, if it turns out to
+matter in practice.
+
+### Fail-closed behavior
+
+Consistent with the Phase 1 lifecycle decision: **when Shield is enabled
+for a repository but its policy can't be read, is invalid, or Git
+inspection itself fails, the evaluator blocks the action** —
+`policy-missing`, `policy-corrupt`, and `inspection-failed` are always
+immediate, first-checked denials, before any other Git-state evaluation
+even runs. A hook that can't determine anything meaningful must never
+silently allow the action through as if Shield weren't installed; that
+would be strictly worse than Shield not existing, because it manufactures
+false confidence. `--no-verify` remains the sanctioned, already-documented
+way past a hook in this state.
+
+### What's next (not this phase)
+
+- Writing the policy file at all (`fs` I/O on top of `src/shield/storage.ts`'s
+  pure paths) — this phase's tests write policy files directly with
+  `serializeShieldPolicy`, standing in for whatever future flow generates
+  one from a real profile + live `RepoFacts`.
 - Actual hook installation into `<git-common-dir>/hooks/`, including
   detecting and safely coexisting with (or clearly refusing to clobber) a
   pre-existing third-party hook manager.
+- Per-ref push inspection (using the ref lines already accepted on stdin)
+  for anything beyond destination/route — e.g. force-push detection, if a
+  future phase decides that belongs in Shield.
+- Closing the `profile-unresolved`/`profile-conflict`/`push-route-mismatch`
+  gaps above, if a future design decides they're worth the added policy
+  complexity.
 - A "Shield Mode" section in Settings with an enable/disable toggle, once
   there is something real for it to toggle.
 
