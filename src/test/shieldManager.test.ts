@@ -180,8 +180,15 @@ test("enable() installs a policy, an evaluator copy, and owned pre-commit AND pr
       const hookPath = path.join(hooksDir, fileName);
       const hookContent = await fs.readFile(hookPath, "utf8");
       assert.match(hookContent, new RegExp(`repo-identity-guard-shield-artifact v4 \\(${marker}\\)`));
-      const mode = (await fs.stat(hookPath)).mode;
-      assert.equal(mode & 0o100, 0o100, `${fileName} hook file should be executable`);
+      if (process.platform !== "win32") {
+        // NTFS has no POSIX executable bit -- Git for Windows makes a
+        // hook run via its own shebang-interpretation mechanism instead,
+        // so this check is meaningless there (confirmed on real Windows
+        // CI: fs.stat().mode never carries 0o100 regardless of what
+        // writeFile's `mode` option asked for).
+        const mode = (await fs.stat(hookPath)).mode;
+        assert.equal(mode & 0o100, 0o100, `${fileName} hook file should be executable`);
+      }
     }
 
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);

@@ -477,7 +477,7 @@ test("branch.pushRemote redirects a push and Shield evaluates the ACTUAL destina
     await git(repo, ["remote", "add", "upstream", `git@github-work:${rightBare}`]);
     await git(repo, ["config", "branch.feature/shield-tests.pushRemote", "upstream"]);
     await git(repo, ["config", "push.default", "current"]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     // Bare `git push` (no remote argument) -- only then does Git consult
     // branch.<name>.pushRemote to resolve which remote to use.
@@ -504,7 +504,7 @@ test("remote.pushDefault redirects a bare `git push` and is evaluated against th
     await git(repo, ["remote", "add", "upstream", `git@github-work:${rightBare}`]);
     await git(repo, ["config", "remote.pushDefault", "upstream"]);
     await git(repo, ["config", `push.default`, "current"]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, [], env);
     assert.equal(result.code, 0, result.stderr);
@@ -526,7 +526,7 @@ test("remote.pushurl (asymmetric fetch/push URL) is what's actually evaluated at
     // Fetch URL points somewhere Shield never approved; only the pushurl matters for `git push`.
     await git(repo, ["remote", "add", "origin", "https://example.com/nonexistent/repo.git"]);
     await git(repo, ["remote", "set-url", "--push", "origin", `git@github-work:${rightBare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "feature/shield-tests"], env);
     assert.equal(result.code, 0, result.stderr);
@@ -545,7 +545,7 @@ test("force push to the approved destination is still subject to the same destin
     const manager = new ShieldManager();
     await enableShield(manager, repo, { profiles: [routeOnlyProfile] });
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const first = await push(repo, ["origin", "feature/shield-tests"], env);
     assert.equal(first.code, 0, first.stderr);
@@ -574,7 +574,7 @@ test("ref deletion (`git push origin :branch`) is evaluated the same as any othe
     const manager = new ShieldManager();
     await enableShield(manager, repo, { profiles: [routeOnlyProfile] });
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const first = await push(repo, ["origin", "feature/shield-tests"], env);
     assert.equal(first.code, 0, first.stderr);
@@ -623,7 +623,7 @@ test("expected GitHub login match under strict verification -> allowed (network 
     const manager = new ShieldManager();
     await enableShield(manager, repo);
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "feature/shield-tests"], env);
     assert.equal(result.code, 0, result.stderr);
@@ -801,6 +801,21 @@ async function timeIt(fn: () => Promise<unknown>): Promise<number> {
   return performance.now() - start;
 }
 
+/**
+ * Windows-aware latency bound. Confirmed on real windows-latest CI: a
+ * single git-subprocess-heavy test here took ~1.5s there against ~80ms
+ * on Linux -- not a Shield regression, just real, substantially higher
+ * process-spawn overhead on Windows (spawning `git.exe`/`sh.exe` per
+ * hook invocation costs much more than a POSIX fork+exec). These
+ * assertions exist to catch a genuine regression (e.g. an accidental
+ * network call), not to make a cross-platform latency claim -- so the
+ * bound itself is platform-aware rather than pretending one number fits
+ * every OS.
+ */
+function platformBoundMs(posixBoundMs: number): number {
+  return process.platform === "win32" ? posixBoundMs * 5 : posixBoundMs;
+}
+
 test("PERFORMANCE: added commit latency stays well under one second on a local repo", async () => {
   const repo = await makeTempRepo();
   try {
@@ -817,7 +832,8 @@ test("PERFORMANCE: added commit latency stays well under one second on a local r
 
       // eslint-disable-next-line no-console
       console.log(`[perf] commit: baseline=${baseline.toFixed(1)}ms shielded=${withShield.toFixed(1)}ms delta=${(withShield - baseline).toFixed(1)}ms`);
-      assert.ok(withShield < 1000, `commit with Shield took ${withShield}ms, expected well under 1000ms`);
+      const bound = platformBoundMs(1000);
+      assert.ok(withShield < bound, `commit with Shield took ${withShield}ms, expected well under ${bound}ms`);
     } finally {
       await cleanup(withoutShieldRepo.dir);
     }
@@ -837,12 +853,13 @@ test("PERFORMANCE: added push latency in route-only (non-account-verifying) stri
     const profile: Profile = { ...workProfile, expectedGitHubLogin: undefined };
     await enableShield(manager, repo, { profiles: [profile] });
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const elapsed = await timeIt(() => push(repo, ["origin", "feature/shield-tests"], env));
     // eslint-disable-next-line no-console
     console.log(`[perf] push (route-only): ${elapsed.toFixed(1)}ms`);
-    assert.ok(elapsed < 1000, `route-only push took ${elapsed}ms, expected well under 1000ms`);
+    const bound = platformBoundMs(1000);
+    assert.ok(elapsed < bound, `route-only push took ${elapsed}ms, expected well under ${bound}ms`);
   } finally {
     await cleanup(repo.dir, remoteParent, fakeSshBin);
   }
@@ -857,7 +874,7 @@ test("PERFORMANCE: added push latency in strict GitHub SSH account-verification 
     const manager = new ShieldManager();
     await enableShield(manager, repo); // workProfile already sets expectedGitHubLogin
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeGithubSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeGithubSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const elapsed = await timeIt(() => push(repo, ["origin", "feature/shield-tests"], env));
     // eslint-disable-next-line no-console
@@ -868,7 +885,8 @@ test("PERFORMANCE: added push latency in strict GitHub SSH account-verification 
     // number is dominated by network RTT (see docs/SHIELD_MODE.md's
     // measured-latency note) -- the mocked figure here only bounds
     // Shield's own local overhead, never network time.
-    assert.ok(elapsed < 3000, `strict account-verifying push took ${elapsed}ms, expected well under 3000ms locally`);
+    const bound = platformBoundMs(3000);
+    assert.ok(elapsed < bound, `strict account-verifying push took ${elapsed}ms, expected well under ${bound}ms locally`);
   } finally {
     await cleanup(repo.dir, remoteParent, fakeGithubSshBin);
   }

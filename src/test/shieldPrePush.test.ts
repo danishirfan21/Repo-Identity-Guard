@@ -193,7 +193,7 @@ test("push to the approved destination through a trusted SSH alias -> allowed, a
     await enableShield(manager, repo, approvedFacts(repo));
 
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.equal(result.code, 0, result.stderr);
@@ -214,7 +214,7 @@ test("pushing multiple refs in one invocation still allows/enforces correctly (m
 
     await git(repo, ["branch", "second"]);
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main", "second"], env);
     assert.equal(result.code, 0, result.stderr);
@@ -260,7 +260,7 @@ test("a pushurl changed to a different owner after Shield approval -> blocked, r
     const bare = await makeBareRemote(remoteParent, "someone", "backend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
     await git(repo, ["config", "remote.origin.pushurl", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.notEqual(result.code, 0);
@@ -285,7 +285,7 @@ test("a different remote entirely (not 'origin') is still checked against the sa
 
     const bare = await makeBareRemote(remoteParent, "SomeoneElse", "unrelated");
     await git(repo, ["remote", "add", "upstream", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["upstream", "main"], env);
     assert.notEqual(result.code, 0);
@@ -305,7 +305,7 @@ test("a direct URL push (git push <url>, no configured remote) to an unexpected 
     await enableShield(manager, repo, approvedFacts(repo));
 
     const bare = await makeBareRemote(remoteParent, "RandomOrg", "random-repo");
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, [`git@github-work:${bare}`, "main"], env);
     assert.notEqual(result.code, 0);
@@ -339,7 +339,7 @@ test("no approved destination on file (policy predates a resolvable remote) -> f
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.notEqual(result.code, 0);
@@ -363,7 +363,7 @@ test("a generic SSH host (github.com) under a strict profile -> blocked, ref NOT
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github.com:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.notEqual(result.code, 0);
@@ -388,7 +388,7 @@ test("an untrusted SSH alias under a strict profile -> blocked, ref NOT updated"
     // in trustedSshHostAliases -- must not be trusted just for not being
     // one of the well-known generic hosts.
     await git(repo, ["remote", "add", "origin", `git@github-personal:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.notEqual(result.code, 0);
@@ -542,7 +542,7 @@ test("an SSH override does NOT block a non-strict profile (route trust is only e
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}`, GIT_SSH_COMMAND: `${fakeSshBin}/ssh` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}`, GIT_SSH_COMMAND: `${fakeSshBin}/ssh` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.equal(result.code, 0, result.stderr);
@@ -567,7 +567,7 @@ test("missing Shield policy at push time -> blocked, ref NOT updated", async () 
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.notEqual(result.code, 0);
@@ -591,7 +591,7 @@ test("malformed (corrupted) Shield policy at push time -> blocked, ref NOT updat
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.notEqual(result.code, 0);
@@ -619,7 +619,7 @@ test("an evaluator that fails unexpectedly (corrupted copy) still blocks the pus
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.notEqual(result.code, 0);

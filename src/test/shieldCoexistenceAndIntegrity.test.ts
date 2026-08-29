@@ -159,7 +159,11 @@ test("chainForeignHooks: true moves the foreign hook to a sidecar and installs S
 
     const sidecarPath = `${hookPath}.repo-identity-guard-original`;
     assert.equal(await fs.readFile(sidecarPath, "utf8"), foreignContent);
-    assert.equal(((await fs.stat(sidecarPath)).mode & 0o100) as number, 0o100, "chained original should keep its executable bit");
+    if (process.platform !== "win32") {
+      // NTFS has no POSIX executable bit -- see shieldManager.test.ts's
+      // identical guard for why this is skipped there.
+      assert.equal(((await fs.stat(sidecarPath)).mode & 0o100) as number, 0o100, "chained original should keep its executable bit");
+    }
 
     const installedHook = await fs.readFile(hookPath, "utf8");
     assert.match(installedHook, new RegExp(SHIELD_ARTIFACT_MARKER));
@@ -271,7 +275,7 @@ test("a chained pre-push hook receives the same argv AND the same stdin ref line
     });
 
     await git(repo, ["remote", "add", "origin", `git@github-work:${bareDir}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}:${repo.env.PATH}` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
     const pushResult = await run(repo, ["push", "origin", "main"], env);
     assert.equal(pushResult.code, 0, pushResult.stderr);
 
@@ -351,7 +355,9 @@ test("disable() restores a chained original exactly (bytes and executable bit) a
     await manager.disable(repo.dir);
 
     assert.equal(await fs.readFile(hookPath, "utf8"), foreignContent);
-    assert.equal(((await fs.stat(hookPath)).mode & 0o100) as number, 0o100, "restored original should keep its executable bit");
+    if (process.platform !== "win32") {
+      assert.equal(((await fs.stat(hookPath)).mode & 0o100) as number, 0o100, "restored original should keep its executable bit");
+    }
     await assert.rejects(fs.access(`${hookPath}.repo-identity-guard-original`), "sidecar must be gone after restore");
   } finally {
     await cleanup(repo.dir);

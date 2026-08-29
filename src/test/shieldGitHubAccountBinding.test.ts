@@ -202,7 +202,7 @@ async function setUpScenario(profiles: Profile[] = [workProfile]): Promise<Scena
 }
 
 async function pushWithFakeSsh(scenario: Scenario, extraEnv: NodeJS.ProcessEnv): Promise<PushResult> {
-  const env = { ...scenario.repo.env, PATH: `${scenario.fakeSshBin}:${scenario.repo.env.PATH}`, ...extraEnv };
+  const env = { ...scenario.repo.env, PATH: `${scenario.fakeSshBin}${path.delimiter}${scenario.repo.env.PATH}`, ...extraEnv };
   return push(scenario.repo, ["origin", "main"], env);
 }
 
