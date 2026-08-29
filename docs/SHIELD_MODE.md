@@ -2209,3 +2209,168 @@ documented rather than pretended away:
 Phase 8 narrows a different class entirely — **Shield being wrong or
 silently inert while reporting that it is protecting you** — not the
 deliberate-bypass class.
+
+---
+
+## Phase 9: Git hook mechanism research (findings only — nothing migrated)
+
+Both investigations below were run against **git version 2.43.0**, the Git
+in this project's dev/CI environment. Neither resulted in a production
+change. They are recorded because the alternative — re-deriving them from
+scratch, or worse, assuming them — is how an enforcement mechanism quietly
+gets built on something that does not work.
+
+The two most decision-relevant facts are pinned by executable assertions in
+`src/test/gitHookMechanismResearch.test.ts`, so a future Git upgrade that
+changes either one is noticed rather than silently invalidating this
+section.
+
+### (A) Config-driven / multiple hooks per event: **does not exist**
+
+Shield chains a pre-existing foreign hook by moving it to a
+`.repo-identity-guard-original` sidecar and calling it from its own shim.
+That is a workaround. The question was whether modern Git can replace it.
+
+**It cannot, on any currently released Git.** Empirically, on 2.43.0, in a
+repository with a traditional `.git/hooks/pre-commit` present and two
+`hook.pre-commit.command` entries configured:
+
+```
+$ git config --add hook.pre-commit.command /tmp/extra1.sh
+$ git config --add hook.pre-commit.command /tmp/extra2.sh
+$ git config --get-all hook.pre-commit.command
+/tmp/extra1.sh
+/tmp/extra2.sh
+
+$ git commit -m one
+TRADITIONAL pre-commit ran          <- and nothing else
+
+$ git hook run pre-commit
+TRADITIONAL pre-commit ran          <- and nothing else
+```
+
+A configured hook that exits non-zero does not block the commit either —
+it is never executed at all:
+
+```
+$ git config --add hook.pre-commit.command /tmp/fail.sh   # exit 1
+$ git commit -m two
+TRADITIONAL pre-commit ran
+commit exit: 0                       <- committed anyway
+```
+
+So: `git config` happily stores `hook.<name>.command`, and Git **completely
+ignores it**. `git hook run` exists (added in Git 2.36) but is only a way to
+*invoke* the one traditional hook script by name — it resolves exactly one
+script per hook event, and there is no `hooks.d`-style multi-script
+convention anywhere in core Git. The multi-hook configuration syntax
+appeared in Git mailing-list proposals and in some third-party
+documentation; it was never merged.
+
+**Conclusion: no migration is possible, so none was attempted.** Shield's
+sidecar chaining stays. Should a future Git ship real configured hooks, the
+migration would additionally need a fallback for every supported Git down to
+Shield's 2.31 floor, so the sidecar mechanism would have to be retained
+regardless — which materially reduces the value of migrating at all.
+
+Other properties confirmed while testing, for whoever revisits this:
+
+- **Execution order / multiple hooks:** not applicable — one script per
+  event, full stop.
+- **Traditional hook files always win**, and their presence does not
+  suppress or interact with the ignored config entries in any way.
+- **`core.hooksPath` still selects the directory** the single script is
+  resolved from; `git hook run` honours it identically.
+- **Worktrees:** hooks resolve from the shared common dir, which is why
+  Shield stores its policy and evaluator there (see "Storage decision").
+- **`--no-verify` suppresses `git hook run`-invoked hooks exactly as it
+  suppresses directly-invoked ones** — it is a property of the invoking
+  command, not of the hook mechanism.
+
+### (B) `reference-transaction`: real coverage, unusable as an enforcement point
+
+`pre-commit`/`pre-merge-commit` do not fire for a clean cherry-pick or
+revert (documented in Phase 7). `reference-transaction` fires on every ref
+update, so the question was whether it closes that gap.
+
+**It genuinely would.** It is also, for Shield's purposes, the wrong hook,
+and it was NOT wired into enforcement.
+
+#### What actually invokes it (observed)
+
+| Operation | Fires? | Refs seen |
+|---|---|---|
+| `git commit` | yes | `HEAD`, `refs/heads/<branch>` |
+| `git commit --no-verify` | **yes** | same |
+| `git merge --no-ff` | yes | `HEAD`, branch |
+| `git cherry-pick` | **yes** | `CHERRY_PICK_HEAD`, then `HEAD` + branch |
+| `git revert` | **yes** | `HEAD` + branch, then `CHERRY_PICK_HEAD` cleanup |
+| `git rebase` | yes | `REBASE_HEAD` (plus the commit's own updates) |
+| `git branch <name>` | yes | `refs/heads/<name>` |
+| `git tag v1` | yes | `refs/tags/v1` |
+| `git reset --hard` | yes | `ORIG_HEAD`, `HEAD`, branch |
+| `git fetch` / `git pull` | yes | remote-tracking refs, `ORIG_HEAD` |
+| `git stash` / `stash pop` | yes | `refs/stash`, `ORIG_HEAD`, `HEAD` |
+| `git gc` / prune | yes | **every ref in the repository**, then deletions |
+| `git checkout <branch>` | no | (no ref is updated) |
+
+#### Mechanics
+
+- **Phases:** invoked once per phase with `$1` = `prepared`, `committed`,
+  or `aborted`. Both `prepared` and `committed` fire for a successful
+  update; `aborted` fires for a rolled-back one.
+- **stdin:** `<old-oid> <new-oid> <ref-name>` lines, **all refs in the
+  transaction in one invocation**, `0{40}` for creation/deletion.
+- **A non-zero exit in the `prepared` phase ABORTS the operation.**
+  Confirmed: `git commit` exited 128 and HEAD was unchanged; `git branch
+  should-not-exist` exited 128 and the branch was not created.
+- **`--no-verify` does NOT suppress it.** Confirmed directly: with a hook
+  refusing in `prepared`, `git commit --no-verify` still exited 128 and
+  created nothing. This is the single most interesting property here — it
+  is strictly outside the `--no-verify` bypass.
+- **Committer identity is reachable but not supplied:** the hook receives
+  only object ids, so it would have to run `git cat-file commit <new-oid>`
+  and parse the `committer` line itself, per candidate ref, per
+  transaction.
+- **Performance:** 200 commits took 20135 ms with no hook and 20860 ms
+  with a trivial `cat >/dev/null` hook — about 3.6 % / ~3.6 ms per commit
+  for a hook that does *nothing*. Note it is invoked **twice** per commit
+  (prepared + committed) versus `pre-commit`'s once, and Shield's real
+  evaluator spawns `sh`, several `git` processes and `awk`, so the true
+  cost would be several times a `pre-commit`'s — paid on every ref update
+  in the repository, not just on commits.
+
+#### Why it was not wired into enforcement
+
+1. **It fires on almost everything.** `gc`, `fetch`, `stash`, `reset`,
+   `branch`, `tag`, and ref deletions all arrive at the same hook as a
+   commit does. Shield would have to reconstruct "a new commit object just
+   became reachable from HEAD or a branch, made locally, by this user" from
+   nothing but oid triples — and every filtering mistake either misses the
+   case it was added for or **breaks `git gc`, `git fetch` or `git stash`
+   in the user's repository**. That failure mode is far worse than the gap
+   it closes.
+2. **AUTHOR must not be checked there.** Preserving the original author is
+   the entire point of cherry-pick and rebase. Only COMMITTER identifies
+   the local actor, so only COMMITTER could be enforced — which means this
+   hook could never do what `pre-commit` does, only a strict subset of it,
+   under a different rule. Two different identity rules for two different
+   code paths is precisely the kind of divergence Shield exists to prevent.
+3. **It runs with the ref store locked.** A slow or hanging hook stalls
+   every ref update, including `gc` and `fetch`.
+4. **Its failure mode is unexplainable.** Refusing in `prepared` produces a
+   bare `exit 128` from whatever plumbing was mid-transaction, with none of
+   the framing `pre-commit` gives Shield for saying *why* an operation was
+   blocked and what to do about it.
+5. **The `--no-verify` property cuts both ways.** A mechanism a user cannot
+   turn off with the standard escape hatch is not obviously a feature for a
+   tool whose stated promise is "a safety net against accidents, not a
+   cage" — and it would make Shield's documented threat boundary
+   inconsistent between commits and ref updates.
+
+**Conclusion: findings recorded, no production change.** The clean
+cherry-pick/revert gap remains documented (Phase 7) rather than closed by a
+mechanism whose blast radius is the entire ref store. If it is ever
+revisited, it should be as an explicitly opt-in, COMMITTER-only,
+narrowly-filtered addition with a fallback, never as a replacement for
+`pre-commit`.

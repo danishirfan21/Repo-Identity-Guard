@@ -1,21 +1,32 @@
 /**
  * Ownership/version marking for the files Shield writes onto disk (the
- * pre-commit and pre-push hook shims, and its copy of the standalone
- * evaluator). All are plain shell scripts, so "ownership" is a comment line
+ * pre-commit, pre-merge-commit and pre-push hook shims -- the first two
+ * built from the same builder, see HOOK_SPECS in manager.ts -- and its copy
+ * of the standalone evaluator). All are plain shell scripts, so "ownership" is a comment line
  * embedded in the
  * file itself — checked before ShieldManager will overwrite or delete
  * anything at a path it doesn't fully control, and read back by
  * `inspect()`/`repair()` to tell "this is Shield's own artifact, possibly
  * outdated" apart from "something else lives here now."
  *
- * Deliberately no separate manifest/lockfile: the marker-plus-version
- * comment embedded in each artifact *is* the durable record, so a
- * partially-completed install can never be mistaken for a complete one —
+ * Deliberately no separate manifest of artifact CONTENT: the
+ * marker-plus-version comment embedded in each artifact *is* the durable
+ * record of what a file is, so a partially-completed install can never be
+ * mistaken for a complete one —
  * `inspect()` always re-derives state from what is actually on disk right
  * now, never from a cached "I installed this" flag that could drift from
  * reality (a foreign tool overwriting the hook, a user hand-editing it, a
  * crash mid-write). See ShieldManager's module comment for how this feeds
  * the off/active/degraded/broken lifecycle.
+ *
+ * This is NOT the same thing as "Shield keeps no records at all", which an
+ * earlier version of this comment implied. A marker embedded in a file can
+ * only ever be found by looking at a path you already know to look at, and
+ * `core.hooksPath` can move after an install — so Shield ALSO keeps a
+ * durable list of the hooks directories it has installed into
+ * (`src/shield/installRecord.ts`). That record never decides what an
+ * artifact IS (this marker does, re-read from disk every time); it only
+ * says where else to go and look.
  */
 
 export const SHIELD_ARTIFACT_MARKER = "repo-identity-guard-shield-artifact";

@@ -33,8 +33,8 @@ import { ShieldAction, ShieldLifecycleState } from "./types";
 
 /**
  * ShieldManager owns Shield's on-disk lifecycle: installing/removing/
- * repairing the pre-commit and pre-push hooks and the policy + evaluator
- * copy they read, and reporting their current health. It does **not**
+ * repairing the pre-commit, pre-merge-commit and pre-push hooks and the
+ * policy + evaluator copy they read, and reporting their current health. It does **not**
  * evaluate Shield decisions itself (that's `src/shield/evaluator.ts` and
  * the shipped `resources/shield/shield-evaluate.sh`, run standalone at
  * hook time) and it does **not** depend on `vscode` — every method here is
@@ -46,7 +46,8 @@ import { ShieldAction, ShieldLifecycleState } from "./types";
  * ShieldManager writes/deletes only:
  *  - `<gitCommonDir>/repo-identity-guard/*` — Shield's own namespaced
  *    subdirectory under this repo's Git metadata (policy, evaluator copy).
- *  - `<hooksDir>/pre-commit` and `<hooksDir>/pre-push` — resolved fresh via
+ *  - `<hooksDir>/pre-commit`, `<hooksDir>/pre-merge-commit` and
+ *    `<hooksDir>/pre-push` — resolved fresh via
  *    `git rev-parse --git-path hooks` (see `getHooksDir`), and each only
  *    ever written or deleted when that exact path is empty or already
  *    carries Shield's own ownership marker (see `src/shield/artifacts.ts`).
@@ -56,8 +57,8 @@ import { ShieldAction, ShieldLifecycleState } from "./types";
  *    hooks are evaluated and installed independently either way, so a
  *    foreign `pre-push` never blocks installing Shield's `pre-commit`, or
  *    vice versa.
- *  - `<hooksDir>/pre-commit.repo-identity-guard-original` and
- *    `<hooksDir>/pre-push.repo-identity-guard-original` — the exact
+ *  - `<hooksDir>/<hook-name>.repo-identity-guard-original`, for each of
+ *    the three hook names above — the exact
  *    original bytes (and executable bit) of a foreign hook Shield moved
  *    aside to make room for its own, written/restored ONLY as part of
  *    `chainForeignHooks` (see below).
@@ -79,13 +80,21 @@ import { ShieldAction, ShieldLifecycleState } from "./types";
  * currently-resolved-hooksDir) every time it's called. This is what makes
  * "partial installation never reports ACTIVE" true by construction: if
  * `enable()` is interrupted after writing the policy but before the hook,
- * the next `inspect()` (or the hook itself, which fails open when its
- * evaluator copy is missing) sees exactly that partial state and reports
+ * the next `inspect()` sees exactly that partial state and reports
  * `degraded`, never a stale `active` left over from a flag no one updated.
+ * (The hook itself FAILS CLOSED in the mirror-image situation -- installed
+ * but with its evaluator copy missing -- as of artifact v5; see
+ * `artifacts.ts`. It has not "failed open" since v4, and this comment used
+ * to say it did.)
+ *
  * The same re-derivation is what turns "someone redirected `core.hooksPath`
  * away from Shield's hooks directory" into an automatically-detected
- * `degraded`, with no bookkeeping of "where Shield last installed to"
- * required at all.
+ * `degraded`. That much needs no bookkeeping -- but the CONVERSE does:
+ * finding the hooks Shield left behind at the directory `core.hooksPath`
+ * moved AWAY from is impossible without a record of where Shield installed,
+ * which is exactly why `src/shield/installRecord.ts` exists. This comment
+ * used to claim no such bookkeeping was required at all; that was wrong,
+ * and under fail-closed shims it was dangerously wrong.
  *
  * `inspect()` never writes anything, ever — including when it detects
  * tampering, drift, or an outdated version. Turning `degraded`/`broken`
@@ -126,10 +135,19 @@ import { ShieldAction, ShieldLifecycleState } from "./types";
  * the Git version in this repository's CI/dev environment (see
  * docs/SHIELD_MODE.md "Phase 6" for the exact command and output) before
  * deciding to implement chaining as Shield's own wrapper rather than
- * relying on a native feature that doesn't exist. Shield's minimum
- * supported Git version remains **2.9** (when `core.hooksPath` — which
- * `getHooksDir` fundamentally depends on — was introduced); nothing in
- * this phase raises that floor.
+ * relying on a native feature that doesn't exist. Re-verified against Git
+ * 2.43.0 in Phase 9 (Part 14): `hook.<name>.command` config entries are
+ * accepted by `git config` and then COMPLETELY IGNORED -- neither `git
+ * commit` nor `git hook run pre-commit` executes them, and the traditional
+ * hook file is still the only script that runs. So sidecar chaining remains
+ * the only mechanism, and no migration is available to move to.
+ *
+ * Shield's minimum supported Git version is **2.31.0**, NOT 2.9. This
+ * comment used to say 2.9 (when `core.hooksPath` was introduced); Phase 8
+ * found that wrong on two counts -- `git rev-parse --path-format=absolute`
+ * needs 2.31, and `pre-merge-commit` needs 2.24 -- and
+ * `src/shield/gitVersion.ts` is the authority. `enable()` refuses outright
+ * below the floor.
  *
  * `disable()` (and a repair that later removes Shield) restores a chained
  * original exactly: the sidecar is moved back over the hook path, byte-
@@ -149,7 +167,7 @@ export interface ShieldGitContext {
 
 export type ShieldArtifactOwnership = "shield" | "foreign" | "absent";
 
-/** One of the two hook files Shield can install — see `HOOK_SPECS`. */
+/** One of the THREE hook files Shield can install — see `HOOK_SPECS`. `pre-merge-commit` was added in Phase 7 and governs the same "commit" action as `pre-commit`. */
 export type ShieldHookFileName = "pre-commit" | "pre-merge-commit" | "pre-push";
 
 export interface ShieldHookInspection {
@@ -186,7 +204,7 @@ export interface ShieldInspection {
   /** Human-readable diagnostic lines explaining `state` — always empty when `state` is "active" with nothing to repair. */
   reasons: string[];
   gitContext?: ShieldGitContext;
-  /** One entry per hook file Shield can install (`pre-commit`, `pre-push`), in that order — always present, even when `ownership` is `"absent"`. */
+  /** One entry per hook file Shield can install (`pre-commit`, `pre-merge-commit`, `pre-push`), in that order — always present, even when `ownership` is `"absent"`. */
   hooks: ShieldHookInspection[];
   policyPath?: string;
   policyPresent: boolean;
@@ -690,7 +708,7 @@ export class ShieldManager {
       state = "degraded";
       for (const orphan of orphanedHookPaths) {
         reasons.push(
-          `A Shield-owned hook is still installed at ${orphan}, which is not the hooks directory Git currently uses${coreHooksPath ? ` ("core.hooksPath" is set to "${coreHooksPath}")` : ""}. It is inert right now, but would take effect again if that setting changed back. Run "Repair Shield" or "Disable Shield" — both clean up Shield's previous installation locations.`,
+          `A Shield-owned hook is still installed at ${orphan}, which is not the hooks directory Git currently uses${coreHooksPath ? ` ("core.hooksPath" is set to "${coreHooksPath}")` : ""}. It is inert ONLY while "core.hooksPath" points elsewhere -- it is not harmless, and it takes effect again the moment that setting changes back or is unset. Run "Repair Shield" or "Disable Shield" — both clean up Shield's previous installation locations.`,
         );
       }
     } else if (!policyResult) {
@@ -899,7 +917,8 @@ export class ShieldManager {
   /**
    * Installs (or repairs) Shield for this repo: writes the policy and a
    * fresh evaluator copy under this repo's git-common-dir, then installs
-   * the pre-commit AND pre-push hook shims — each independently, and each
+   * the pre-commit, pre-merge-commit AND pre-push hook shims — each
+   * independently, and each
    * only into an empty hook slot, one Shield already owns, or (with
    * `input.chainForeignHooks: true`) one occupied by a foreign hook that
    * gets chained rather than replaced (see the class-level "Hook
@@ -1325,8 +1344,9 @@ export class ShieldManager {
   }
 
   /**
-   * Removes only what Shield itself owns: its pre-commit AND pre-push
-   * hooks (each re-verified as Shield's own immediately before touching
+   * Removes only what Shield itself owns: its pre-commit,
+   * pre-merge-commit AND pre-push hooks (each re-verified as Shield's own
+   * immediately before touching
    * it — never a foreign hook, even one that appeared at that path after
    * Shield last installed), and its policy/evaluator copy under this
    * repo's git-common-dir. Never touches anything else. Safe to call when

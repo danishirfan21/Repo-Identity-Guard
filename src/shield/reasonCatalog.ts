@@ -61,7 +61,7 @@ export const SHIELD_REASON_CATALOG: Record<ShieldReasonId, ShieldReasonDescripto
     capability: "push_account",
   },
   "push-route-override": {
-    description: "An SSH command override (GIT_SSH, GIT_SSH_COMMAND, core.sshCommand, or a command-scoped -c override) was detected at push time, so the route this push would actually use cannot be verified against the profile's trusted SSH host aliases, even if the URL's host would otherwise be trusted.",
+    description: "An SSH transport override was detected at push time, so the route this push would actually use cannot be verified against the profile's trusted SSH host aliases, even if the URL's host would otherwise be trusted. Two families count: an override of WHICH program speaks SSH (GIT_SSH, GIT_SSH_COMMAND, core.sshCommand — including a command-scoped -c), and an override of the argument conventions Git drives it under (a non-OpenSSH ssh.variant / GIT_SSH_VARIANT, e.g. plink), which applies even with no command override at all.",
     capability: "push_account",
   },
   "push-account-mismatch": {
