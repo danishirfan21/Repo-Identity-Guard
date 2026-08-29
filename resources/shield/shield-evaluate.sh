@@ -824,6 +824,50 @@ Reason: Push destination changed since Shield approval (this push would go to ${
   CORE_SSH_COMMAND=$(git config --get core.sshCommand 2>/dev/null || true)
   [ -n "$CORE_SSH_COMMAND" ] && SSH_OVERRIDES="${SSH_OVERRIDES:+$SSH_OVERRIDES, }core.sshCommand"
 
+  # Phase 9 / Part 3 finding: `ssh.variant` (and its GIT_SSH_VARIANT
+  # environment form) changes HOW git invokes the ssh transport even when
+  # NO command override is set at all -- so a route could diverge from what
+  # Shield probes with none of the three checks above noticing.
+  #
+  # Empirically confirmed against git 2.43.0, with a fake `ssh` on PATH and
+  # no GIT_SSH/GIT_SSH_COMMAND/core.sshCommand set anywhere:
+  #
+  #   (default)                      ssh -o SendEnv=GIT_PROTOCOL git@host git-upload-pack '/o/r.git'
+  #   -c ssh.variant=plink           ssh                          git@host git-upload-pack '/o/r.git'
+  #   -c ssh.variant=simple          ssh                          git@host git-upload-pack '/o/r.git'
+  #   GIT_SSH_VARIANT=tortoiseplink  ssh -batch                   git@host git-upload-pack '/o/r.git'
+  #
+  # i.e. git is driving that program under PuTTY/plink/"simple" argument
+  # conventions, not OpenSSH's. Shield's verification probe below is
+  # unconditionally OpenSSH syntax (`ssh -G`, `-o BatchMode=yes`,
+  # `-o StrictHostKeyChecking=yes`, `-p <port>`; plink spells the port
+  # `-P` and has no `-G` at all). Under a non-OpenSSH variant the probe
+  # therefore cannot be shown to reproduce the transport the push will use
+  # -- and an unprovable route must read as UNVERIFIED and block under a
+  # strict profile, never be assumed equivalent.
+  #
+  # Only a genuinely non-OpenSSH variant counts: "auto" is git's default
+  # and "ssh" explicitly asserts OpenSSH semantics, which is exactly what
+  # the probe assumes, so neither is an override. GIT_SSH_VARIANT wins over
+  # ssh.variant (git's own precedence), so the EFFECTIVE value is what is
+  # judged -- `ssh.variant=plink` cancelled by `GIT_SSH_VARIANT=ssh` is not
+  # a divergence and must not be blocked as one.
+  #
+  # Both forms are visible here: GIT_SSH_VARIANT is inherited by the hook,
+  # and `git config --get ssh.variant` sees command-scoped `git -c
+  # ssh.variant=...` too, because git propagates it through
+  # GIT_CONFIG_PARAMETERS (empirically verified from inside a real hook).
+  EFFECTIVE_SSH_VARIANT="${GIT_SSH_VARIANT:-}"
+  SSH_VARIANT_SOURCE=GIT_SSH_VARIANT
+  if [ -z "$EFFECTIVE_SSH_VARIANT" ]; then
+    EFFECTIVE_SSH_VARIANT=$(git config --get ssh.variant 2>/dev/null || true)
+    SSH_VARIANT_SOURCE=ssh.variant
+  fi
+  case "$(lower "$EFFECTIVE_SSH_VARIANT")" in
+    ""|auto|ssh) ;;
+    *) SSH_OVERRIDES="${SSH_OVERRIDES:+$SSH_OVERRIDES, }$SSH_VARIANT_SOURCE=$EFFECTIVE_SSH_VARIANT" ;;
+  esac
+
   ROUTE_UNVERIFIED=1
   ROUTE_REASON_ID=push-route-unverified
   ROUTE_MESSAGE="This push's protocol could not be determined, so the account that would authenticate it cannot be verified locally."

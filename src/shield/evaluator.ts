@@ -202,16 +202,31 @@ export interface PushEvalFacts {
    */
   refLines?: string[];
   /**
-   * Non-empty entries among `GIT_SSH`, `GIT_SSH_COMMAND`, and the
-   * *effective* `core.sshCommand` config (any scope, including a
-   * command-scoped `-c core.sshCommand=...`) visible at push time —
-   * whichever of the three were actually set, named for the message; empty
-   * when none were. Any of these can redirect an ssh-protocol push through
-   * a completely different SSH client/config than the one implied by the
-   * URL's host, which is exactly what `trustedSshHostAliases` is trusted
-   * evidence for — so their presence makes route trust unverifiable even
-   * through an otherwise-trusted alias. Read fresh at push time, never
+   * Every SSH-transport override visible at push time, named for the
+   * message; empty when there are none. Read fresh at push time, never
    * cached: see docs/SHIELD_MODE.md "Phase 4."
+   *
+   * Two independent families, both of which can make the route a push
+   * actually takes differ from the one Shield's `ssh -G`/`ssh -T` probe
+   * takes — which is exactly what `trustedSshHostAliases` is trusted
+   * evidence about, so any of them makes route trust unverifiable even
+   * through an otherwise-trusted alias:
+   *
+   *  - **which program speaks SSH** — `GIT_SSH`, `GIT_SSH_COMMAND`, and
+   *    the effective `core.sshCommand` config (any scope, including a
+   *    command-scoped `-c core.sshCommand=...`).
+   *  - **under which argument conventions git drives it** — the effective
+   *    `ssh.variant` / `GIT_SSH_VARIANT` (Phase 9 / Part 3). These apply
+   *    even with no command override at all, and Shield used not to notice
+   *    them: `ssh.variant=plink` makes git speak PuTTY conventions to
+   *    whatever `ssh` is on PATH, while Shield's probe is unconditionally
+   *    OpenSSH syntax (`-G`, `-o BatchMode=yes`, `-p <port>`). Only a
+   *    genuinely non-OpenSSH value counts — `auto` (git's default) and
+   *    `ssh` (an explicit assertion of OpenSSH semantics) are not
+   *    overrides — and `GIT_SSH_VARIANT` takes precedence over
+   *    `ssh.variant`, so it is the EFFECTIVE value that is judged. See
+   *    `resources/shield/shield-evaluate.sh`'s matching block for the
+   *    captured `git 2.43.0` argv evidence.
    */
   sshCommandOverrides: string[];
 
@@ -228,6 +243,58 @@ export interface PushEvalFacts {
    * at hook time; this module only decides what a given outcome means.
    */
   githubAccountCheck?: GitHubAccountVerificationOutcome;
+}
+
+/**
+ * The read-only inputs that decide whether an ssh-protocol push's transport
+ * can diverge from the one Shield's own `ssh -G`/`ssh -T` probe would take.
+ * Every one of these is either an environment variable a hook inherits or a
+ * Git config key `git config --get` resolves at any scope — nothing here
+ * reads a key, an SSH config file, or the network.
+ */
+export interface SshTransportEnvironment {
+  /** `GIT_SSH` (a program path). */
+  gitSsh?: string;
+  /** `GIT_SSH_COMMAND` (a shell snippet — NEVER executed to "verify" it). */
+  gitSshCommand?: string;
+  /** `git config --get core.sshCommand`, any scope, including command-scoped `-c`. */
+  coreSshCommand?: string;
+  /** `GIT_SSH_VARIANT` (environment form; takes precedence over the config key). */
+  gitSshVariant?: string;
+  /** `git config --get ssh.variant`, any scope, including command-scoped `-c`. */
+  sshVariantConfig?: string;
+}
+
+/** `ssh.variant` values that assert ordinary OpenSSH semantics — the exact conventions Shield's probe uses, so not a divergence. */
+const OPENSSH_EQUIVALENT_VARIANTS = new Set(["", "auto", "ssh"]);
+
+/**
+ * The names of every SSH-transport override in effect, in the same order
+ * and with the same spelling `resources/shield/shield-evaluate.sh` produces
+ * — this is the TypeScript half of that block, kept 1:1 with it and
+ * cross-checked by the differential tests.
+ *
+ * Deliberately never executes, resolves, or otherwise interprets the *value*
+ * of `GIT_SSH_COMMAND`/`core.sshCommand`: running a user-supplied shell
+ * snippet to "check what it does" would be a far worse hazard than the
+ * ambiguity it resolves. Presence alone is sufficient, because presence
+ * alone is what makes the route unprovable.
+ */
+export function resolveSshCommandOverrides(env: SshTransportEnvironment): string[] {
+  const overrides: string[] = [];
+  if (env.gitSsh) overrides.push("GIT_SSH");
+  if (env.gitSshCommand) overrides.push("GIT_SSH_COMMAND");
+  if (env.coreSshCommand) overrides.push("core.sshCommand");
+
+  // GIT_SSH_VARIANT wins over ssh.variant (Git's own precedence), so the
+  // EFFECTIVE value is judged: `ssh.variant=plink` cancelled by
+  // `GIT_SSH_VARIANT=ssh` is not a divergence and must not block.
+  const source = env.gitSshVariant ? "GIT_SSH_VARIANT" : "ssh.variant";
+  const effectiveVariant = (env.gitSshVariant || env.sshVariantConfig || "").trim();
+  if (!OPENSSH_EQUIVALENT_VARIANTS.has(effectiveVariant.toLowerCase())) {
+    overrides.push(`${source}=${effectiveVariant}`);
+  }
+  return overrides;
 }
 
 /**
