@@ -64,6 +64,22 @@ async function touchFile(repo: Repo, name: string, content: string): Promise<voi
   await git(repo, ["add", name]);
 }
 
+// Same Windows PATH-casing fix as shieldPrePush.test.ts — see that file's
+// comment on `normalizePathKey` for why this is necessary: `process.env`
+// on Windows may key the search path as `Path`, not `PATH`, and reading
+// `repo.env.PATH` off a plain spread object silently returns undefined,
+// producing a broken PATH once a fake ssh dir is prepended.
+function normalizePathKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result = { ...env };
+  const pathKeys = Object.keys(result).filter((key) => key.toUpperCase() === "PATH");
+  const value = pathKeys.map((key) => result[key]).find((v) => v !== undefined);
+  for (const key of pathKeys) {
+    if (key !== "PATH") delete result[key];
+  }
+  if (value !== undefined) result.PATH = value;
+  return result;
+}
+
 async function makeTempRepo(): Promise<Repo> {
   // realpath: on macOS, os.tmpdir() resolves through the /var ->
   // /private/var symlink, while `git rev-parse --path-format=absolute`
@@ -72,7 +88,7 @@ async function makeTempRepo(): Promise<Repo> {
   // output would spuriously fail on macOS alone (confirmed via CI).
   const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-")));
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...normalizePathKey(process.env),
     GIT_CONFIG_GLOBAL: path.join(dir, ".test-global-gitconfig"),
     GIT_CONFIG_NOSYSTEM: "1",
   };

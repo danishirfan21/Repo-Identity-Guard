@@ -134,7 +134,33 @@ function stripAmbientGitConfigEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   for (const key of Object.keys(cleaned)) {
     if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) delete cleaned[key];
   }
-  return cleaned;
+  return normalizePathKey(cleaned);
+}
+
+/**
+ * Phase 7 Windows finding: `process.env` on Windows carries the search-path
+ * variable as `Path` (or `PATH`/`path`, inconsistently, depending on how the
+ * runner set it up) -- Node's `process.env` is case-insensitive for reads,
+ * but a plain object produced by spreading it is NOT, so it keeps whatever
+ * casing the OS happened to use as its only real key. Every test in this
+ * file reads `repo.env.PATH` (uppercase) to prepend a fake ssh directory;
+ * on a box where the real key is `Path`, that read silently returns
+ * `undefined`, and the resulting env ends up with BOTH a correct `Path` and
+ * a broken `PATH: "<dir>;undefined"` -- and once both casings of the same
+ * Windows environment variable exist on one object, spawn's env block
+ * becomes ambiguous and `git` itself failed to resolve at all (`spawn git
+ * ENOENT`), not just the fake ssh shim. Collapsing every case variant down
+ * to a single canonical `PATH` key up front removes the ambiguity.
+ */
+function normalizePathKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result = { ...env };
+  const pathKeys = Object.keys(result).filter((key) => key.toUpperCase() === "PATH");
+  const value = pathKeys.map((key) => result[key]).find((v) => v !== undefined);
+  for (const key of pathKeys) {
+    if (key !== "PATH") delete result[key];
+  }
+  if (value !== undefined) result.PATH = value;
+  return result;
 }
 
 async function makeTempRepo(): Promise<Repo> {

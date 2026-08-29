@@ -141,7 +141,20 @@ function stripAmbientGitConfigEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   for (const key of Object.keys(cleaned)) {
     if (/^GIT_CONFIG_(COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) delete cleaned[key];
   }
-  return cleaned;
+  return normalizePathKey(cleaned);
+}
+
+// Same Windows PATH-casing fix as shieldPrePush.test.ts — see that file's
+// comment on `normalizePathKey` for why this is necessary.
+function normalizePathKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const result = { ...env };
+  const pathKeys = Object.keys(result).filter((key) => key.toUpperCase() === "PATH");
+  const value = pathKeys.map((key) => result[key]).find((v) => v !== undefined);
+  for (const key of pathKeys) {
+    if (key !== "PATH") delete result[key];
+  }
+  if (value !== undefined) result.PATH = value;
+  return result;
 }
 
 async function makeTempRepo(): Promise<Repo> {
