@@ -485,12 +485,35 @@ function versionOfBytes(bytes: Buffer): number | undefined {
 }
 
 export class ShieldManager {
-  /** Resolves the repo-facing paths Shield operates on, fresh, every call — never cached across calls. */
+  /**
+   * Resolves the repo-facing paths Shield operates on, fresh, every call —
+   * never cached across calls.
+   *
+   * `getGitDir`/`getGitCommonDir` are shared with the general (non-Shield)
+   * facts collector and deliberately do NOT pass `--path-format=absolute`
+   * to `git rev-parse` there, because that flag requires Git 2.31+ and
+   * those functions still have to work below Shield's own version floor.
+   * `getHooksDir` has no such constraint (it is Shield-only, already
+   * gated behind the 2.31 floor) and does pass it, which makes `git`
+   * canonicalize the result -- resolving a symlinked temp/home directory
+   * (e.g. macOS's /var -> /private/var) the way `path.resolve` never
+   * does. Left alone, that mismatch means `gitCommonDir` and `hooksDir`
+   * can name the *same* real directory with two different strings, and
+   * everything Shield derives from `gitCommonDir` (the storage dir, the
+   * install record, the policy/evaluator paths) would silently disagree
+   * with paths derived from `hooksDir`. `fs.realpath` here canonicalizes
+   * `gitDir`/`gitCommonDir` the same way, without touching the shared,
+   * older-Git-safe functions themselves.
+   */
   async resolveGitContext(repoRoot: string): Promise<ShieldGitContext> {
-    const [gitDir, gitCommonDir, hooksDir] = await Promise.all([
+    const [rawGitDir, rawGitCommonDir, hooksDir] = await Promise.all([
       getGitDir(repoRoot),
       getGitCommonDir(repoRoot),
       getHooksDir(repoRoot),
+    ]);
+    const [gitDir, gitCommonDir] = await Promise.all([
+      rawGitDir ? await fs.realpath(rawGitDir).catch(() => rawGitDir) : rawGitDir,
+      rawGitCommonDir ? await fs.realpath(rawGitCommonDir).catch(() => rawGitCommonDir) : rawGitCommonDir,
     ]);
     if (!gitDir || !gitCommonDir || !hooksDir) {
       throw new Error(

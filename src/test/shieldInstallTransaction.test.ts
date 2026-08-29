@@ -190,9 +190,16 @@ async function assertNoUnrecordedShieldHook(repo: Repo, candidateDirs: string[])
   for (const dir of candidateDirs) {
     const live = await shieldHooksIn(dir);
     if (live.length === 0) continue;
+    // The record is populated from `fs.realpath`-canonicalized directories
+    // (see ShieldManager.resolveGitContext), so a candidate built as a
+    // plain JS path.join off a temp-dir root -- which may itself be a
+    // symlink, e.g. macOS's /var -> /private/var -- has to be
+    // canonicalized the same way before comparing, or a directory Shield
+    // correctly recorded reads as "unrecorded" by string mismatch alone.
+    const canonicalDir = await fs.realpath(dir).catch(() => dir);
     assert.ok(
-      recorded.some((r) => path.resolve(r) === path.resolve(dir)),
-      `Shield-owned hooks ${live.join(", ")} exist at ${dir} but that directory is not in Shield's installation record (${JSON.stringify(recorded)}).`,
+      recorded.some((r) => path.resolve(r) === canonicalDir),
+      `Shield-owned hooks ${live.join(", ")} exist at ${dir} (${canonicalDir}) but that directory is not in Shield's installation record (${JSON.stringify(recorded)}).`,
     );
   }
 }
@@ -385,9 +392,13 @@ test("PART 1 — the record is written as a SUPERSET before any hook moves, so a
       (nodeFs.promises as { writeFile: typeof nodeFs.promises.writeFile }).writeFile = realWriteFile;
     }
 
+    // The record holds `fs.realpath`-canonicalized directories (see
+    // ShieldManager.resolveGitContext); `newHooksDir` here is a plain
+    // path.join off `repo.dir`, which may itself be a symlink (e.g.
+    // macOS's /var -> /private/var), so canonicalize before comparing.
     const resolved = recordAtFirstHookWrite.map((d) => path.resolve(d));
     assert.ok(resolved.includes(path.resolve(originalHooksDir)), JSON.stringify(recordAtFirstHookWrite));
-    assert.ok(resolved.includes(path.resolve(newHooksDir)), JSON.stringify(recordAtFirstHookWrite));
+    assert.ok(resolved.includes(await fs.realpath(newHooksDir)), JSON.stringify(recordAtFirstHookWrite));
   } finally {
     await cleanup(repo);
   }
