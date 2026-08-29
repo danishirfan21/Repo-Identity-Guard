@@ -9,6 +9,7 @@ import { computeWorkspaceSafetyState, workspaceProblemCount } from "./core/works
 import { collectRepoFacts, resolveIdentityConfigScope } from "./services/gitService";
 import { copyToClipboard, runSavedCommand } from "./services/commandRunner";
 import { SafeActionRunner } from "./services/safeActionRunner";
+import { ShieldManager } from "./shield";
 import {
   affectsRepoIdentityGuardConfig,
   getProfiles,
@@ -53,6 +54,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const statusBar = new IdentityStatusBar();
   const memoryStore = new MemoryStore(context);
   const safeActionRunner = new SafeActionRunner();
+  const shieldManager = new ShieldManager();
+  const shieldEvaluatorScriptSource = path.join(context.extensionPath, "resources", "shield", "shield-evaluate.sh");
 
   const buildModel = (): SidebarModel => ({
     summary: latestSummary,
@@ -615,6 +618,110 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   }
 
+  /**
+   * Minimal command-palette-only entry points for Phase 3 (Shield's
+   * install/repair/disable/health-check lifecycle) — deliberately not
+   * wired into the sidebar yet; that's a later, dedicated UI phase. Every
+   * write goes through `requireWorkspaceTrust()` first, same as Fix
+   * Commit Identity, since installing a Git hook is exactly the kind of
+   * mutating action Workspace Trust exists to gate; a plain health check
+   * is read-only and works regardless.
+   */
+  async function enableShield(): Promise<void> {
+    const { facts } = latestSummary;
+    if (!facts.repoRoot) {
+      await vscode.window.showInformationMessage("Open a Git repository first.");
+      return;
+    }
+    if (!(await requireWorkspaceTrust())) return;
+
+    try {
+      const result = await shieldManager.enable(facts.repoRoot, shieldEvaluatorScriptSource, {
+        facts,
+        profiles: getProfiles(),
+        protectedBranches: getProtectedBranches(),
+      });
+      if (result.ok) {
+        await vscode.window.showInformationMessage(
+          `Shield enabled for ${facts.repoName ?? facts.repoRoot} (${result.inspection.policyProfileLabel ?? "matched profile"}).`,
+        );
+      } else {
+        await vscode.window.showWarningMessage(
+          `Shield could not be fully enabled: ${result.inspection.reasons[0] ?? "see Shield health check for details."}`,
+        );
+      }
+    } catch (error) {
+      await vscode.window.showErrorMessage(`Could not enable Shield: ${getErrorMessage(error)}`);
+    }
+  }
+
+  async function repairShield(): Promise<void> {
+    const { facts } = latestSummary;
+    if (!facts.repoRoot) {
+      await vscode.window.showInformationMessage("Open a Git repository first.");
+      return;
+    }
+    if (!(await requireWorkspaceTrust())) return;
+
+    try {
+      const result = await shieldManager.repair(facts.repoRoot, shieldEvaluatorScriptSource, {
+        facts,
+        profiles: getProfiles(),
+        protectedBranches: getProtectedBranches(),
+      });
+      if (result.ok) {
+        await vscode.window.showInformationMessage(`Shield repaired for ${facts.repoName ?? facts.repoRoot}.`);
+      } else {
+        await vscode.window.showWarningMessage(
+          `Shield is still not fully active: ${result.inspection.reasons[0] ?? "see Shield health check for details."}`,
+        );
+      }
+    } catch (error) {
+      await vscode.window.showErrorMessage(`Could not repair Shield: ${getErrorMessage(error)}`);
+    }
+  }
+
+  async function disableShield(): Promise<void> {
+    const { facts } = latestSummary;
+    if (!facts.repoRoot) {
+      await vscode.window.showInformationMessage("Open a Git repository first.");
+      return;
+    }
+    if (!(await requireWorkspaceTrust())) return;
+
+    const confirmation = await vscode.window.showWarningMessage(
+      `Disable Shield for ${facts.repoName ?? facts.repoRoot}? This removes Shield's own pre-commit hook and policy for this repository only — no other Git config, hooks, or credentials are touched.`,
+      { modal: true },
+      "Disable Shield",
+    );
+    if (confirmation !== "Disable Shield") return;
+
+    try {
+      await shieldManager.disable(facts.repoRoot);
+      await vscode.window.showInformationMessage(`Shield disabled for ${facts.repoName ?? facts.repoRoot}.`);
+    } catch (error) {
+      await vscode.window.showErrorMessage(`Could not disable Shield: ${getErrorMessage(error)}`);
+    }
+  }
+
+  async function checkShieldHealth(): Promise<void> {
+    const { facts } = latestSummary;
+    if (!facts.repoRoot) {
+      await vscode.window.showInformationMessage("Open a Git repository first.");
+      return;
+    }
+    try {
+      const { summary, state } = await shieldManager.healthCheck(facts.repoRoot);
+      if (state === "active") {
+        await vscode.window.showInformationMessage(summary);
+      } else {
+        await vscode.window.showWarningMessage(summary);
+      }
+    } catch (error) {
+      await vscode.window.showErrorMessage(`Could not check Shield health: ${getErrorMessage(error)}`);
+    }
+  }
+
   context.subscriptions.push(
     vscode.commands.registerCommand("repoIdentityGuard.scan", () => scan()),
     vscode.commands.registerCommand("repoIdentityGuard.showStatus", () => showStatus()),
@@ -625,6 +732,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("repoIdentityGuard.openSettings", () =>
       vscode.commands.executeCommand("workbench.action.openSettingsJson"),
     ),
+    vscode.commands.registerCommand("repoIdentityGuard.enableShield", () => enableShield()),
+    vscode.commands.registerCommand("repoIdentityGuard.disableShield", () => disableShield()),
+    vscode.commands.registerCommand("repoIdentityGuard.repairShield", () => repairShield()),
+    vscode.commands.registerCommand("repoIdentityGuard.checkShieldHealth", () => checkShieldHealth()),
     vscode.window.onDidChangeActiveTextEditor(() => void scan()),
     vscode.workspace.onDidChangeWorkspaceFolders(() => void scan()),
     vscode.workspace.onDidGrantWorkspaceTrust(() => void scan()),

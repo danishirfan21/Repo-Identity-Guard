@@ -74,6 +74,22 @@
       {
         "command": "repoIdentityGuard.openSettings",
         "title": "Repo Identity Guard: Open Settings"
+      },
+      {
+        "command": "repoIdentityGuard.enableShield",
+        "title": "Repo Identity Guard: Enable Shield"
+      },
+      {
+        "command": "repoIdentityGuard.disableShield",
+        "title": "Repo Identity Guard: Disable Shield"
+      },
+      {
+        "command": "repoIdentityGuard.repairShield",
+        "title": "Repo Identity Guard: Repair Shield"
+      },
+      {
+        "command": "repoIdentityGuard.checkShieldHealth",
+        "title": "Repo Identity Guard: Check Shield Health"
       }
     ],
     "configuration": {

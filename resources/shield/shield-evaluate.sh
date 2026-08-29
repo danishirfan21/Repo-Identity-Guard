@@ -1,5 +1,6 @@
 #!/bin/sh
 # shield-evaluate.sh — Shield Mode's standalone enforcement evaluator.
+# repo-identity-guard-shield-artifact v1 (evaluator)
 #
 # This is the actual runtime artifact a future Git hook (pre-commit /
 # pre-push) invokes. It has NO dependency on Node, VS Code, or any running
@@ -179,10 +180,28 @@ evaluate_commit() {
   name_matches "$COMMITTER_NAME" && email_matches "$COMMITTER_EMAIL" || COMMITTER_OK=0
 
   if [ "$AUTHOR_OK" = 0 ] || [ "$COMMITTER_OK" = 0 ]; then
+    # Which identity (author, committer, or both) actually mismatched —
+    # reported so "Found:" never has to guess.
+    WHO=""
+    [ "$AUTHOR_OK" = 0 ] && WHO="author ${AUTHOR_NAME:-(unknown)} <${AUTHOR_EMAIL:-(unknown)}>"
+    if [ "$COMMITTER_OK" = 0 ]; then
+      if [ -n "$WHO" ]; then
+        WHO="$WHO; committer ${COMMITTER_NAME:-(unknown)} <${COMMITTER_EMAIL:-(unknown)}>"
+      else
+        WHO="committer ${COMMITTER_NAME:-(unknown)} <${COMMITTER_EMAIL:-(unknown)}>"
+      fi
+    fi
+    EXPECTED_DISPLAY="${EXPECTED_NAME:+$EXPECTED_NAME }<$EXPECTED_EMAIL>"
+
     if name_matches "$CONFIGURED_NAME" && email_matches "$CONFIGURED_EMAIL"; then
-      add_reason commit-identity-override "Git config for this repo already matches $PROFILE_LABEL, but the effective identity for this commit is overridden by the environment or an explicit command-line option."
+      add_reason commit-identity-override "Profile: $PROFILE_LABEL
+Expected: $EXPECTED_DISPLAY
+Found: $WHO
+(Git config for this repo already matches $PROFILE_LABEL — the effective identity above is overridden by the environment or an explicit command-line option.)"
     else
-      add_reason commit-identity-mismatch "This commit's effective identity does not match the $PROFILE_LABEL profile (expected $EXPECTED_EMAIL)."
+      add_reason commit-identity-mismatch "Profile: $PROFILE_LABEL
+Expected: $EXPECTED_DISPLAY
+Found: $WHO"
     fi
   fi
 

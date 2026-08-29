@@ -123,6 +123,23 @@ export async function getGitCommonDir(repoRoot: string): Promise<string | null> 
   return resolveGitPath(repoRoot, ["rev-parse", "--git-common-dir"]);
 }
 
+/**
+ * The hooks directory Git will actually look in for `pre-commit`/`pre-push`
+ * etc. right now, from this worktree — via `git rev-parse --git-path
+ * hooks`, never a guessed `<repoRoot>/.git/hooks`. This is the one call
+ * that already accounts for everything Shield's hook installation must
+ * respect: a repo-level `core.hooksPath` (shared by every worktree) or a
+ * worktree-scoped one (`extensions.worktreeConfig` + `git config
+ * --worktree core.hooksPath`, affecting only this worktree) both change
+ * this answer, exactly the way they change where Git itself resolves
+ * hooks from. See docs/SHIELD_MODE.md "Hooks are shared across all
+ * worktrees, by default" / "core.hooksPath" sections for the empirical
+ * basis.
+ */
+export async function getHooksDir(repoRoot: string): Promise<string | null> {
+  return resolveGitPath(repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"]);
+}
+
 /** True when `--git-dir` and `--git-common-dir` differ, i.e. this is a linked worktree, not the main one. */
 export function isLinkedWorktree(gitDir: string | null, gitCommonDir: string | null): boolean {
   if (!gitDir || !gitCommonDir) return false;

@@ -23,6 +23,7 @@ import * as path from "node:path";
 
 const SHIELD_DIR_NAME = "repo-identity-guard";
 const SHIELD_POLICY_FILE_NAME = "shield-policy.json";
+const SHIELD_EVALUATOR_FILE_NAME = "shield-evaluate.sh";
 
 /**
  * `<gitCommonDir>/repo-identity-guard` — Shield's own subdirectory inside
@@ -49,4 +50,18 @@ export function shieldStorageDir(gitCommonDirAbsolute: string): string {
 /** `<gitCommonDir>/repo-identity-guard/shield-policy.json` — see {@link shieldStorageDir}. */
 export function shieldPolicyFilePath(gitCommonDirAbsolute: string): string {
   return path.join(shieldStorageDir(gitCommonDirAbsolute), SHIELD_POLICY_FILE_NAME);
+}
+
+/**
+ * `<gitCommonDir>/repo-identity-guard/shield-evaluate.sh` — Shield's own
+ * copy of the standalone evaluator, installed alongside the policy it
+ * reads. Copying it here (rather than having the hook reach back into the
+ * extension's own install directory) keeps enforcement working even if
+ * the extension is later updated, moved, or uninstalled while Shield
+ * remains enabled, and keeps it worktree-portable for the same reason the
+ * policy file is: this path is identical from every worktree of the
+ * repository.
+ */
+export function shieldEvaluatorScriptFilePath(gitCommonDirAbsolute: string): string {
+  return path.join(shieldStorageDir(gitCommonDirAbsolute), SHIELD_EVALUATOR_FILE_NAME);
 }

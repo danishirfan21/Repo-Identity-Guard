@@ -655,23 +655,195 @@ would be strictly worse than Shield not existing, because it manufactures
 false confidence. `--no-verify` remains the sanctioned, already-documented
 way past a hook in this state.
 
-### What's next (not this phase)
+### What's next after Phase 2 (superseded below by Phase 3, except where noted)
 
-- Writing the policy file at all (`fs` I/O on top of `src/shield/storage.ts`'s
-  pure paths) — this phase's tests write policy files directly with
-  `serializeShieldPolicy`, standing in for whatever future flow generates
-  one from a real profile + live `RepoFacts`.
-- Actual hook installation into `<git-common-dir>/hooks/`, including
-  detecting and safely coexisting with (or clearly refusing to clobber) a
-  pre-existing third-party hook manager.
+- ~~Writing the policy file at all~~ — done in Phase 3 (`ShieldManager.enable`/`repair`).
+- ~~Actual hook installation~~ — done in Phase 3, pre-commit only (see below).
 - Per-ref push inspection (using the ref lines already accepted on stdin)
   for anything beyond destination/route — e.g. force-push detection, if a
-  future phase decides that belongs in Shield.
+  future phase decides that belongs in Shield. Still not implemented — no
+  pre-push hook exists yet either (see Phase 3 below).
 - Closing the `profile-unresolved`/`profile-conflict`/`push-route-mismatch`
   gaps above, if a future design decides they're worth the added policy
-  complexity.
-- A "Shield Mode" section in Settings with an enable/disable toggle, once
-  there is something real for it to toggle.
+  complexity. Still open.
+- A "Shield Mode" section in Settings/sidebar with an enable/disable
+  toggle — Phase 3 added command-palette commands only, deliberately not a
+  sidebar redesign; still open.
 
-None of the above exists yet. This phase is the model those future phases
-must conform to.
+## Phase 3: installation lifecycle and pre-commit enforcement
+
+Phase 3 makes Shield real: `ShieldManager` (`src/shield/manager.ts`)
+installs, repairs, disables, inspects, and health-checks Shield for a
+repository, and a generated pre-commit hook (`src/shield/artifacts.ts`)
+wires the Phase 2 evaluator into an actual `git commit`. Four
+command-palette commands (`Repo Identity Guard: Enable/Disable/Repair
+Shield`, `...: Check Shield Health`) exercise this end to end without any
+sidebar redesign.
+
+### Mutation scope
+
+`ShieldManager` writes and deletes only:
+
+- `<git-common-dir>/repo-identity-guard/*` — Shield's own namespaced
+  subdirectory under this repo's Git metadata (the policy file, and now
+  also a copy of the evaluator script).
+- `<hooksDir>/pre-commit`, where `hooksDir` is resolved fresh every time
+  via `git rev-parse --path-format=absolute --git-path hooks` — never a
+  guessed `.git/hooks` — and only when that exact path is empty or
+  already carries Shield's own ownership marker.
+
+It never sets `core.hooksPath` or any other repo-local Git config key:
+empirically, the hooks directory `--git-path hooks` resolves to by
+default is already writable directly and already shared by every worktree
+(see "Hooks are shared across all worktrees, by default" above), so no
+config write was needed to make installation work. It never touches
+global Git config, SSH keys/config, credential managers/helpers, GitHub
+credentials, or any tracked file in the working tree.
+
+### Ownership and version markers, not a manifest file
+
+Every file Shield writes (`pre-commit`, and the evaluator copy under
+`repo-identity-guard/`) carries a `repo-identity-guard-shield-artifact vN`
+comment marker (`src/shield/artifacts.ts`). This is deliberately the
+*only* record of "Shield installed this" — there is no separate
+`shield-manifest.json` tracking install state. `ShieldManager.inspect()`
+re-derives `off`/`active`/`degraded`/`broken` from exactly what is on disk
+right now:
+
+| Condition | State |
+| --- | --- |
+| No Shield artifact anywhere (policy, evaluator copy, or an owned hook) | `off` |
+| A `pre-commit` exists at the currently-resolved hooks path but has no Shield marker | `degraded` — never overwritten or deleted |
+| Shield artifacts exist but the policy file is missing | `degraded` |
+| Policy file exists but fails `validateShieldPolicy` | `broken` |
+| Evaluator copy missing or unmarked | `degraded` |
+| Owned hook missing (policy + evaluator present) | `degraded` |
+| Policy valid, evaluator owned, hook owned, all at their current locations | `active` (plus a non-blocking "update available" reason if either artifact's embedded version is older than the current one) |
+
+This has two consequences worth calling out:
+
+- **A crash or interruption mid-`enable()` can never read back as
+  `active`.** If the process dies after writing the policy but before the
+  hook, the next `inspect()` sees exactly that — policy present, hook
+  absent — and reports `degraded`. There is no cached "I finished
+  installing" flag that could go stale relative to reality.
+- **A later `core.hooksPath` redirect is caught for free.** If something
+  changes `core.hooksPath` (repo- or worktree-scoped) after Shield
+  installed, `inspect()` resolves `hooksDir` fresh via Git every time —
+  it will simply stop finding Shield's owned hook at the new location and
+  report `degraded`, with no need to remember "where did Shield install
+  to last time." The old hook file left behind at the previous location
+  is inert (nothing invokes it) and cleaned up the next time `disable()`
+  runs from a context that still resolves there, or ignored otherwise —
+  a known, acceptable trade-off given `core.hooksPath` itself is an
+  already-documented full bypass (see the threat boundary table above).
+
+### Existing-hook safety
+
+`enable()`/`repair()` check hook-slot ownership *before* writing anything:
+if `<hooksDir>/pre-commit` exists and does **not** carry Shield's marker,
+activation is refused — Shield still writes its own policy and evaluator
+copy (harmless and inert without a wired hook) but does not touch the
+hook file, and `inspect()` reports `degraded` with a message naming the
+exact path and telling the user to move the foreign hook aside and re-run
+`Repair Shield`. `disable()` re-verifies ownership immediately before
+deleting the hook file, so a hook that became foreign after Shield
+installed it (replaced by something else in the meantime) is also never
+deleted. More advanced coexistence (chaining into an existing hook
+manager) is explicitly out of scope for this phase.
+
+### The pre-commit hook
+
+The installed hook (`buildPreCommitHookScript()` in
+`src/shield/artifacts.ts`) contains no enforcement logic itself: it
+resolves `git rev-parse --path-format=absolute --git-common-dir`, checks
+for Shield's evaluator copy there, and — if present — runs it with
+`commit` and relays a non-zero result as:
+
+```
+Repo Identity Guard Shield
+
+COMMIT BLOCKED
+
+Shield: [commit-identity-mismatch] Profile: Work
+Expected: Danish Irfan <work@example.com>
+Found: author Danish Irfan <personal@example.com>
+
+Fix the repository identity or disable Shield for this repository.
+```
+
+If the evaluator copy is missing (a half-removed install), the hook
+fails **open** (`exit 0`) rather than blocking an ordinary commit because
+of Shield's own incomplete state — the same "never manufacture false
+confidence, but also never manufacture a false block" posture as the
+evaluator's own fail-closed behavior applies at a different layer (the
+evaluator fails *closed* on a broken/missing *policy* once it's actually
+running; the hook fails *open* on a missing *evaluator*, since at that
+point there's no Shield installation left to trust either way, and the
+existing behavior — no Shield hook at all — is the honest fallback).
+
+Because the evaluator copy and the policy both live under the shared
+git-common-dir (Phase 1's storage decision) and the hook itself is
+installed once at whatever `--git-path hooks` resolves to (shared by
+every worktree by default), one `enable()` call from any worktree
+protects every worktree of that repository — confirmed end-to-end in
+`shieldManager.test.ts`'s linked-worktree test, not just asserted.
+
+### Empirical findings from this phase
+
+- **`git commit --author="Name <email>"` IS visible to the pre-commit
+  hook.** `git var GIT_AUTHOR_IDENT` (and the `GIT_AUTHOR_NAME`/
+  `GIT_AUTHOR_EMAIL` environment variables Git sets for the hook's own
+  process) reflect the `--author` override, confirmed against real Git
+  2.43 both by hand and in an automated test. Shield blocks it exactly
+  like an environment-variable override (`commit-identity-override`,
+  since the repo's own config is untouched and still correct).
+- **`git -c user.email=... commit` is also visible via the effective
+  identity, but NOT via `git config --local`.** `-c` overrides show up in
+  `git var GIT_AUTHOR_IDENT` (inherited by the hook through
+  `GIT_CONFIG_PARAMETERS`), but an explicit `git config --local
+  user.email` query — what the hook reads as "configured" — does not see
+  it. This is exactly the override case, not the mismatch case, and
+  matches how an environment-variable override behaves.
+- **`git rebase --continue` does NOT invoke the pre-commit hook for the
+  commit it creates internally**, confirmed against real Git 2.43: a
+  pre-commit hook that unconditionally exits 1 does not stop
+  `--continue` from completing successfully. This is a genuine,
+  documented gap, not an oversight — Shield's `repo-operation-in-progress`
+  reason still fires correctly for a *plain* `git commit` made while a
+  rebase is in progress (e.g. conflict resolved and staged, `--continue`
+  not yet run), which is the realistic path an ordinary `git commit`
+  during a rebase actually takes, and is what
+  `shieldManager.test.ts` exercises. A future phase considering a
+  `post-rewrite`/`pre-rebase` hook, or accepting this as a known
+  Shield boundary, should start from this finding rather than assuming
+  `--continue` is covered.
+- **A real `git commit` cannot reach the `merge-conflicts` reason at
+  all**, because Git itself refuses to commit while unmerged files exist
+  ("Committing is not possible because you have unmerged files") *before
+  any hook runs* — confirmed in `shieldManager.test.ts`. Shield's
+  `merge-conflicts` check is genuine defense-in-depth (exercised directly
+  against `shield-evaluate.sh` in `shieldEvaluatorScript.test.ts`, and
+  still correct to keep for e.g. a future hook context where Git's own
+  guard doesn't apply), not something an end-to-end `git commit` test can
+  observe.
+- **`--no-verify` bypasses Shield's pre-commit hook entirely** — Git's
+  own documented, unconditional escape hatch, exercised end-to-end in
+  `shieldManager.test.ts`: a commit that would otherwise be blocked for a
+  wrong identity succeeds under `--no-verify`. This is expected and was
+  already documented as a permanent bypass in Phase 1; Phase 3 does not
+  and cannot close it.
+
+### What's next (not this phase)
+
+- A pre-push hook wired the same way (Phase 2 already defines
+  `evaluatePush`/the shell script's `push` mode; only the hook
+  installation is missing).
+- Per-ref push inspection, the `profile-unresolved`/`profile-conflict`/
+  `push-route-mismatch` gaps, and a Settings/sidebar Shield toggle — all
+  still open, as listed above.
+- Coexisting with a pre-existing third-party hook manager (Husky,
+  `pre-commit`, Lefthook) instead of simply refusing to install
+  alongside one.
+- A `commit-msg` or `post-rewrite` hook, if a future design wants to catch
+  `git rebase --continue`'s commits given the gap documented above.
