@@ -328,7 +328,17 @@ async function readBytesIfExists(filePath: string): Promise<Buffer | null> {
     // ENOENT): nothing readable there either — reported as absent so
     // `classifyHookFile` is the single place that decides what an
     // unusual file type means.
-    if (code === "ENOENT" || code === "EISDIR" || code === "ELOOP") return null;
+    //
+    // ENOTDIR is the same class of answer and was missing (Phase 9,
+    // empirically reproduced): a plain FILE occupying a path component —
+    // e.g. something writing `.git/repo-identity-guard` as a file — made
+    // `inspect()` throw ENOTDIR straight out of `enable()`, so a
+    // repository in that state could not even be diagnosed, let alone
+    // repaired. It means "nothing readable at this path" exactly as much
+    // as EISDIR does. ENAMETOOLONG is included for the same reason.
+    if (code === "ENOENT" || code === "EISDIR" || code === "ELOOP" || code === "ENOTDIR" || code === "ENAMETOOLONG") {
+      return null;
+    }
     throw error;
   }
 }
@@ -412,8 +422,19 @@ async function writeFileAtomic(filePath: string, content: string | Buffer, mode?
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
   const tempPath = path.join(dir, `.${path.basename(filePath)}.tmp-${crypto.randomBytes(6).toString("hex")}`);
-  await fs.writeFile(tempPath, content, mode !== undefined ? { mode } : undefined);
-  await fs.rename(tempPath, filePath);
+  try {
+    await fs.writeFile(tempPath, content, mode !== undefined ? { mode } : undefined);
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    // Phase 9: clean the temp file up on failure. Without this, a failed
+    // rename (a directory occupying the destination, a read-only mount, a
+    // full disk) stranded a `.<name>.tmp-<hex>` file in Shield's own
+    // storage/hooks directory forever — which `disable()`'s deliberately
+    // non-forcing `rmdir` then could never clear, so a repository that hit
+    // one transient write error kept a permanent, unexplained leftover.
+    await fs.unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
 }
 
 async function deleteIfExists(filePath: string): Promise<void> {
@@ -961,64 +982,226 @@ export class ShieldManager {
     // design) and self-heals a previously-corrupted copy of either.
     const evaluatorScript = await fs.readFile(evaluatorScriptSource);
 
+    // ==================================================================
+    // TRANSACTION — prepare → persist lifecycle metadata → install →
+    //               verify → commit (Phase 9)
+    // ==================================================================
+    //
+    // Phase 9 finding, empirically reproduced (see
+    // src/test/shieldInstallRecordTransaction.test.ts): the install record
+    // used to be written best-effort, AFTER orphan cleanup and in the same
+    // breath as the artifacts, and its failure was reported as a warning
+    // while all three hook shims were installed anyway. The observed result
+    // on a repository whose record file could not be written was
+    // `state: "active"`, three live fail-CLOSED hooks on disk, and NO
+    // durable record naming the directory they live in — precisely the
+    // orphan hazard `installRecord.ts` exists to prevent, and the one that
+    // (under v5 fail-closed shims) can permanently block every commit and
+    // push in a repository with no Shield left to repair or disable it.
+    //
+    // So the record is now a SAFETY PREREQUISITE, not bookkeeping:
+    //
+    //  1. prepare — everything above this point: resolve Git context,
+    //     refuse an unsupported Git, build the policy, classify every hook
+    //     slot, read the evaluator source. No writes have happened yet.
+    //  2. persist required lifecycle metadata — create Shield's storage
+    //     directory and durably record every hooks directory Shield will
+    //     be responsible for. This is a SUPERSET (previous locations plus
+    //     this one), so at no instant is a live Shield hook missing from
+    //     the record. If this step cannot be completed, the transaction
+    //     ABORTS here, before anything is installed, moved, or removed.
+    //  3. install/update artifacts — policy, evaluator, hooks — each with
+    //     an exact byte+mode snapshot taken first so a failure part-way
+    //     through can be rolled back to the state that preceded it.
+    //  4. verify — a fresh `inspect()`.
+    //  5. commit — narrow the record to the locations that actually still
+    //     hold something, and report.
+    //
+    // Orphan cleanup deliberately moved to AFTER step 2: destroying a
+    // known-good previous installation is a mutation like any other, and
+    // must never happen on the strength of a transaction that cannot even
+    // record where it is going.
+
+    const storageDir = shieldStorageDir(gitContext.gitCommonDir);
+    const installRecordPath = shieldInstallRecordFilePath(storageDir);
+    const previousRecord = await readShieldInstallRecord(installRecordPath);
+
+    // Does Shield already have something on disk here worth protecting?
+    // Decides FIRST-ENABLE (abort must leave no Shield state behind) from
+    // REPAIR/MIGRATION (abort must leave the existing, known-good
+    // enforcement exactly as it is).
+    const preExisting = await this.hasExistingShieldState(gitContext, previousRecord);
+
+    // ---- step 2: persist required lifecycle metadata ----
+    let storageDirCreated = false;
+    let metadataFailure: string | undefined;
+    try {
+      storageDirCreated = (await fs.mkdir(storageDir, { recursive: true })) !== undefined;
+    } catch (error) {
+      metadataFailure = `Shield's storage directory (${storageDir}) could not be created: ${toMessage(error)}`;
+    }
+
+    // The superset: every hooks directory Shield was already responsible
+    // for, PLUS the one it is about to install into. Writing the superset
+    // first (and narrowing it only after cleanup has actually succeeded)
+    // guarantees the record is never momentarily missing a live location.
+    const supersetDirs = normalizeHookDirs([...(previousRecord?.hookDirs ?? []), gitContext.hooksDir]);
+    if (metadataFailure === undefined) {
+      // An existing record that already names every directory this install
+      // needs IS durable lifecycle metadata — there is nothing new to
+      // persist, so a failure to rewrite an already-correct file must not
+      // abort an otherwise-safe repair.
+      const alreadyCurrent =
+        !!previousRecord &&
+        supersetDirs.length === previousRecord.hookDirs.length &&
+        supersetDirs.every((dir) => previousRecord.hookDirs.some((d) => sameHookDir(d, dir)));
+      if (!alreadyCurrent && !(await writeShieldInstallRecord(installRecordPath, supersetDirs, input.now ?? Date.now()))) {
+        metadataFailure = `Shield could not durably record which hooks directory it installs into (${installRecordPath} is not writable)`;
+      }
+    }
+
+    if (metadataFailure !== undefined) {
+      // ---- ABORT. Nothing has been installed, moved, or removed. ----
+      if (storageDirCreated) {
+        // Leave no Shield state behind on a failed FIRST enable. rmdir
+        // (never rm -rf) so this can only ever remove a directory Shield
+        // itself just created and that is still empty.
+        await fs.rmdir(storageDir).catch(() => undefined);
+      }
+      const inspection = await this.inspect(repoRoot);
+      const headline = preExisting
+        ? `${metadataFailure}. Shield could not safely establish lifecycle tracking, so this repair was ABORTED before touching anything: no hook was installed, moved, or removed, and the Shield installation already present here is unchanged and still enforcing. Until this is resolved Shield cannot guarantee it can find and remove every hook it owns, so it is reported as degraded. Fix the permissions on ${storageDir} and run "Repair Shield" again.`
+        : `${metadataFailure}. Shield was NOT enabled: without that record it could not guarantee it would later be able to find and remove the hooks it installs, and a Shield hook that Disable Shield cannot reach would block every commit and push in this repository with no Shield left to repair it. Nothing was installed and no Shield state was left behind. Fix the permissions on ${storageDir} and try again.`;
+      return {
+        ok: false,
+        inspection: {
+          ...inspection,
+          // Never report ACTIVE out of an aborted enable/repair: lifecycle
+          // tracking is exactly the thing that could not be established.
+          state: inspection.state === "active" ? "degraded" : inspection.state,
+          reasons: [headline, ...inspection.reasons],
+        },
+      };
+    }
+
     // Adopt any Shield-owned hooks stranded at a previous install location
     // BEFORE installing here, so a repair genuinely consolidates rather
     // than adding a third live copy. Same conservative ownership rule as
     // `disable()`: a chained original is restored if one is waiting,
     // otherwise the hook is simply removed; anything Shield cannot prove
-    // it owns is left completely alone.
+    // it owns is left completely alone. Safe to run now — and only now —
+    // because the record above already names every location involved.
     const orphanCleanup = await this.cleanUpOrphanedInstallations(gitContext);
 
-    // Record where Shield is about to install BEFORE writing the hooks,
-    // never after. If the process dies mid-install, the record naming this
-    // directory is strictly better than no record: `disable()` then still
-    // knows to look here. The reverse order could leave a hook with no
-    // record pointing at it — the exact orphan this record exists to
-    // prevent.
-    const installRecordPath = shieldInstallRecordFilePath(shieldStorageDir(gitContext.gitCommonDir));
-    const previousRecord = await readShieldInstallRecord(installRecordPath);
-    const recordedDirs = normalizeHookDirs([
-      // Locations that could not be fully cleaned above stay on the list so
-      // a later disable/repair tries again; cleaned ones are dropped.
+    // ---- step 3: install artifacts, with rollback ----
+    //
+    // Every write snapshots the exact prior bytes and mode of the path it
+    // touches first, and pushes an undo. On a failure part-way through,
+    // undos run in REVERSE order — hooks before evaluator before policy —
+    // so the rollback itself can never pass through the one state that is
+    // genuinely dangerous under v5 fail-closed shims ("hook present,
+    // evaluator gone"). Nothing outside the exact set of paths this
+    // operation wrote is ever touched.
+    const undos: Array<() => Promise<void>> = [];
+    const writeTracked = async (filePath: string, content: string | Buffer, mode?: number): Promise<void> => {
+      const before = await readBytesIfExists(filePath).catch(() => null);
+      const beforeMode = before === null ? undefined : await modeOf(filePath);
+      undos.push(async () => {
+        if (before === null) await deleteIfExists(filePath);
+        else await writeFileAtomic(filePath, before, beforeMode);
+      });
+      await writeFileAtomic(filePath, content, mode);
+    };
+
+    try {
+      await writeTracked(policyPath, serializeShieldPolicy(built.policy));
+      await writeTracked(evaluatorPath, evaluatorScript, 0o755);
+
+      for (const write of hookWrites) {
+        if (write.mode === "skip") continue;
+        if (write.mode === "chain") {
+          // Preserve the foreign hook's exact bytes and executable bit at
+          // its sidecar location BEFORE Shield's own hook takes its place —
+          // if the process dies between these two writes, inspect() sees a
+          // hook slot that's either still the untouched foreign hook (sidecar
+          // write didn't complete) or already Shield's own with a sidecar
+          // present (safe, resumable — re-running enable() with chaining
+          // again is a no-op here since the slot is now Shield-owned).
+          await writeTracked(chainedOriginalPath(write.hookPath), write.originalContent, write.originalMode);
+        }
+        await writeTracked(write.hookPath, write.spec.build(), 0o755);
+      }
+    } catch (error) {
+      const rollbackFailures: string[] = [];
+      for (const undo of undos.reverse()) {
+        await undo().catch((rollbackError) => rollbackFailures.push(toMessage(rollbackError)));
+      }
+      const inspection = await this.inspect(repoRoot);
+      return {
+        ok: false,
+        inspection: {
+          ...inspection,
+          state: inspection.state === "active" ? "degraded" : inspection.state,
+          reasons: [
+            `Shield could not finish installing its artifacts: ${toMessage(error)}. ${
+              rollbackFailures.length === 0
+                ? "Everything this operation had written was rolled back to its previous contents; nothing Shield does not own was touched."
+                : `Rolling back was itself incomplete (${rollbackFailures.join("; ")}) — run "Repair Shield" or "Disable Shield".`
+            } Shield's installation record still names every hooks directory involved, so "Disable Shield" can still reach them.`,
+            ...orphanCleanup.reasons,
+            ...inspection.reasons,
+          ],
+        },
+      };
+    }
+
+    // ---- steps 4 + 5: verify, then commit the narrowed record ----
+    const inspection = await this.inspect(repoRoot);
+
+    // Narrow the record from the superset written in step 2 down to the
+    // locations that actually still hold something: this hooks directory,
+    // plus any previous location cleanup could not finish. Best-effort by
+    // design — the superset already on disk is a strict over-approximation,
+    // so failing to narrow it can only ever make a later Disable/Repair
+    // look in one extra place, never miss one.
+    const narrowedDirs = normalizeHookDirs([
       ...(previousRecord?.hookDirs ?? []).filter((dir) => orphanCleanup.stillPresentDirs.some((d) => sameHookDir(d, dir))),
       gitContext.hooksDir,
     ]);
-    // mkdir first: writeShieldInstallRecord is best-effort and must not be
-    // the thing that creates Shield's storage directory by luck.
-    await fs.mkdir(shieldStorageDir(gitContext.gitCommonDir), { recursive: true });
-    const recordWritten = await writeShieldInstallRecord(installRecordPath, recordedDirs, input.now ?? Date.now());
-
-    await writeFileAtomic(policyPath, serializeShieldPolicy(built.policy));
-    await writeFileAtomic(evaluatorPath, evaluatorScript, 0o755);
-
-    for (const write of hookWrites) {
-      if (write.mode === "skip") continue;
-      if (write.mode === "chain") {
-        // Preserve the foreign hook's exact bytes and executable bit at
-        // its sidecar location BEFORE Shield's own hook takes its place —
-        // if the process dies between these two writes, inspect() sees a
-        // hook slot that's either still the untouched foreign hook (sidecar
-        // write didn't complete) or already Shield's own with a sidecar
-        // present (safe, resumable — re-running enable() with chaining
-        // again is a no-op here since the slot is now Shield-owned).
-        await writeFileAtomic(chainedOriginalPath(write.hookPath), write.originalContent, write.originalMode);
-      }
-      await writeFileAtomic(write.hookPath, write.spec.build(), 0o755);
+    if (narrowedDirs.length !== supersetDirs.length) {
+      await writeShieldInstallRecord(installRecordPath, narrowedDirs, input.now ?? Date.now());
     }
 
-    const inspection = await this.inspect(repoRoot);
-    const extraReasons = [
-      ...orphanCleanup.reasons,
-      ...(recordWritten
-        ? []
-        : [
-            `Shield could not write its installation record at ${installRecordPath}. Shield is installed and enforcing, but if "core.hooksPath" is changed before Shield is disabled, Disable Shield may not find these hooks to remove them — check that this directory is writable and run "Repair Shield".`,
-          ]),
-    ];
+    const extraReasons = [...orphanCleanup.reasons];
     return {
       ok: inspection.state === "active" && extraReasons.length === 0,
       inspection: extraReasons.length === 0 ? inspection : { ...inspection, reasons: [...extraReasons, ...inspection.reasons] },
     };
+  }
+
+  /**
+   * Whether this repository already carries Shield state worth protecting
+   * — used only to tell a failed FIRST enable (which must leave nothing
+   * behind) from a failed REPAIR/migration (which must leave the existing,
+   * known-good enforcement completely untouched). Deliberately generous:
+   * anything that even looks like a prior Shield install counts, because
+   * the consequence of guessing "first enable" wrongly is destroying
+   * working enforcement, while guessing "repair" wrongly only leaves an
+   * empty directory behind.
+   */
+  private async hasExistingShieldState(
+    gitContext: ShieldGitContext,
+    previousRecord: { hookDirs: string[] } | undefined,
+  ): Promise<boolean> {
+    if (previousRecord && previousRecord.hookDirs.length > 0) return true;
+    for (const filePath of [shieldPolicyFilePath(gitContext.gitCommonDir), shieldEvaluatorScriptFilePath(gitContext.gitCommonDir)]) {
+      if ((await readBytesIfExists(filePath).catch(() => null)) !== null) return true;
+    }
+    for (const spec of HOOK_SPECS) {
+      const bytes = await readBytesIfExists(path.join(gitContext.hooksDir, spec.fileName)).catch(() => null);
+      if (bytes !== null && isOwnedBytes(bytes)) return true;
+    }
+    return false;
   }
 
   /**

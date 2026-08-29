@@ -53,11 +53,21 @@ import * as path from "node:path";
  *   Shield will touch it. A tampered or stale record can therefore only
  *   ever cause Shield to look somewhere useless — never to delete a file
  *   it cannot prove it owns.
- * - **Best-effort by design.** A missing, unreadable, or malformed record
- *   is not an error and never blocks enable/disable/repair; it just means
- *   Shield knows about fewer previous locations. Failing an install
- *   because a bookkeeping file could not be parsed would be strictly
- *   worse than proceeding with the currently-resolved hooks directory.
+ * - **Reading is best-effort; WRITING is a safety prerequisite.** A
+ *   missing, unreadable, or malformed record on *read* is not an error and
+ *   never blocks anything: it just means Shield knows about fewer previous
+ *   locations, and every location it does know is re-verified anyway.
+ *   Failing to *write* it is a different matter entirely, and as of Phase 9
+ *   it aborts the operation — see `ShieldManager.enable`'s "TRANSACTION"
+ *   comment. Empirically (before that change): with this file unwritable,
+ *   `enable()` installed all three fail-CLOSED hook shims, reported
+ *   `state: "active"`, and left no record of where those hooks were. Move
+ *   `core.hooksPath` afterwards and Disable Shield can no longer reach
+ *   them; move it back and they are live again with no evaluator beside
+ *   them, blocking every commit and push with no Shield left to repair or
+ *   disable. "Shield installed enforcement it cannot prove it can remove"
+ *   is not a warning-level condition, so `writeShieldInstallRecord`'s
+ *   boolean return is now a transaction gate, not a diagnostic.
  */
 
 const INSTALL_RECORD_FILE_NAME = "installations.json";
@@ -154,9 +164,12 @@ export async function readShieldInstallRecord(recordPath: string): Promise<Shiel
 /**
  * Writes the record atomically (same-directory temp file + rename, so the
  * rename is guaranteed to be on the same filesystem and therefore atomic).
- * Never throws: a bookkeeping write failing must not fail an otherwise
- * successful enable/repair. Returns whether the write landed, so a caller
- * that wants to report reduced cleanup coverage can.
+ * Never throws — it reports success as a boolean instead, because its
+ * caller needs to *decide* on that result rather than handle an exception:
+ * `ShieldManager.enable` treats `false` as a hard abort of the whole
+ * install transaction (see this module's doc comment and that method's
+ * "TRANSACTION" comment). Returning `true` means the record is durably on
+ * disk at `recordPath` right now.
  */
 export async function writeShieldInstallRecord(recordPath: string, hookDirs: readonly string[], now: number): Promise<boolean> {
   const content = serializeShieldInstallRecord({
