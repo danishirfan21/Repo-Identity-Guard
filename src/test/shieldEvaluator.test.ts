@@ -186,6 +186,7 @@ function pushFacts(overrides: Partial<PushEvalFacts> = {}): PushEvalFacts {
   return {
     remoteName: "origin",
     remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git",
+    sshCommandOverrides: [],
     ...overrides,
   };
 }
@@ -245,10 +246,10 @@ test("evaluatePush: a push-destination mismatch always blocks, regardless of str
   assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
 });
 
-test("evaluatePush skips the destination check (rather than guessing) when the policy never recorded an approved destination", () => {
+test("evaluatePush fails closed with push-destination-mismatch when the policy never recorded an approved destination (Phase 4: ambiguity blocks, never guesses safe)", () => {
   const decision = evaluatePush(policy({ approvedPushDestination: undefined }), pushFacts());
-  // No destination mismatch reported — only route trust is evaluated.
-  assert.ok(!decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
 });
 
 test("evaluatePush never claims cryptographic account verification in any reason message", () => {

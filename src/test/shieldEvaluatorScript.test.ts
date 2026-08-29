@@ -319,6 +319,7 @@ test("push to a different owner than approved -> blocked with push-destination-m
     const decision = evaluatePush(defaultPolicy(), {
       remoteName: "origin",
       remoteUrl: "git@github-work:SomeoneElse/other-repo.git",
+      sshCommandOverrides: [],
     });
     assert.equal(decision.allowed, false);
     assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));

@@ -1,7 +1,8 @@
 /**
  * Ownership/version marking for the files Shield writes onto disk (the
- * pre-commit hook shim and its copy of the standalone evaluator). Both are
- * plain shell scripts, so "ownership" is a comment line embedded in the
+ * pre-commit and pre-push hook shims, and its copy of the standalone
+ * evaluator). All are plain shell scripts, so "ownership" is a comment line
+ * embedded in the
  * file itself — checked before ShieldManager will overwrite or delete
  * anything at a path it doesn't fully control, and read back by
  * `inspect()`/`repair()` to tell "this is Shield's own artifact, possibly
@@ -94,6 +95,72 @@ fi
   printf '%s\\n' "$REASON" | grep -v '^Shield: BLOCKED'
   echo ""
   echo "Fix the repository identity or disable Shield for this repository."
+} >&2
+
+exit "$CODE"
+`;
+}
+
+/**
+ * The pre-push hook Shield installs. Like the pre-commit hook, it contains
+ * no enforcement logic of its own -- it forwards Git's own pre-push
+ * arguments (`$1` = remote name, `$2` = remote location/URL) and its own
+ * stdin (the `<local-ref> <local-sha1> <remote-ref> <remote-sha1>` lines
+ * Git feeds a real pre-push hook) straight through to the evaluator copy
+ * Shield placed alongside the repo's policy -- these are the actual
+ * action-time values for THIS push, never a value predicted earlier by an
+ * extension scan. Fails open (exit 0) if the evaluator copy is missing,
+ * for the same reason the pre-commit hook does.
+ */
+export function buildPrePushHookScript(): string {
+  return `#!/bin/sh
+# Repo Identity Guard Shield pre-push hook (owned by Repo Identity Guard)
+# ${SHIELD_ARTIFACT_MARKER} v${SHIELD_ARTIFACT_VERSION} (pre-push)
+#
+# Managed by Repo Identity Guard's Shield Mode. Do not hand-edit this file
+# -- "Repo Identity Guard: Repair Shield" regenerates it, and "Repo
+# Identity Guard: Disable Shield" removes it (only because that command
+# recognizes this exact marker comment; a hand-edited copy that keeps the
+# marker would still be recognized as Shield's own and be replaced/removed
+# by those commands -- if you need to customize hook behavior, chain your
+# own separate hook instead of editing this one).
+set -eu
+
+REMOTE_NAME="\${1:-}"
+REMOTE_LOCATION="\${2:-}"
+
+GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+EVAL_SCRIPT="$GIT_COMMON_DIR/repo-identity-guard/shield-evaluate.sh"
+
+# No evaluator copy present -- nothing to enforce. Fail open: a half
+# installed/removed Shield must never be the reason an ordinary push is
+# blocked.
+[ -f "$EVAL_SCRIPT" ] || exit 0
+
+# Stdin here is Git's own <local-ref> <local-sha1> <remote-ref>
+# <remote-sha1> lines for this push -- not redirected, so the evaluator
+# invocation below inherits it exactly as Git provided it.
+set +e
+REASON=$(sh "$EVAL_SCRIPT" push "$REMOTE_NAME" "$REMOTE_LOCATION" 2>&1 >/dev/null)
+CODE=$?
+set -e
+
+if [ "$CODE" -eq 0 ]; then
+  exit 0
+fi
+
+{
+  echo ""
+  echo "Repo Identity Guard Shield"
+  echo ""
+  echo "PUSH BLOCKED"
+  echo ""
+  echo "Remote: $REMOTE_NAME"
+  echo "Destination: $REMOTE_LOCATION"
+  echo ""
+  printf '%s\\n' "$REASON" | grep -v '^Shield: BLOCKED'
+  echo ""
+  echo "Fix the push destination/route or disable Shield for this repository."
 } >&2
 
 exit "$CODE"

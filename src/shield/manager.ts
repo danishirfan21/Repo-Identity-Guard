@@ -7,12 +7,13 @@ import { Profile, RepoFacts } from "../types";
 import {
   SHIELD_ARTIFACT_VERSION,
   buildPreCommitHookScript,
+  buildPrePushHookScript,
   extractShieldArtifactVersion,
   isShieldOwnedArtifact,
 } from "./artifacts";
 import { ShieldPolicy, buildShieldPolicy, parseShieldPolicy, serializeShieldPolicy } from "./policy";
 import { shieldEvaluatorScriptFilePath, shieldPolicyFilePath, shieldStorageDir } from "./storage";
-import { ShieldLifecycleState } from "./types";
+import { ShieldAction, ShieldLifecycleState } from "./types";
 
 /**
  * ShieldManager owns Shield's on-disk lifecycle: installing/removing/
@@ -29,12 +30,14 @@ import { ShieldLifecycleState } from "./types";
  * ShieldManager writes/deletes only:
  *  - `<gitCommonDir>/repo-identity-guard/*` — Shield's own namespaced
  *    subdirectory under this repo's Git metadata (policy, evaluator copy).
- *  - `<hooksDir>/pre-commit` — resolved fresh via `git rev-parse
- *    --git-path hooks` (see `getHooksDir`), and only ever written or
- *    deleted when that exact path is empty or already carries Shield's
- *    own ownership marker (see `src/shield/artifacts.ts`). A foreign
- *    `pre-commit` hook already occupying that path is never overwritten
- *    and never deleted.
+ *  - `<hooksDir>/pre-commit` and `<hooksDir>/pre-push` — resolved fresh via
+ *    `git rev-parse --git-path hooks` (see `getHooksDir`), and each only
+ *    ever written or deleted when that exact path is empty or already
+ *    carries Shield's own ownership marker (see `src/shield/artifacts.ts`).
+ *    A foreign hook already occupying either path is never overwritten and
+ *    never deleted — the two hooks are evaluated and installed
+ *    independently, so a foreign `pre-push` never blocks installing
+ *    Shield's `pre-commit`, or vice versa.
  *
  * It never touches global Git config, SSH keys/config, credential
  * managers/helpers, GitHub credentials, or any tracked file in the
@@ -71,14 +74,25 @@ export interface ShieldGitContext {
 
 export type ShieldArtifactOwnership = "shield" | "foreign" | "absent";
 
+/** One of the two hook files Shield can install — see `HOOK_SPECS`. */
+export type ShieldHookFileName = "pre-commit" | "pre-push";
+
+export interface ShieldHookInspection {
+  fileName: ShieldHookFileName;
+  /** The Git action this hook file governs — used to decide whether its absence matters (only when `policy.enabledActions` includes this action). */
+  action: ShieldAction;
+  path: string;
+  ownership: ShieldArtifactOwnership;
+  version?: number;
+}
+
 export interface ShieldInspection {
   state: ShieldLifecycleState;
   /** Human-readable diagnostic lines explaining `state` — always empty when `state` is "active" with nothing to repair. */
   reasons: string[];
   gitContext?: ShieldGitContext;
-  hookPath?: string;
-  hookOwnership?: ShieldArtifactOwnership;
-  hookVersion?: number;
+  /** One entry per hook file Shield can install (`pre-commit`, `pre-push`), in that order — always present, even when `ownership` is `"absent"`. */
+  hooks: ShieldHookInspection[];
   policyPath?: string;
   policyPresent: boolean;
   policyValid: boolean;
@@ -101,7 +115,17 @@ export interface ShieldEnableInput {
   now?: number;
 }
 
-const HOOK_FILE_NAME = "pre-commit";
+interface HookSpec {
+  fileName: ShieldHookFileName;
+  action: ShieldAction;
+  build: () => string;
+}
+
+/** The hook files Shield can install, and which Git action each one governs — order here is the order `ShieldInspection.hooks` reports them in. */
+const HOOK_SPECS: readonly HookSpec[] = [
+  { fileName: "pre-commit", action: "commit", build: buildPreCommitHookScript },
+  { fileName: "pre-push", action: "push", build: buildPrePushHookScript },
+];
 
 function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -164,6 +188,12 @@ export class ShieldManager {
       return {
         state: "broken",
         reasons: [`Could not inspect this repository's Git state: ${toMessage(error)}`],
+        hooks: HOOK_SPECS.map((spec) => ({
+          fileName: spec.fileName,
+          action: spec.action,
+          path: "",
+          ownership: "absent" as ShieldArtifactOwnership,
+        })),
         policyPresent: false,
         policyValid: false,
         evaluatorPresent: false,
@@ -173,34 +203,54 @@ export class ShieldManager {
 
     const policyPath = shieldPolicyFilePath(gitContext.gitCommonDir);
     const evaluatorPath = shieldEvaluatorScriptFilePath(gitContext.gitCommonDir);
-    const hookPath = path.join(gitContext.hooksDir, HOOK_FILE_NAME);
 
-    const [policyRaw, evaluatorRaw, hookRaw] = await Promise.all([
+    const [policyRaw, evaluatorRaw, ...hookRaws] = await Promise.all([
       readFileIfExists(policyPath),
       readFileIfExists(evaluatorPath),
-      readFileIfExists(hookPath),
+      ...HOOK_SPECS.map((spec) => readFileIfExists(path.join(gitContext.hooksDir, spec.fileName))),
     ]);
 
     const policyResult = policyRaw !== null ? parseShieldPolicy(policyRaw) : undefined;
     const evaluatorOwned = evaluatorRaw !== null && isShieldOwnedArtifact(evaluatorRaw);
     const evaluatorVersion = evaluatorOwned ? extractShieldArtifactVersion(evaluatorRaw as string) : undefined;
 
-    const hookOwnership: ShieldArtifactOwnership =
-      hookRaw === null ? "absent" : isShieldOwnedArtifact(hookRaw) ? "shield" : "foreign";
-    const hookVersion = hookOwnership === "shield" ? extractShieldArtifactVersion(hookRaw as string) : undefined;
+    const hooks: ShieldHookInspection[] = HOOK_SPECS.map((spec, i) => {
+      const raw = hookRaws[i];
+      const ownership: ShieldArtifactOwnership = raw === null ? "absent" : isShieldOwnedArtifact(raw) ? "shield" : "foreign";
+      return {
+        fileName: spec.fileName,
+        action: spec.action,
+        path: path.join(gitContext.hooksDir, spec.fileName),
+        ownership,
+        version: ownership === "shield" ? extractShieldArtifactVersion(raw as string) : undefined,
+      };
+    });
 
     const reasons: string[] = [];
     let state: ShieldLifecycleState;
 
-    const anyShieldArtifactPresent = policyRaw !== null || evaluatorRaw !== null || hookOwnership === "shield";
+    const anyShieldArtifactPresent =
+      policyRaw !== null || evaluatorRaw !== null || hooks.some((h) => h.ownership === "shield");
+
+    const foreignHooks = hooks.filter((h) => h.ownership === "foreign");
+    // Only a hook whose action this policy actually governs matters for
+    // "is Shield fully active" — a policy that (for whatever reason) only
+    // enables "commit" must not report degraded over a missing pre-push
+    // hook it never intended to install.
+    const enabledActions = policyResult?.ok ? policyResult.policy.enabledActions : undefined;
+    const missingGovernedHooks = hooks.filter(
+      (h) => h.ownership === "absent" && (enabledActions ? enabledActions.includes(h.action) : true),
+    );
 
     if (!anyShieldArtifactPresent) {
       state = "off";
-    } else if (hookOwnership === "foreign") {
+    } else if (foreignHooks.length > 0) {
       state = "degraded";
-      reasons.push(
-        `A pre-commit hook already exists at ${hookPath} that Repo Identity Guard did not create. Shield will not overwrite or delete it — move it aside (or chain into it yourself), then run "Repair Shield".`,
-      );
+      for (const hook of foreignHooks) {
+        reasons.push(
+          `A ${hook.fileName} hook already exists at ${hook.path} that Repo Identity Guard did not create. Shield will not overwrite or delete it — move it aside (or chain into it yourself), then run "Repair Shield".`,
+        );
+      }
     } else if (!policyResult) {
       state = "degraded";
       reasons.push('Shield artifacts are present but no policy file was found. Run "Repair Shield" or re-enable Shield.');
@@ -214,13 +264,17 @@ export class ShieldManager {
       reasons.push(
         'Shield\'s evaluator copy is missing or was modified outside Repo Identity Guard. Run "Repair Shield" to reinstall it.',
       );
-    } else if (hookOwnership === "absent") {
+    } else if (missingGovernedHooks.length > 0) {
       state = "degraded";
-      reasons.push('Shield\'s policy and evaluator are installed, but its pre-commit hook is missing. Run "Repair Shield" to reinstall it.');
+      for (const hook of missingGovernedHooks) {
+        reasons.push(`Shield's ${hook.fileName} hook is missing. Run "Repair Shield" to reinstall it.`);
+      }
     } else {
       state = "active";
-      if (hookVersion === undefined || hookVersion < SHIELD_ARTIFACT_VERSION) {
-        reasons.push('A newer Shield hook is available. Run "Repair Shield" to update it.');
+      for (const hook of hooks) {
+        if (hook.ownership === "shield" && (hook.version === undefined || hook.version < SHIELD_ARTIFACT_VERSION)) {
+          reasons.push(`A newer Shield ${hook.fileName} hook is available. Run "Repair Shield" to update it.`);
+        }
       }
       if (evaluatorVersion === undefined || evaluatorVersion < SHIELD_ARTIFACT_VERSION) {
         reasons.push('A newer Shield evaluator is available. Run "Repair Shield" to update it.');
@@ -231,9 +285,7 @@ export class ShieldManager {
       state,
       reasons,
       gitContext,
-      hookPath,
-      hookOwnership,
-      hookVersion,
+      hooks,
       policyPath,
       policyPresent: policyRaw !== null,
       policyValid: policyResult?.ok ?? false,
@@ -290,11 +342,14 @@ export class ShieldManager {
       approvedRepositoryKey,
       approvedPushDestination,
       protectedBranches,
-      // Only "commit" is actually enforced today: Phase 3 installs a
-      // pre-commit hook only. Listing "push" here before a pre-push hook
-      // exists to invoke the evaluator would claim enforcement that isn't
-      // wired up yet — see docs/SHIELD_MODE.md "What's next."
-      enabledActions: ["commit"],
+      // Both actions are enforced as of Phase 4: enable()/repair() install
+      // both the pre-commit and pre-push hook shims. Note that an absent
+      // `approvedPushDestination` (no resolvable remote yet) still results
+      // in "push" being enabled here — push evaluation's own destination
+      // check fails CLOSED in that case (see evaluator.ts
+      // destinationReasons), which is the intended conservative behavior,
+      // not a gap to work around by leaving "push" out.
+      enabledActions: ["commit", "push"],
       now,
     });
     return { policy };
@@ -303,11 +358,12 @@ export class ShieldManager {
   /**
    * Installs (or repairs) Shield for this repo: writes the policy and a
    * fresh evaluator copy under this repo's git-common-dir, then installs
-   * the pre-commit hook shim — but only into an empty hook slot or one
-   * Shield already owns. A foreign hook already at that path is never
-   * touched; Shield still writes its own policy/evaluator (harmless and
-   * inert without a hook to invoke them) and reports `degraded` rather
-   * than pretending the hook is active.
+   * the pre-commit AND pre-push hook shims — each independently, and each
+   * only into an empty hook slot or one Shield already owns. A foreign
+   * hook already at either path is never touched; Shield still writes its
+   * own policy/evaluator (harmless and inert without a hook to invoke
+   * them) and reports `degraded` rather than pretending full enforcement
+   * is active.
    *
    * `evaluatorScriptSource` is the absolute path to this extension's own
    * bundled `resources/shield/shield-evaluate.sh` — passed in rather than
@@ -327,12 +383,17 @@ export class ShieldManager {
 
     const policyPath = shieldPolicyFilePath(gitContext.gitCommonDir);
     const evaluatorPath = shieldEvaluatorScriptFilePath(gitContext.gitCommonDir);
-    const hookPath = path.join(gitContext.hooksDir, HOOK_FILE_NAME);
 
-    // Ownership check happens BEFORE any write, so a refused activation
+    // Ownership checks happen BEFORE any write, so a refused activation
     // never leaves a half-written hook behind.
-    const existingHook = await readFileIfExists(hookPath);
-    const hookSlotIsSafe = existingHook === null || isShieldOwnedArtifact(existingHook);
+    const hookWrites = await Promise.all(
+      HOOK_SPECS.map(async (spec) => {
+        const hookPath = path.join(gitContext.hooksDir, spec.fileName);
+        const existing = await readFileIfExists(hookPath);
+        const slotIsSafe = existing === null || isShieldOwnedArtifact(existing);
+        return { spec, hookPath, slotIsSafe };
+      }),
+    );
 
     // Policy + evaluator are always (re)written: they're inert without a
     // wired hook, and rewriting them keeps Shield's recorded intent
@@ -342,8 +403,10 @@ export class ShieldManager {
     await writeFileAtomic(policyPath, serializeShieldPolicy(built.policy));
     await writeFileAtomic(evaluatorPath, evaluatorScript, 0o755);
 
-    if (hookSlotIsSafe) {
-      await writeFileAtomic(hookPath, buildPreCommitHookScript(), 0o755);
+    for (const { spec, hookPath, slotIsSafe } of hookWrites) {
+      if (slotIsSafe) {
+        await writeFileAtomic(hookPath, spec.build(), 0o755);
+      }
     }
 
     const inspection = await this.inspect(repoRoot);
@@ -356,21 +419,23 @@ export class ShieldManager {
   }
 
   /**
-   * Removes only what Shield itself owns: its pre-commit hook (re-verified
-   * as Shield's own immediately before deleting — never a foreign hook,
-   * even one that appeared at this path after Shield last installed), and
-   * its policy/evaluator copy under this repo's git-common-dir. Never
-   * touches anything else. Safe to call when Shield was never enabled, or
-   * is already partially/fully disabled (every removal is a no-op if the
-   * file is already gone).
+   * Removes only what Shield itself owns: its pre-commit AND pre-push
+   * hooks (each re-verified as Shield's own immediately before deleting —
+   * never a foreign hook, even one that appeared at that path after
+   * Shield last installed), and its policy/evaluator copy under this
+   * repo's git-common-dir. Never touches anything else. Safe to call when
+   * Shield was never enabled, or is already partially/fully disabled
+   * (every removal is a no-op if the file is already gone).
    */
   async disable(repoRoot: string): Promise<ShieldInspection> {
     const gitContext = await this.resolveGitContext(repoRoot);
 
-    const hookPath = path.join(gitContext.hooksDir, HOOK_FILE_NAME);
-    const existingHook = await readFileIfExists(hookPath);
-    if (existingHook !== null && isShieldOwnedArtifact(existingHook)) {
-      await deleteIfExists(hookPath);
+    for (const spec of HOOK_SPECS) {
+      const hookPath = path.join(gitContext.hooksDir, spec.fileName);
+      const existingHook = await readFileIfExists(hookPath);
+      if (existingHook !== null && isShieldOwnedArtifact(existingHook)) {
+        await deleteIfExists(hookPath);
+      }
     }
 
     const storageDir = shieldStorageDir(gitContext.gitCommonDir);

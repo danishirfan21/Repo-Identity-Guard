@@ -60,6 +60,10 @@ export const SHIELD_REASON_CATALOG: Record<ShieldReasonId, ShieldReasonDescripto
     description: "The push route resolves to a route explicitly associated with a different profile than the one matched for this repository.",
     capability: "push_account",
   },
+  "push-route-override": {
+    description: "An SSH command override (GIT_SSH, GIT_SSH_COMMAND, core.sshCommand, or a command-scoped -c override) was detected at push time, so the route this push would actually use cannot be verified against the profile's trusted SSH host aliases, even if the URL's host would otherwise be trusted.",
+    capability: "push_account",
+  },
   "policy-missing": {
     description: "Shield is enabled for this repository, but no policy file could be found where one was expected.",
   },

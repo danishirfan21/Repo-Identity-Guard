@@ -61,8 +61,12 @@ fail_immediately() {
   # For failures that make any further evaluation meaningless
   # (policy-missing, policy-corrupt, inspection-failed): report and exit
   # without evaluating anything else, matching evaluateFromPolicyLoad's
-  # short-circuit behavior in src/shield/evaluator.ts.
-  echo "Shield: BLOCKED [$1]: $2" >&2
+  # short-circuit behavior in src/shield/evaluator.ts. Deliberately the same
+  # "Shield: [id] message" shape add_reason's lines use below (not prefixed
+  # "Shield: BLOCKED" the way the final summary line is) -- a caller (e.g.
+  # a hook shim) that strips that one summary line by matching
+  # "^Shield: BLOCKED" must never accidentally swallow this line too.
+  echo "Shield: [$1] $2" >&2
   exit 1
 }
 
@@ -278,6 +282,26 @@ evaluate_push() {
       HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
       REPO_PATH=$(printf '%s' "$rest" | sed -E 's#^[^/]*/##')
       ;;
+    *://*)
+      # Any other <scheme>://... (git://, ftp://, file://, ...) -- mirrors
+      # parseRemoteUrl()'s generic URL branch: protocol is "unknown" (only
+      # https/ssh get their own label), but host/path are still extracted
+      # the same way, EXCEPT an authority-less form (file:///path, where
+      # what follows the scheme starts with "/") has no host at all --
+      # matching `new URL(...).hostname` being "" for that shape.
+      PROTOCOL=unknown
+      rest=$(printf '%s' "$REMOTE_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##')
+      case "$rest" in
+        /*)
+          HOST=""
+          REPO_PATH="$rest"
+          ;;
+        *)
+          HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
+          REPO_PATH=$(printf '%s' "$rest" | sed -E 's#^[^/]*/##')
+          ;;
+      esac
+      ;;
     *:*)
       # scp-like: [user@]host:path (also covers a bare SSH host alias)
       PROTOCOL=ssh
@@ -291,18 +315,25 @@ evaluate_push() {
 
   # ---- destination: OWNER-based, never host-based (see evaluator.ts's
   # destinationReasons for why a host comparison would falsely flag every
-  # trusted-SSH-alias push as a mismatch) ----
+  # trusted-SSH-alias push as a mismatch). Fails CLOSED: if Shield never
+  # recorded an approved destination for this repo (no remote resolvable
+  # the last time it was enabled/repaired), that is treated as a mismatch,
+  # not silently allowed — this also covers a direct `git push <url>` to
+  # an ad hoc destination Shield never had visibility into. ----
+  APPROVED_HOST=$(policy_scalar host)
   APPROVED_OWNER=$(policy_scalar owner)
   APPROVED_REPO=$(policy_scalar repo)
-  if [ -n "$APPROVED_OWNER" ]; then
-    if [ "$(lower "$PARSED_OWNER")" != "$(lower "$APPROVED_OWNER")" ]; then
-      add_reason push-destination-mismatch "This push would go to ${PARSED_OWNER:-an unknown owner}, not the approved destination ($APPROVED_OWNER)."
-    elif [ -n "$APPROVED_REPO" ] && [ -n "$PARSED_REPO" ] && [ "$(lower "$PARSED_REPO")" != "$(lower "$APPROVED_REPO")" ]; then
-      add_reason push-destination-mismatch "This push would go to $PARSED_OWNER/$PARSED_REPO, not the approved destination ($APPROVED_OWNER/$APPROVED_REPO)."
-    fi
+  EXPECTED_DESTINATION_DISPLAY="${APPROVED_HOST:-(unknown host)}:${APPROVED_OWNER:-?}${APPROVED_REPO:+/$APPROVED_REPO}"
+
+  if [ -z "$APPROVED_OWNER" ]; then
+    add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
+Shield has no approved push destination on file for this repository (none was resolved the last time Shield was enabled or repaired).
+Reason: Refresh Shield after confirming the intended remote before pushing."
+  elif [ "$(lower "$PARSED_OWNER")" != "$(lower "$APPROVED_OWNER")" ] || { [ -n "$APPROVED_REPO" ] && [ -n "$PARSED_REPO" ] && [ "$(lower "$PARSED_REPO")" != "$(lower "$APPROVED_REPO")" ]; }; then
+    add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
+Expected approved destination: $EXPECTED_DESTINATION_DISPLAY
+Reason: Push destination changed since Shield approval (this push would go to ${PARSED_OWNER:-an unknown owner}${PARSED_REPO:+/$PARSED_REPO})."
   fi
-  # If policy never recorded an approved destination, there is nothing to
-  # compare against — deliberately not reported as a mismatch.
 
   # ---- route trust ----
   IS_GENERIC=0
@@ -310,9 +341,25 @@ evaluate_push() {
     github.com|gitlab.com|bitbucket.org) IS_GENERIC=1 ;;
   esac
 
+  # An SSH command override can redirect the connection regardless of what
+  # the URL's host claims -- check this BEFORE trusting any alias, since a
+  # "trusted" alias proves nothing once the program that actually speaks
+  # SSH for this push might not be the one ~/.ssh/config implies. None of
+  # these inspect key material, touch SSH config, or make a network call --
+  # they only check whether an override is present.
+  SSH_OVERRIDES=""
+  [ -n "${GIT_SSH:-}" ] && SSH_OVERRIDES="GIT_SSH"
+  [ -n "${GIT_SSH_COMMAND:-}" ] && SSH_OVERRIDES="${SSH_OVERRIDES:+$SSH_OVERRIDES, }GIT_SSH_COMMAND"
+  CORE_SSH_COMMAND=$(git config --get core.sshCommand 2>/dev/null || true)
+  [ -n "$CORE_SSH_COMMAND" ] && SSH_OVERRIDES="${SSH_OVERRIDES:+$SSH_OVERRIDES, }core.sshCommand"
+
   ROUTE_UNVERIFIED=1
+  ROUTE_REASON_ID=push-route-unverified
   ROUTE_MESSAGE="This push's protocol could not be determined, so the account that would authenticate it cannot be verified locally."
-  if [ "$PROTOCOL" = "https" ]; then
+  if [ "$PROTOCOL" = "ssh" ] && [ -n "$SSH_OVERRIDES" ]; then
+    ROUTE_REASON_ID=push-route-override
+    ROUTE_MESSAGE="An SSH command override ($SSH_OVERRIDES) was detected, so the route this push would actually use cannot be verified against the $PROFILE_LABEL profile's trusted SSH host aliases -- even though the URL's host (\"$HOST\") might otherwise be trusted."
+  elif [ "$PROTOCOL" = "https" ]; then
     ROUTE_MESSAGE="This push is over HTTPS. The account that authenticates it cannot be verified locally."
   elif [ "$PROTOCOL" = "ssh" ] && [ "$IS_GENERIC" = 1 ]; then
     ROUTE_MESSAGE="This push uses the generic SSH host \"$HOST\", which authenticates with whichever key is used by default."
@@ -325,11 +372,11 @@ evaluate_push() {
     fi
   fi
 
-  # An unverified/untrusted route only blocks when the profile is strict —
-  # a destination mismatch (added above, unconditionally) always blocks
-  # regardless of strictness.
+  # An unverified/untrusted/unverifiable route only blocks when the
+  # profile is strict — a destination mismatch (added above,
+  # unconditionally) always blocks regardless of strictness.
   if [ "$ROUTE_UNVERIFIED" = 1 ] && [ "$STRICT_PUSH" = "true" ]; then
-    add_reason push-route-unverified "$ROUTE_MESSAGE"
+    add_reason "$ROUTE_REASON_ID" "$ROUTE_MESSAGE"
   fi
 }
 

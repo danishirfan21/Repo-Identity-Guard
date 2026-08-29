@@ -200,6 +200,19 @@ export interface PushEvalFacts {
    * evaluation."
    */
   refLines?: string[];
+  /**
+   * Non-empty entries among `GIT_SSH`, `GIT_SSH_COMMAND`, and the
+   * *effective* `core.sshCommand` config (any scope, including a
+   * command-scoped `-c core.sshCommand=...`) visible at push time —
+   * whichever of the three were actually set, named for the message; empty
+   * when none were. Any of these can redirect an ssh-protocol push through
+   * a completely different SSH client/config than the one implied by the
+   * URL's host, which is exactly what `trustedSshHostAliases` is trusted
+   * evidence for — so their presence makes route trust unverifiable even
+   * through an otherwise-trusted alias. Read fresh at push time, never
+   * cached: see docs/SHIELD_MODE.md "Phase 4."
+   */
+  sshCommandOverrides: string[];
 }
 
 /**
@@ -215,13 +228,21 @@ export interface PushEvalFacts {
  */
 function destinationReasons(policy: ShieldPolicy, owner: string | undefined, repo: string | undefined): ShieldReason[] {
   const approved = policy.approvedPushDestination;
-  // If policy never recorded an approved destination (e.g. the repo had no
-  // resolvable remote when the policy was generated), there is nothing to
-  // compare against — deliberately not reported as a mismatch, since that
-  // would be guessing. See docs/SHIELD_MODE.md "Push evaluation" for why
-  // this is a known, documented gap rather than a silent assumption.
+  // Fail closed, per docs/SHIELD_MODE.md "Phase 4": if Shield never
+  // resolved an approved destination for this repository (e.g. no remote
+  // existed when it was last enabled/repaired), there is no way to confirm
+  // THIS push is compatible with what was approved — ambiguity is treated
+  // as a mismatch, not silently allowed. This also covers a direct
+  // `git push <url>` to an ad hoc destination that was never part of any
+  // remote Shield had visibility into.
   if (!approved || !approved.owner) {
-    return [];
+    return [
+      {
+        id: "push-destination-mismatch",
+        message: `Shield has no approved push destination on file for the ${policy.profileLabel} profile in this repository (none was resolved the last time Shield was enabled or repaired). Refresh Shield after confirming the intended remote before pushing.`,
+        capability: "push_destination",
+      },
+    ];
   }
   const ownerMatches = normalize(approved.owner) === normalize(owner);
   const repoMatches = !approved.repo || !repo || normalize(approved.repo) === normalize(repo);
@@ -231,15 +252,35 @@ function destinationReasons(policy: ShieldPolicy, owner: string | undefined, rep
   return [
     {
       id: "push-destination-mismatch",
-      message: `This push would go to ${owner ?? "an unknown owner"}${repo ? `/${repo}` : ""}, not the approved destination (${approved.owner}${approved.repo ? `/${approved.repo}` : ""}).`,
+      message: `Profile: ${policy.profileLabel}\nExpected approved destination: ${approved.host ?? "(unknown host)"}:${approved.owner}${approved.repo ? `/${approved.repo}` : ""}\nReason: Push destination changed since Shield approval (this push would go to ${owner ?? "an unknown owner"}${repo ? `/${repo}` : ""}).`,
       capability: "push_destination",
     },
   ];
 }
 
-function routeReasons(policy: ShieldPolicy, protocol: string, host: string | undefined): ShieldReason[] {
-  const trustedAliases = policy.trustedSshHostAliases.map(normalize);
+function routeReasons(
+  policy: ShieldPolicy,
+  protocol: string,
+  host: string | undefined,
+  sshCommandOverrides: string[],
+): ShieldReason[] {
   const isGenericHost = !!host && GENERIC_REMOTE_HOSTS.has(normalize(host));
+
+  // An SSH command override can redirect the connection regardless of what
+  // the URL's host claims, so it must be checked before trusting an alias
+  // — a "trusted" alias proves nothing once the program that actually
+  // speaks SSH for this push might not be the one `~/.ssh/config` implies.
+  if (protocol === "ssh" && sshCommandOverrides.length > 0) {
+    return [
+      {
+        id: "push-route-override",
+        message: `An SSH command override (${sshCommandOverrides.join(", ")}) was detected, so the route this push would actually use cannot be verified against the ${policy.profileLabel} profile's trusted SSH host aliases — even though the URL's host ("${host ?? "unknown"}") might otherwise be trusted.`,
+        capability: "push_account",
+      },
+    ];
+  }
+
+  const trustedAliases = policy.trustedSshHostAliases.map(normalize);
   const isTrustedAlias = protocol === "ssh" && !!host && !isGenericHost && trustedAliases.includes(normalize(host));
 
   if (isTrustedAlias) {
@@ -265,7 +306,7 @@ export function evaluatePush(policy: ShieldPolicy, facts: PushEvalFacts, now: nu
 
   const parsed = parseRemoteUrl(facts.remoteUrl);
   const reasons = destinationReasons(policy, parsed.owner, parsed.repo);
-  const route = routeReasons(policy, parsed.protocol, parsed.host);
+  const route = routeReasons(policy, parsed.protocol, parsed.host, facts.sshCommandOverrides);
 
   // An unverified/untrusted route only blocks when the profile is strict —
   // same strictPushSetup semantics as Phase 0's push_account capability.

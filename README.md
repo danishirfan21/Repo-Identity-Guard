@@ -235,18 +235,19 @@ reporting "not locked" after a worktree-scoped fix. Full per-worktree
 config management isn't built — this is deliberately just an honest,
 correctly-scoped mutation and warning before you confirm.
 
-**Shield Mode** (a local pre-commit Git hook that blocks unsafe commits —
-wrong identity, a protected branch, detached HEAD, an in-progress
-merge/rebase) exists behind command-palette commands only:
-`Repo Identity Guard: Enable/Disable/Repair Shield` and `...: Check Shield
-Health`. There is still no Settings/sidebar toggle for it — a disabled
-"Coming soon" card in Settings remains the only sidebar-visible state (see
-Limitations) — so this is opt-in and easy to miss unless you go looking
-for it, deliberately, until a dedicated UI phase. Enforcement itself runs
-standalone (a POSIX shell script Shield installs alongside the hook) and
-works with VS Code completely closed; push enforcement isn't wired to a
-hook yet. Full details — threat model, policy schema, worktree handling,
-the evaluator, and the installation lifecycle — are in
+**Shield Mode** (local pre-commit AND pre-push Git hooks that block unsafe
+commits and pushes — wrong identity, a protected branch, detached HEAD, an
+in-progress merge/rebase, a push to a destination or over a route that
+doesn't match what Shield approved for this repo) exists behind
+command-palette commands only: `Repo Identity Guard: Enable/Disable/Repair
+Shield` and `...: Check Shield Health`. There is still no Settings/sidebar
+toggle for it — a disabled "Coming soon" card in Settings remains the only
+sidebar-visible state (see Limitations) — so this is opt-in and easy to
+miss unless you go looking for it, deliberately, until a dedicated UI
+phase. Enforcement itself runs standalone (a POSIX shell script Shield
+installs alongside both hooks) and works with VS Code completely closed.
+Full details — threat model, policy schema, worktree handling, the
+evaluator, and the installation lifecycle — are in
 [docs/SHIELD_MODE.md](docs/SHIELD_MODE.md).
 
 ## Push setup: destination vs. account
@@ -389,13 +390,12 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
 
 ## Limitations in this build
 
-- **Shield Mode has no sidebar UI yet.** Its pre-commit hook can be
-  installed/removed/repaired/health-checked only via command-palette
-  commands (`Repo Identity Guard: Enable/Disable/Repair Shield`, `...:
-  Check Shield Health`) — the sidebar's Settings card still just says
-  "Coming soon," and there's no toggle there that could be mistaken for a
-  working one. A pre-push hook doesn't exist yet either, so push
-  enforcement (destination/route checks) is defined but not wired up.
+- **Shield Mode has no sidebar UI yet.** Its pre-commit and pre-push hooks
+  can be installed/removed/repaired/health-checked only via
+  command-palette commands (`Repo Identity Guard: Enable/Disable/Repair
+  Shield`, `...: Check Shield Health`) — the sidebar's Settings card still
+  just says "Coming soon," and there's no toggle there that could be
+  mistaken for a working one.
 - **Fork detection is naming-convention-based, not verified.** The
   fork/upstream conflict check only looks for a remote literally named
   `upstream` — there's no reliable way to detect a fork relationship from

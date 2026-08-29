@@ -155,13 +155,13 @@ test("inspect() on a repo Shield has never touched reports off, with nothing wri
     assert.equal(inspection.state, "off");
     assert.equal(inspection.policyPresent, false);
     assert.equal(inspection.evaluatorPresent, false);
-    assert.equal(inspection.hookOwnership, "absent");
+    assert.ok(inspection.hooks.every((h) => h.ownership === "absent"));
   } finally {
     await cleanup(repo);
   }
 });
 
-test("enable() installs a policy, an evaluator copy, and an owned pre-commit hook, and reports active", async () => {
+test("enable() installs a policy, an evaluator copy, and owned pre-commit AND pre-push hooks, and reports active", async () => {
   const repo = await makeTempRepo();
   try {
     const manager = new ShieldManager();
@@ -173,18 +173,23 @@ test("enable() installs a policy, an evaluator copy, and an owned pre-commit hoo
     assert.equal(result.inspection.policyProfileLabel, "Work");
 
     const hooksDir = await hooksDirFor(repo);
-    const hookPath = path.join(hooksDir, "pre-commit");
-    const hookContent = await fs.readFile(hookPath, "utf8");
-    assert.match(hookContent, /repo-identity-guard-shield-artifact v1 \(pre-commit\)/);
-
-    const mode = (await fs.stat(hookPath)).mode;
-    assert.equal(mode & 0o100, 0o100, "hook file should be executable");
+    for (const [fileName, marker] of [
+      ["pre-commit", "pre-commit"],
+      ["pre-push", "pre-push"],
+    ] as const) {
+      const hookPath = path.join(hooksDir, fileName);
+      const hookContent = await fs.readFile(hookPath, "utf8");
+      assert.match(hookContent, new RegExp(`repo-identity-guard-shield-artifact v1 \\(${marker}\\)`));
+      const mode = (await fs.stat(hookPath)).mode;
+      assert.equal(mode & 0o100, 0o100, `${fileName} hook file should be executable`);
+    }
 
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     const evaluatorContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh"), "utf8");
     assert.match(evaluatorContent, /repo-identity-guard-shield-artifact v1 \(evaluator\)/);
     const policyContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-policy.json"), "utf8");
     assert.match(policyContent, /"profileLabel": "Work"/);
+    assert.match(policyContent, /"push"/); // enabledActions now includes push as of Phase 4
   } finally {
     await cleanup(repo);
   }

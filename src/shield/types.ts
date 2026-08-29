@@ -46,6 +46,7 @@ export type ShieldReasonId =
   | "push-destination-mismatch"
   | "push-route-unverified"
   | "push-route-mismatch"
+  | "push-route-override"
   | "policy-missing"
   | "policy-corrupt"
   | "inspection-failed";
@@ -62,6 +63,7 @@ export const SHIELD_REASON_IDS: readonly ShieldReasonId[] = [
   "push-destination-mismatch",
   "push-route-unverified",
   "push-route-mismatch",
+  "push-route-override",
   "policy-missing",
   "policy-corrupt",
   "inspection-failed",

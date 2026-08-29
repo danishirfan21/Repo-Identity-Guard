@@ -118,6 +118,7 @@ type ShieldReasonId =
   | "push-destination-mismatch"
   | "push-route-unverified"
   | "push-route-mismatch"
+  | "push-route-override" // Phase 4: an SSH command override makes the route unverifiable
   | "policy-missing"
   | "policy-corrupt"
   | "inspection-failed";
@@ -620,7 +621,7 @@ exact same account — comparing hosts would flag every alias-based push
 mismatch. This mirrors `checkPushDestination` in `statusEngine.ts`
 exactly, which also matches on owner/exact-repo-key, never on host alone.
 
-**Push blocks when:**
+**Push blocks when (updated by Phase 4 — see below for the override row and the fail-closed change to the "no approved destination" row):**
 
 | Condition | Reason id | Blocking regardless of `strictPushSetup`? |
 | --- | --- | --- |
@@ -628,10 +629,9 @@ exactly, which also matches on owner/exact-repo-key, never on host alone.
 | Push owner (and repo, if known) doesn't match the approved destination | `push-destination-mismatch` | **Yes, always** |
 | HTTPS, unrecognized protocol, a generic host (`github.com`/`gitlab.com`/`bitbucket.org`), or a custom SSH alias not listed in `trustedSshHostAliases` | `push-route-unverified` | No — only when `strictPushSetup` is true |
 
-If the policy never recorded an approved destination at all (e.g. the repo
-had no resolvable remote when the policy was generated), the destination
-check is skipped rather than guessed at — no reason is reported for a
-comparison that can't actually be made.
+~~If the policy never recorded an approved destination at all..., the
+destination check is skipped rather than guessed at~~ — **this was
+changed in Phase 4 to fail closed instead; see below.**
 
 `push-route-mismatch` (an alias trusted only under a *different* profile
 than the one matched here) is defined as a reason id but is **not**
@@ -658,11 +658,10 @@ way past a hook in this state.
 ### What's next after Phase 2 (superseded below by Phase 3, except where noted)
 
 - ~~Writing the policy file at all~~ — done in Phase 3 (`ShieldManager.enable`/`repair`).
-- ~~Actual hook installation~~ — done in Phase 3, pre-commit only (see below).
+- ~~Actual hook installation~~ — done in Phase 3 (pre-commit) and Phase 4 (pre-push).
 - Per-ref push inspection (using the ref lines already accepted on stdin)
   for anything beyond destination/route — e.g. force-push detection, if a
-  future phase decides that belongs in Shield. Still not implemented — no
-  pre-push hook exists yet either (see Phase 3 below).
+  future phase decides that belongs in Shield. Still not implemented.
 - Closing the `profile-unresolved`/`profile-conflict`/`push-route-mismatch`
   gaps above, if a future design decides they're worth the added policy
   complexity. Still open.
@@ -834,11 +833,9 @@ protects every worktree of that repository — confirmed end-to-end in
   already documented as a permanent bypass in Phase 1; Phase 3 does not
   and cannot close it.
 
-### What's next (not this phase)
+### What's next after Phase 3 (superseded below by Phase 4, except where noted)
 
-- A pre-push hook wired the same way (Phase 2 already defines
-  `evaluatePush`/the shell script's `push` mode; only the hook
-  installation is missing).
+- ~~A pre-push hook wired the same way~~ — done in Phase 4.
 - Per-ref push inspection, the `profile-unresolved`/`profile-conflict`/
   `push-route-mismatch` gaps, and a Settings/sidebar Shield toggle — all
   still open, as listed above.
@@ -847,3 +844,158 @@ protects every worktree of that repository — confirmed end-to-end in
   alongside one.
 - A `commit-msg` or `post-rewrite` hook, if a future design wants to catch
   `git rebase --continue`'s commits given the gap documented above.
+
+## Phase 4: pre-push enforcement
+
+Phase 4 wires the push evaluator into a real `pre-push` hook
+(`buildPrePushHookScript()` in `src/shield/artifacts.ts`), installed and
+managed by `ShieldManager` exactly like the pre-commit hook (independent
+ownership check, independent foreign-hook safety, independent
+active/degraded reporting per hook — see Phase 3's "Ownership and version
+markers" table, now with a `pre-push` row alongside `pre-commit`).
+`enable()`/`repair()` now set `policy.enabledActions = ["commit", "push"]`
+unconditionally.
+
+### The pre-push hook
+
+Forwards Git's own pre-push argv (`$1` = remote name, `$2` = remote
+location/URL — the actual resolved location Git is about to push to, not
+a value read from `git remote -v`) and its own stdin (the real
+`<local-ref> <local-sha1> <remote-ref> <remote-sha1>` lines) straight
+through to the evaluator copy, unmodified. A blocked push prints:
+
+```
+Repo Identity Guard Shield
+
+PUSH BLOCKED
+
+Remote: origin
+Destination: git@github-personal:acme/backend.git
+
+Shield: [push-destination-mismatch] Profile: Work
+Expected approved destination: github-work:AcmeSoftware/acme-frontend
+Reason: Push destination changed since Shield approval (this push would go to acme/backend).
+
+Fix the push destination/route or disable Shield for this repository.
+```
+
+Like the pre-commit hook, it fails **open** (`exit 0`) if the evaluator
+copy is missing — a half-removed Shield install must never be the reason
+an ordinary push is blocked.
+
+### Push destination now fails closed (changed from Phase 2)
+
+Phase 2 explicitly skipped the destination check when the policy held no
+`approvedPushDestination` ("nothing to compare against, don't guess").
+Phase 4 changes this deliberately: **an unresolved/absent approved
+destination is now itself a `push-destination-mismatch`**, blocking the
+push. Rationale, directly from the task that specified this phase:
+
+> If Shield was enabled while push destination was
+> `git@github-work:acme/backend.git` and the user/agent later changes the
+> push URL to `git@github-personal:someone/backend.git`, the next push
+> must be blocked until the Shield policy is deliberately refreshed. Any
+> ambiguity should fail closed for an active Shield.
+
+An absent approved destination is exactly this kind of ambiguity — it
+means Shield cannot confirm *any* destination is compatible with what was
+approved, which is a strictly more dangerous unknown than "the owner
+doesn't match," not a lesser one. This also closes what would otherwise
+be a loophole: a direct `git push <url>` to an ad hoc destination Shield
+never had visibility into no longer sails through uncontested. This
+change is unconditional (not gated by `strictPushSetup`), matching every
+other destination-mismatch check.
+
+### Route trust and profile-bound SSH aliases (unchanged model, now enforced)
+
+Route trust still uses exactly the Phase 0 model: only an alias explicitly
+listed in the *matched* profile's `trustedSshHostAliases` counts as
+trusted; a custom-looking alias that was never listed is not trusted just
+for not being one of the well-known generic hosts
+(`github.com`/`gitlab.com`/`bitbucket.org`). Under a strict profile: HTTPS
+blocks, a generic SSH host blocks, an unlisted alias blocks, a listed
+trusted alias passes the route check. As always, "passes" means "this is
+a route trust decision, not cryptographic proof of the GitHub account
+behind it" — no message anywhere claims otherwise (swept by a dedicated
+test in both `shieldEvaluator.test.ts` and `shieldPrePush.test.ts`).
+
+### Action-time SSH overrides make a route unverifiable
+
+`GIT_SSH`, `GIT_SSH_COMMAND`, and the *effective* `core.sshCommand` config
+(any scope — worktree/local/global config, **and** a command-scoped `git
+-c core.sshCommand=...`, which shows up identically to a persisted value
+through a plain `git config --get core.sshCommand` query with no scope
+restriction) can each redirect which program actually speaks SSH for a
+push, regardless of what the URL's host claims. Any of them being set at
+push time now produces `push-route-override` instead of the usual
+alias-trust outcome — checked *before* alias trust, so an override can't
+be masked by an otherwise-trusted-looking host. Like route-unverified,
+this only blocks when `strictPushSetup` is true; it is specifically a
+route-trust concern, not a destination concern.
+
+This inspects only whether these three mechanisms are *set* — never their
+contents, never SSH key material, never `~/.ssh/config`, and it makes no
+network call. A documented, accepted limitation: it cannot detect an
+attacker shadowing the literal `ssh` executable via `PATH` (git's default
+SSH invocation, with none of the three overrides set, simply resolves
+`ssh` via `PATH` like any other command) — `shieldPrePush.test.ts` itself
+relies on exactly this technique to fake a working SSH transport for its
+"should succeed" tests without a real SSH daemon, which is precisely why
+it's called out here as a real, not merely theoretical, blind spot.
+
+### Empirical findings from this phase
+
+- **Git does not invoke the pre-push hook at all if the SSH transport
+  fails outright.** An override pointed at a broken command (e.g.
+  `/bin/false`) makes Git fail during connection/ref-advertisement with
+  its own `fatal: Could not read from remote repository` — before the
+  hook ever runs. To prove Shield's hook itself is what blocks an
+  override (not Git's transport failing first), every override test in
+  `shieldPrePush.test.ts` points the override at a transport that would
+  actually have succeeded (see the `PATH`-shadowed fake `ssh` above),
+  confirming the block is Shield's and that it prevented a push that
+  otherwise would have gone through.
+- **`file://` (and other generic `<scheme>://` URLs) were silently
+  misparsed by the shell script before this phase.** The script's `case`
+  statement only special-cased `https?://` and `ssh://`; anything else
+  containing a colon fell through to the scp-like branch, so
+  `file:///tmp/x/Owner/repo.git` was parsed as SSH host `"file"` — wrong,
+  and inconsistent with the TypeScript reference (`parseRemoteUrl`, which
+  correctly classifies any other `scheme://` as protocol "unknown" via
+  `new URL(...)`). Fixed with a `*://*` case mirroring the TS behavior
+  exactly (including the authority-less `file:///path` shape, where the
+  host is empty) and cross-checked in `shieldEvaluatorScript.test.ts`.
+  Found while building this phase's own test harness (a `file://` bare
+  remote was the natural way to test a real, working, non-SSH transport)
+  — a genuine pre-existing bug, not introduced by Phase 4.
+- **A second real bug, also found via this phase's testing:** the pre-commit
+  and pre-push hook shims strip the evaluator's own multi-reason summary
+  line from their output via `grep -v '^Shield: BLOCKED'` — but
+  `fail_immediately()` (used for `policy-missing`/`policy-corrupt`/
+  `inspection-failed`) originally emitted `Shield: BLOCKED [id]: message`,
+  which that same filter also matched and silently swallowed. A real
+  `git push`/`git commit` against a missing or corrupt policy would print
+  Shield's banner with an empty reason section. Fixed by changing
+  `fail_immediately()`'s format to `Shield: [id] message` (matching
+  `add_reason`'s per-line format, distinct from the one summary line the
+  filter is meant to strip). Caught by `shieldPrePush.test.ts`'s
+  missing/malformed-policy tests actually going through the real
+  installed hook rather than invoking the evaluator script directly.
+- **`git push --no-verify` bypasses Shield's pre-push hook entirely** —
+  Git's own documented, unconditional escape hatch, exercised end-to-end
+  in `shieldPrePush.test.ts`: a push to a destination that would
+  otherwise be blocked succeeds under `--no-verify`, and the remote ref is
+  updated. This is expected, already documented as a permanent bypass in
+  Phase 1, and outside Shield's accidental-misuse threat model — Phase 4
+  does not and cannot close it.
+
+### What's next (not this phase)
+
+- Per-ref push inspection (force-push detection, etc.) using the ref
+  lines the hook already forwards but the evaluator doesn't yet inspect.
+- The `profile-unresolved`/`profile-conflict`/`push-route-mismatch` gaps.
+- A Settings/sidebar Shield toggle and status surface — still
+  command-palette-only.
+- Coexisting with a pre-existing third-party hook manager, for both hooks.
+- Detecting a shadowed `ssh` executable on `PATH` — an accepted, disclosed
+  limitation for now (see above), not silently ignored.
