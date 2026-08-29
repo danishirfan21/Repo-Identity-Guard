@@ -125,17 +125,23 @@
               },
               "expectedRemoteOwners": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "description": "GitHub owners/orgs (wildcards allowed) whose repos should match this profile."
               },
               "exactRepos": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "description": "Exact repositories pinned to this profile, canonicalized as host/owner/repo (wildcards allowed), e.g. github.com/acme/secret. Always wins over expectedRemoteOwners — this is how one specific repo is bound to a profile regardless of owner patterns."
               },
               "expectedBranchPatterns": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "description": "Wildcard branch name patterns considered normal for this profile, e.g. feature/*."
               },
               "strictPushSetup": {
@@ -144,7 +150,9 @@
               },
               "trustedSshHostAliases": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "description": "SSH host aliases (e.g. github-work, from a ~/.ssh/config Host entry) this profile explicitly trusts as an approved push route. A custom SSH alias is never trusted just for being non-generic — only aliases listed here can make Push Account read as a trusted route, and even then it is never cryptographic proof of the remote account."
               },
               "expectedGitHubLogin": {
@@ -156,8 +164,13 @@
         },
         "repoIdentityGuard.protectedBranches": {
           "type": "array",
-          "default": ["main", "master"],
-          "items": { "type": "string" },
+          "default": [
+            "main",
+            "master"
+          ],
+          "items": {
+            "type": "string"
+          },
           "description": "Local branch policy: branch names Repo Identity Guard treats as protected on this machine. Not synced with GitHub's own branch protection settings."
         },
         "repoIdentityGuard.requireLocalIdentity": {
@@ -182,6 +195,7 @@
   "devDependencies": {
     "@types/node": "^20.14.10",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
     "autoprefixer": "^10.5.2",
     "postcss": "^8.5.15",
     "tailwindcss": "^3.4.19",

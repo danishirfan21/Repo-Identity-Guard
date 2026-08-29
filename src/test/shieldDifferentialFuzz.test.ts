@@ -343,7 +343,7 @@ test("PART 7 — with the policy deleted mid-sweep, every generated action fails
     });
     for (const result of results) {
       assert.equal(result.allowed, false);
-      assert.deepEqual(result.reasonIds, ["policy-missing"]);
+      assert.deepEqual(result.reasonIds, ["policy-missing"], result.stderr);
     }
   } finally {
     await destroyRepoPool(repos);

@@ -100,7 +100,21 @@ export interface FuzzRepo {
   env: NodeJS.ProcessEnv;
 }
 
-const POOL_SIZE_DEFAULT = Math.max(2, Math.min(8, os.cpus().length * 2));
+/**
+ * Deliberately conservative, and capped at the CPU count rather than a
+ * multiple of it.
+ *
+ * Every case here costs a real `sh` process that itself spawns several
+ * `git` and `awk` processes, and Node's test runner already runs test FILES
+ * concurrently — so three fuzz files at `cpus * 2` workers each put well
+ * over a hundred processes in flight on a 4-core runner. That was observed
+ * once, in a full-suite run, to make a `git rev-parse` inside the evaluator
+ * fail, which the evaluator correctly reported as `inspection-failed`
+ * (fail-closed, exactly right) but which read as a spurious mismatch to a
+ * harness expecting a policy verdict. Reducing contention is the honest fix
+ * — loosening the assertion would have hidden a real failure mode.
+ */
+const POOL_SIZE_DEFAULT = Math.max(2, Math.min(4, os.cpus().length));
 
 export function fuzzPoolSize(): number {
   const parsed = Number(process.env.SHIELD_FUZZ_WORKERS);

@@ -1,12 +1,50 @@
+# What does NOT go into the packaged .vsix.
+#
+# Verified by building a real VSIX and inspecting it (Part 11); the
+# packaging contract is asserted automatically in
+# src/test/vsixPackaging.test.ts, which also proves the extension can
+# actually read resources/shield/shield-evaluate.sh from an installed
+# extensionPath the way src/extension.ts does.
+#
+# The one rule that matters most: `resources/**` must NEVER be excluded.
+# Shield installs a copy of resources/shield/shield-evaluate.sh into each
+# repository it guards, resolved from `context.extensionPath`. If that file
+# is missing from the package, "Enable Shield" fails at the point of use,
+# on a machine that has no way to get it back.
+
+# TypeScript sources — only the compiled output ships.
 .vscode/**
 src/**
-out/**/*.map
+tsconfig.json
+tailwind.config.js
+
+# Compiled tests, and source maps, which would otherwise more than double
+# the package for no user-facing benefit.
 out/test/**
+out/**/*.map
+
+# Development-only tooling and process files. Not secret, but nothing in
+# the installed extension reads them, and they only bloat the download.
+.github/**
+scripts/**
+TESTING.md
+
+# Dependencies and build/packaging artifacts.
 node_modules/**
 *.tgz
 *.vsix
 .tmp-*
+
+# Repository metadata and anything machine-local. `.env*` and key/cert
+# extensions are listed defensively: they should never exist in this
+# repository at all, and if one ever does it must not be packaged and
+# distributed by accident.
 .git/**
 .gitignore
-tsconfig.json
-tailwind.config.js
+.claude/**
+**/.DS_Store
+.env
+.env.*
+*.pem
+*.key
+*.p12
