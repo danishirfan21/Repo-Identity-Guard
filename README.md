@@ -238,7 +238,10 @@ correctly-scoped mutation and warning before you confirm.
 **Shield Mode** (local Git hooks that would block unsafe commits/pushes) is
 not built yet. There is no toggle for it — a disabled "Coming soon" card in
 Settings makes that explicit, rather than showing a switch that looks live
-but does nothing (see Limitations).
+but does nothing (see Limitations). Its threat model and architecture —
+what it will and won't protect against, its policy schema, and how it
+handles worktrees — are specified ahead of any hook installation in
+[docs/SHIELD_MODE.md](docs/SHIELD_MODE.md).
 
 ## Push setup: destination vs. account
 
