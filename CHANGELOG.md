@@ -379,7 +379,7 @@ behavior. Full write-ups, including the exact reproductions, are in
 ### Changed
 
 - **Shield Mode's toggle has been removed.** `repoIdentityGuard.agentGuardEnabled`
-  no longer exists; Settings shows a disabled "Shield Mode — Coming soon"
+  no longer exists; Settings showed a disabled "Shield Mode — Coming soon"
   card instead, so nothing in the UI can be mistaken for active enforcement.
 - "Protected branches" is now described everywhere as a **local branch
   policy** — Repo Identity Guard does not check or sync with GitHub's own

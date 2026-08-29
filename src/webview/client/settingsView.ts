@@ -1,7 +1,13 @@
 /**
  * Settings — Profiles (chip-based owners/exact-repos/branch patterns editor,
  * "Detect from current repo" prefill), Local Branch Policy, Safety
- * Preferences, and the disabled Shield Mode "Coming Soon" panel.
+ * Preferences, and a short, plain Shield Mode note.
+ *
+ * Shield Mode is real and enforcing as of Phase 4+ (see docs/SHIELD_MODE.md
+ * and src/shield/). Its controls live in the Command Palette ("Repo
+ * Identity Guard: Enable/Disable/Repair Shield", "Check Shield Health") —
+ * deliberately NOT a sidebar dashboard yet, which is what the note here
+ * says, in those words, instead of the old and now-false "Coming soon".
  *
  * "Detect from current repo" only ever prefills form fields from facts the
  * engine already collected this scan (repo owner, effective identity) — it
@@ -109,6 +115,9 @@ function renderProfileEditor() {
         <div class="flex flex-col gap-1.5 border-t border-outline-variant pt-2.5">
           <label class="text-[10.5px] text-on-surface-variant">Trusted SSH host aliases <span class="opacity-70">(e.g. a Host entry in ~/.ssh/config — only these route as a trusted push, never just because a host looks dedicated)</span></label>
           \${renderChipRow(profile, "trustedSshHostAliases", "Add alias, e.g. github-work")}
+          <label class="mt-1 flex flex-col gap-0.5 text-[10.5px] text-on-surface-variant">Expected GitHub login <span class="opacity-70">(optional — the GitHub <em>username</em> a trusted SSH route must authenticate as when Shield performs strict GitHub account verification. Not your commit email, not the repo owner/org, and not the SSH alias.)</span>
+            <input class="vs-input h-7 rounded px-2 font-code-mono text-code-mono" data-field="expectedGitHubLogin" value="\${esc(profile.expectedGitHubLogin || "")}" placeholder="e.g. danish-work" />
+          </label>
         </div>
 
         <div class="mt-1 flex gap-1.5">
@@ -149,12 +158,11 @@ function renderSettings() {
       </label>
     </section>
 
-    <section class="vs-card flex flex-col gap-1 rounded p-2.5 opacity-70">
+    <section class="vs-card flex flex-col gap-1 rounded p-2.5">
       <div class="flex items-center justify-between">
         <span class="flex items-center gap-1.5 text-[12px] font-semibold text-on-surface-variant">\${icon("lock", 13)}Shield Mode</span>
-        <span class="rounded bg-surface-container-high px-1.5 py-0.5 text-[8.5px] font-bold uppercase tracking-wide text-on-surface-variant">Coming soon</span>
       </div>
-      <p class="m-0 text-[10.5px] leading-relaxed text-on-surface-variant">Optional local Git hooks that can block unsafe commits or pushes before they happen. Not built yet — Shield Mode is not currently active and there is no toggle for it.</p>
+      <p class="m-0 text-[10.5px] leading-relaxed text-on-surface-variant">Shield Mode provides optional local Git-hook enforcement. Use the Repo Identity Guard Shield commands from the Command Palette. Full sidebar controls are not yet available.</p>
     </section>
 
     <button class="vs-button-secondary h-7 rounded text-[12px]" id="openSettingsJsonButton">Open settings.json</button>

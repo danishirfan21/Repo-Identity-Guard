@@ -1,5 +1,36 @@
 # Shield Mode: threat model and architecture
 
+## CURRENT STATUS (read this first)
+
+**Shield Mode is implemented and enforcing.** `Repo Identity Guard: Enable
+Shield` installs real `pre-commit`, `pre-merge-commit`, and `pre-push`
+hooks plus a standalone POSIX-shell evaluator under
+`<git-common-dir>/repo-identity-guard/`, and they block unsafe commits and
+pushes with VS Code completely closed. Requires **Git 2.31 or newer**.
+
+Controls are Command Palette only (`Enable`/`Disable`/`Repair Shield`,
+`Check Shield Health`). Settings carries a one-line note pointing at those
+commands — there is no sidebar dashboard and no toggle. Nothing in the
+product says Shield "is not built yet" or "coming soon" any more; where
+this document still contains such a sentence it is inside a **historical,
+superseded** phase section and is labelled as such.
+
+The threat boundary below is **not** historical and has not moved:
+`--no-verify`, a deliberate `core.hooksPath` override, and arbitrary local
+shell access all bypass Shield, by design and by Git's own documented
+behavior. Shield is a safety net against ordinary accidental unsafe
+operations, never a defence against a hostile local adversary.
+
+---
+
+## Phase 1 (HISTORICAL — superseded by Phases 3-9)
+
+> Everything from here to the "Phase 8"/"Phase 9" sections is kept as a
+> record of how the design was reached, phase by phase. Statements in it
+> about what does not exist yet, or about Settings showing "Coming Soon",
+> were true when written and are **no longer true** — see CURRENT STATUS
+> above.
+
 **Status: Phase 1 — architecture and threat model only.** No hooks are
 installed by this phase, no toggle exists in the UI, and no Git mutation
 happens as a result of anything in this document or the code that
@@ -432,7 +463,9 @@ reading and writing the policy file, and actually installing hooks into
 **Status: implemented, not yet wired to a Git hook.** This phase builds the
 thing a future hook will invoke — the actual decision logic — without
 installing anything into `<git-common-dir>/hooks/` and without any Shield
-UI. Settings still shows "Coming Soon."
+UI. (HISTORICAL: "Settings still shows Coming Soon" was true at Phase 2;
+Phase 3+ installs hooks, and the "Coming Soon" panel was removed in Phase
+9 -- see CURRENT STATUS.)
 
 ### Evaluator runtime decision
 
@@ -669,7 +702,9 @@ way past a hook in this state.
   complexity. Still open.
 - A "Shield Mode" section in Settings/sidebar with an enable/disable
   toggle — Phase 3 added command-palette commands only, deliberately not a
-  sidebar redesign; still open.
+  sidebar redesign; still open. (Phase 9 replaced the disabled "Coming
+  Soon" panel with a plain note pointing at those commands. A real
+  dashboard remains deliberately unbuilt.)
 
 ## Phase 3: installation lifecycle and pre-commit enforcement
 

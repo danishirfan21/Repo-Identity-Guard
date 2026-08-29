@@ -140,6 +140,18 @@ document.addEventListener("click", (event) => {
     const profile = state.profiles.find((p) => p.id === id);
     const container = document.querySelector('[data-profile-id="' + CSS.escape(id) + '"]');
     const field = (name) => container.querySelector('[data-field="' + name + '"]');
+    // Object.assign over the STORED profile, never over a fresh object:
+    // every field this editor does not render (exactRepos,
+    // expectedRemoteOwners, expectedBranchPatterns, trustedSshHostAliases,
+    // and anything a future version adds) must survive a save untouched.
+    // Chip fields are edited through patchProfile, which uses the same rule.
+    //
+    // expectedGitHubLogin is normalized empty-string -> undefined: leaving
+    // the input blank must produce an ABSENT field, not "". A stored ""
+    // would differ from the undefined a policy built before this field
+    // existed baked in, and ShieldManager's profile-drift check would then
+    // report permanent drift on a profile nobody actually changed.
+    const expectedGitHubLogin = field("expectedGitHubLogin").value.trim();
     send("saveProfile", {
       profile: Object.assign({}, profile, {
         id,
@@ -147,6 +159,7 @@ document.addEventListener("click", (event) => {
         gitName: field("gitName").value.trim(),
         gitEmail: field("gitEmail").value.trim(),
         strictPushSetup: field("strictPushSetup").checked,
+        expectedGitHubLogin: expectedGitHubLogin === "" ? undefined : expectedGitHubLogin,
       }),
     });
     return;

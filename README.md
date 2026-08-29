@@ -34,9 +34,14 @@ a complete checklist, not just a list of problems:
 | **Repo State** | Is there an unfinished merge/rebase/conflict, or just ordinary uncommitted changes? |
 | **Workspace Trust** | Is this VS Code workspace trusted to run commands in? |
 
-Repo Memory and Shield Mode are shown too, but as separate **info notes** —
-they're context data and feature-availability metadata, not safety
-verdicts, so they never affect the SAFE/NOT SAFE result.
+Repo Memory is shown too, but as a separate **info note** — it's context
+data, not a safety verdict, so it never affects the SAFE/NOT SAFE result.
+Shield Mode is deliberately *not* reported here at all: its state is
+per-repository and lives on disk (see `Repo Identity Guard: Check Shield
+Health`), and the safety engine has no way to know it. An earlier build
+shipped a hard-coded "Shield Mode is not built yet — nothing is enforcing
+this automatically" note that was shown even in repositories where Shield
+was installed and actively blocking pushes; it has been removed.
 
 Each capability result carries one of five states — **Confirmed**,
 **Contradicted**, **Unverified**, **Warning**, or **Not applicable** — plus
@@ -171,7 +176,8 @@ the selected repo while the badge itself reads Not Safe.
   command + Run/Copy), stored locally and privately.
 - **Settings** — profiles as chip-based tabs with an owners/exact-repos/
   branch-pattern chip editor, a "Detect from current repo" prefill button,
-  branch rules, safety preferences, and the disabled Shield Mode card.
+  branch rules, safety preferences, and a short Shield Mode note pointing
+  at the Command Palette.
 - **First-run onboarding** — shown automatically the first time you open
   Repo Identity Guard in a Git repository with no profiles configured yet.
   It shows the detected repository and your current effective Git
@@ -244,8 +250,9 @@ set — a route that authenticates live as the wrong GitHub account) exists
 behind
 command-palette commands only: `Repo Identity Guard: Enable/Disable/Repair
 Shield` and `...: Check Shield Health`. There is still no Settings/sidebar
-toggle for it — a disabled "Coming soon" card in Settings remains the only
-sidebar-visible state (see Limitations) — so this is opt-in and easy to
+toggle for it — Settings carries only a one-line note saying Shield Mode
+provides optional local Git-hook enforcement and that its controls are in
+the Command Palette (see Limitations) — so this is opt-in and easy to
 miss unless you go looking for it, deliberately, until a dedicated UI
 phase. Enforcement itself runs standalone (a POSIX shell script Shield
 installs alongside both hooks) and works with VS Code completely closed.
@@ -422,9 +429,10 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
 - **Shield Mode has no sidebar UI yet.** Its pre-commit, pre-merge-commit,
   and pre-push hooks can be installed/removed/repaired/health-checked only
   via command-palette commands (`Repo Identity Guard: Enable/Disable/Repair
-  Shield`, `...: Check Shield Health`) — the sidebar's Settings card still
-  just says "Coming soon," and there's no toggle there that could be
-  mistaken for a working one.
+  Shield`, `...: Check Shield Health`). The sidebar's Settings card is a
+  plain one-line note pointing at those commands — there is no toggle
+  there that could be mistaken for a working one, and (since Phase 9) no
+  copy anywhere claiming Shield does not exist.
 - **Shield cannot see a clean cherry-pick or revert.** Git commits those
   (when there's no conflict to resolve) via an internal fast path that
   invokes no commit hook at all — not specific to Shield, and not fixable

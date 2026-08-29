@@ -58,7 +58,7 @@ git branch --show-current
 | Strict local identity | Enable `repoIdentityGuard.requireLocalIdentity`; unset local identity while global/effective still matches. | Non-blocking "Repo is not locked to `<Profile>` identity" (commit identity). |
 | Non-Git folder | Open a plain folder with no `.git`. | ⚪ NOT CHECKED. |
 | No pinned memory | Repo Memory has no pinned note. | Info-only "No pinned repo memory" (never blocks SAFE). |
-| Shield Mode card | Open Settings. | A disabled "Shield Mode — Coming soon" card with no checkbox — never an interactive toggle. |
+| Shield Mode card | Open Settings. | A plain "Shield Mode" note saying it provides optional local Git-hook enforcement and that the controls are in the Command Palette. No checkbox, no toggle, and no claim that Shield does not exist. |
 | Full checklist on a safe repo | All checks pass. | Review Details shows all 6 capabilities (Commit Identity, Push Destination, Push Account, Branch Policy, Repo State, Workspace Trust) with a **Confirmed** badge each — not just an empty "no issues" list. |
 | Failed Git inspection | Simulate a Git command failure mid-scan (e.g. corrupt a ref temporarily). | 🔴 NOT SAFE; Repo State shows "Could not fully inspect this repository" as **Unverified** and blocking — never silently treated as clean. |
 | Dependent capability shown as Not applicable | No profile resolves for this repo. | Push Destination, Push Account, and Branch Policy each show a **Not applicable** badge (dimmed) rather than being silently omitted, and don't carry a "Blocks Safety" tag. |
@@ -174,8 +174,9 @@ A separate "Other Notes" section below the checklist shows info notes
 4. Toggle "Require identity to be locked locally" and "Include pinned
    memory note in Copy Context for AI"; confirm both persist to
    `settings.json` and trigger a rescan.
-5. Confirm the "Shield Mode — Coming soon" card has no checkbox and cannot
-   be interacted with.
+5. Confirm the "Shield Mode" card is a plain note pointing at the Command
+   Palette — no checkbox, no toggle, and no "coming soon"/"not built yet"
+   wording (Shield Mode is implemented and enforcing).
 
 ### Refresh behavior
 

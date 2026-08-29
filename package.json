@@ -128,6 +128,11 @@
                 "items": { "type": "string" },
                 "description": "GitHub owners/orgs (wildcards allowed) whose repos should match this profile."
               },
+              "exactRepos": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Exact repositories pinned to this profile, canonicalized as host/owner/repo (wildcards allowed), e.g. github.com/acme/secret. Always wins over expectedRemoteOwners — this is how one specific repo is bound to a profile regardless of owner patterns."
+              },
               "expectedBranchPatterns": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -141,6 +146,10 @@
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "SSH host aliases (e.g. github-work, from a ~/.ssh/config Host entry) this profile explicitly trusts as an approved push route. A custom SSH alias is never trusted just for being non-generic — only aliases listed here can make Push Account read as a trusted route, and even then it is never cryptographic proof of the remote account."
+              },
+              "expectedGitHubLogin": {
+                "type": "string",
+                "description": "The GitHub username this profile expects a trusted SSH route to authenticate as when Shield performs strict GitHub account verification. This is NOT your commit email (gitEmail), NOT the repository's owner or org (expectedRemoteOwners / exactRepos), NOT the SSH host alias (trustedSshHostAliases), and NOT a generic Git username — it is the github.com account name that `ssh -T git@…` reports for this route, e.g. \"danish-work\". Only used when strictPushSetup is on and the push route is already a trusted SSH alias; leave it empty to make no claim about which account authenticates. Requires Shield to be enabled; run \"Repo Identity Guard: Repair Shield\" after changing it."
               }
             }
           }

@@ -630,17 +630,22 @@ export function noPinnedMemoryNote(): InfoNote {
   };
 }
 
-/**
- * Shield Mode (local Git hooks) is not implemented yet. This is a static,
- * always-shown info note — feature-availability metadata, not a safety
- * verdict, and never gated behind a settings toggle a user could mistake
- * for something that's actually protecting them.
+/*
+ * REMOVED (Phase 9): `shieldModeComingSoonNote()`.
+ *
+ * It was a static, always-shown info note reading "Shield Mode is not
+ * built yet — Optional local Git hooks that would block unsafe
+ * commits/pushes don't exist yet — nothing is enforcing this
+ * automatically." Every clause of that is now false: Shield installs real
+ * pre-commit / pre-merge-commit / pre-push hooks that block unsafe
+ * commits and pushes with VS Code closed (src/shield/, and the shipped
+ * resources/shield/shield-evaluate.sh).
+ *
+ * Worse than merely stale: it was shown unconditionally, INCLUDING in a
+ * repository where Shield was active and enforcing — telling a user that
+ * nothing was protecting them while something was. There is deliberately
+ * no replacement note here. Shield's real, per-repository state is
+ * reported by `ShieldManager.inspect()`/`healthCheck()` and surfaced
+ * through the Command Palette; a hard-coded note in the safety engine
+ * cannot know it and must not guess at it.
  */
-export function shieldModeComingSoonNote(): InfoNote {
-  return {
-    id: "agent_guard:shield_mode_coming_soon",
-    category: "agent_guard_meta",
-    title: "Shield Mode is not built yet",
-    message: "Optional local Git hooks that would block unsafe commits/pushes don't exist yet — nothing is enforcing this automatically.",
-  };
-}

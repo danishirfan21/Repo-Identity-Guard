@@ -539,12 +539,26 @@ test("a trusted workspace (default) produces a confirmed workspace-trust result"
   assert.equal(result?.state, "confirmed");
 });
 
-test("Shield Mode is always shown as an info note, never a capability result", () => {
+test("the safety engine never claims Shield Mode does not exist (Phase 9 — it does, and it enforces)", () => {
+  // This used to assert the OPPOSITE: that a static
+  // "Shield Mode is not built yet / nothing is enforcing this
+  // automatically" note was always present. It was shown unconditionally,
+  // including in repositories where Shield was installed and actively
+  // blocking commits and pushes — telling the user nothing protected them
+  // while something did. The note is gone; this test now guards against it
+  // (or anything like it) coming back.
   const summary = run(safeFacts());
-  const note = summary.infoNotes.find((n) => n.title === "Shield Mode is not built yet");
-  assert.ok(note);
-  assert.equal(note?.category, "agent_guard_meta");
-  assert.ok(!summary.capabilityResults.some((r) => r.title === "Shield Mode is not built yet"));
+  const claims = [
+    ...summary.infoNotes.map((n) => `${n.title} ${n.message}`),
+    ...summary.capabilityResults.map((r) => `${r.title} ${r.summary} ${r.whyItMatters ?? ""}`),
+  ];
+  for (const claim of claims) {
+    assert.doesNotMatch(claim, /not built yet|coming soon|don't exist yet|do not exist yet|nothing is enforcing/i, claim);
+  }
+  // The safety engine deliberately makes NO claim about Shield at all —
+  // Shield's real state is per-repository and comes from
+  // ShieldManager.inspect(), which this pure engine cannot see.
+  assert.ok(!summary.infoNotes.some((n) => /shield/i.test(n.title)));
 });
 
 test("strict local identity mode flags identity that is only safe via global config, as a non-blocking warning", () => {

@@ -35,7 +35,6 @@ import {
   repoOperationConflictsResult,
   repoOperationDirtyResult,
   repoOperationInProgressResult,
-  shieldModeComingSoonNote,
   workspaceTrustedResult,
   workspaceUntrustedResult,
 } from "./capabilityFactory";
@@ -85,7 +84,6 @@ export function computeStatus(input: StatusEngineInput): StatusSummary {
   if (!input.pinnedMemoryNote) {
     infoNotes.push(noPinnedMemoryNote());
   }
-  infoNotes.push(shieldModeComingSoonNote());
 
   const level: SafetyLevel = capabilityResults.some((result) => result.blocksOverallSafety)
     ? "not_safe"
