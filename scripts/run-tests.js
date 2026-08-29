@@ -33,5 +33,19 @@ if (files.length === 0) {
   process.exit(1);
 }
 
-const result = spawnSync(process.execPath, ["--test", ...files], { stdio: "inherit" });
+// `--test-concurrency=1`: several of the fuzz/differential test FILES each
+// cap their own real-subprocess pool at `min(4, cpus)` (see
+// fuzzHarness.ts's `POOL_SIZE_DEFAULT`) specifically to bound how many
+// concurrent `sh`/`git`/`awk` processes one file's fuzz cases put in
+// flight. Node's test runner, left at its default, still runs multiple
+// test FILES concurrently -- which stacks several files' pools on top of
+// each other and reproduces the exact contention the per-file cap was
+// meant to prevent (a `git rev-parse` failing transiently under load,
+// correctly reported by the evaluator as `inspection-failed`, but read as
+// a spurious mismatch by a harness expecting a policy verdict). Observed
+// directly: an intermittent failure at roughly 1-in-3 runs with default
+// file-level concurrency, gone across repeated runs once serialized.
+// Sub-tests within one file are unaffected -- this only removes the
+// additional, unbounded layer of cross-file parallelism.
+const result = spawnSync(process.execPath, ["--test", "--test-concurrency=1", ...files], { stdio: "inherit" });
 process.exit(result.status ?? 1);

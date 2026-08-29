@@ -14,6 +14,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Safety net, not a target: the differential/fuzz suites spawn a real
+    # `sh` (which itself spawns `git`/`awk`) per generated case, thousands
+    # of times across the fuzz files. On windows-latest that per-process
+    # overhead was observed to make the full suite run past 45 minutes
+    # with no other progress -- indistinguishable in the UI from a genuine
+    # hang. This timeout turns "silently burns the runner for hours" into
+    # a loud, bounded failure; SHIELD_FUZZ_CASES below is the actual fix
+    # for the overhead itself.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -41,4 +50,18 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: shellcheck -s sh resources/shield/shield-evaluate.sh
 
+      # Full fuzz/differential depth (SHIELD_FUZZ_CASES unset -> each
+      # harness's own default, currently up to ~900 cases) runs on every
+      # OS except Windows. Each fuzz case spawns a real `sh` process
+      # (itself spawning `git`/`awk`), and Windows process-creation
+      # overhead is high enough that the unscaled suite was observed to
+      # still be running 45+ minutes in with no further progress -- see
+      # the job-level timeout-minutes comment above. This does not reduce
+      # what the *generators* cover (same boundary-biased cases, same
+      # assertions) -- only how many of them run on this one slow
+      # platform; the full sweep still runs on ubuntu-latest and
+      # macos-latest on every CI run, and locally with
+      # `SHIELD_FUZZ_CASES=<n> npm test` on any platform.
       - run: npm test
+        env:
+          SHIELD_FUZZ_CASES: ${{ matrix.os == 'windows-latest' && '60' || '' }}
