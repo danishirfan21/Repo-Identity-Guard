@@ -77,7 +77,21 @@ lower() {
   # (where it's stripped harmlessly) and piped line-by-line inside a
   # `while read` loop feeding `grep -qx` (where dropping it would merge
   # every line into one and silently break every array-membership check).
-  printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]'
+  #
+  # Leading/trailing whitespace is STRIPPED as well as case being folded
+  # (Phase 9 / Part 7). This function is the shell half of
+  # `normalize()` in src/shield/evaluator.ts, which has always done
+  # `.trim().toLocaleLowerCase()` -- and the differential fuzzer caught the
+  # two drifting apart: a profile whose `expectedGitName` carried a stray
+  # leading space (a plain settings typo) matched in TypeScript and did NOT
+  # match here, so the shipped evaluator blocked every commit with a
+  # baffling `Expected:   Danish Irfan / Found: Danish Irfan`.
+  #
+  # This is a whitespace-only normalization and loses no safety property:
+  # Git itself strips leading/trailing whitespace from an ident's name, so
+  # the two spellings were never two different identities to begin with.
+  # Nothing about non-whitespace content compares any more leniently.
+  printf '%s\n' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]'
 }
 
 # ==================== locate + load policy ====================
@@ -204,8 +218,18 @@ function parse_string(   out, ch, esc, hex, code, i) {
       else { err("invalid escape sequence \"\\" esc "\"") }
       continue
     }
-    # JSON forbids raw control characters inside strings.
-    if (ch == "\n" || ch == "\r" || ch == "\t") { err("raw control character inside a string") }
+    # JSON forbids EVERY raw control character (U+0000-U+001F) inside a
+    # string, not just the three that are easy to type.
+    #
+    # Phase 9 / Part 8 finding, found by the adversarial parser fuzzer: this
+    # check used to be `ch == "\n" || ch == "\r" || ch == "\t"`, so every
+    # other C0 control character -- U+0001 and the rest, plus DEL -- was
+    # accepted into a string value. That was a FAIL-OPEN disagreement with
+    # the TypeScript validator (JSON.parse rejects them outright): a policy
+    # file corrupted with a stray control byte was rejected by the extension
+    # and honoured by the shipped evaluator, which then allowed the commit.
+    # [[:cntrl:]] is the POSIX character class for exactly that set.
+    if (ch ~ /[[:cntrl:]]/) { err("raw control character inside a string") }
     out = out ch
     pos++
   }
@@ -400,6 +424,24 @@ require_string_array .trustedSshHostAliases
 require_string_array .protectedBranches
 require_string_array .expectedBranchPatterns
 require_string_array .enabledActions
+
+# ...and every element must be one of the two actions Shield knows about.
+#
+# Phase 9 / Part 8 finding, found by the adversarial parser fuzzer: only the
+# "array of strings" shape was checked here, so `["commit","push","rebase"]`
+# parsed fine and was honoured, while validateShieldPolicy() in TypeScript
+# rejects it (`enabledActions must be an array containing only commit,
+# push`). That is a fail-OPEN disagreement in the exact field that decides
+# whether Shield governs an action at all: a policy written by a newer or
+# foreign version of the extension, naming an action this build cannot
+# enforce, was silently accepted as if it named only the ones it does know.
+# An unrecognized action is corruption, and corruption fails closed.
+policy_array .enabledActions | while IFS= read -r declared_action; do
+  case "$declared_action" in
+    commit|push) ;;
+    *) exit 7 ;;
+  esac
+done || fail_immediately policy-corrupt "policy field enabledActions must contain only \"commit\" and \"push\""
 
 # Secret-shaped-field guard -- mirrors validateShieldPolicy()'s own list.
 # A policy carrying any of these was built from the wrong source object and
