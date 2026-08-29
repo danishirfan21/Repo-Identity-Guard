@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createRepoPool,
   destroyRepoPool,
+  fuzzCaseCount,
   fuzzPoolSize,
   fuzzSeed,
   mapWithRepos,
@@ -399,7 +400,7 @@ test("PART 9 — randomized URL sweep: shell and TypeScript agree on owner/repo 
   const OWNERS = ["acme", "Acme", "acme-org", "a", "acme.co", "acme_1"];
   const REPOS = ["repo", "Repo", "repo.name", "repo-name", "r", "repo_v2"];
   const HOSTS = ["github.com", "github-work", "gitlab.com", "git.internal.example", "192.0.2.10"];
-  const cases: string[] = Array.from({ length: 400 }, () => {
+  const cases: string[] = Array.from({ length: fuzzCaseCount(400) }, () => {
     const owner = rng.pick(OWNERS);
     const repo = rng.pick(REPOS);
     const host = rng.pick(HOSTS);

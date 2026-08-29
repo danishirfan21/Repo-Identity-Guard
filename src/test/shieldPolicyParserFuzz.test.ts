@@ -6,6 +6,7 @@ import {
   fuzzCaseCount,
   fuzzPoolSize,
   fuzzSeed,
+  fuzzStride,
   mapWithRepos,
   rngFrom,
   runEvaluator,
@@ -285,10 +286,15 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
   });
 
   // --- truncation sweep ---
-  // Every byte position is checked for the pretty-printed form (the shape
-  // an interrupted write actually produces); a representative stride is
-  // used for the compact one so this stays affordable.
-  for (let i = 1; i < BASELINE_JSON.length; i += 1) {
+  // Every byte position is checked for the pretty-printed form by default
+  // (the shape an interrupted write actually produces) -- exhaustive
+  // unless `SHIELD_FUZZ_CASES` asks for a smaller run, in which case
+  // `fuzzStride` spreads a proportionally reduced sample across the same
+  // byte range rather than silently making this sweep the one part of the
+  // suite the env override doesn't reach. A representative stride is used
+  // for the compact form unconditionally, so this stays affordable.
+  const prettyStride = fuzzStride(BASELINE_JSON.length, 400);
+  for (let i = 1; i < BASELINE_JSON.length; i += prettyStride) {
     cases.push({ label: `truncated at byte ${i} (pretty)`, raw: BASELINE_JSON.slice(0, i), expect: "block" });
   }
   for (let i = 1; i < compact.length; i += 7) {
@@ -367,8 +373,13 @@ test("PART 8 — the shell policy parser never allows an action from a policy th
       0,
       `${bad.length}/${cases.length} policy-parser cases failed (seed ${SEED}).\n${JSON.stringify(bad.slice(0, 5), null, 2)}`,
     );
-    // Sanity: the corpus is actually large and actually contains both kinds.
-    assert.ok(cases.length > 500, `corpus too small: ${cases.length}`);
+    // Sanity: the corpus is actually large and actually contains both
+    // kinds -- but only at full, unscaled depth. `SHIELD_FUZZ_CASES`
+    // (see fuzzStride) deliberately shrinks this corpus on slower CI
+    // legs; a fixed absolute floor would fight that on purpose, not
+    // guard against an accidental regression.
+    const minCorpus = process.env.SHIELD_FUZZ_CASES ? 20 : 500;
+    assert.ok(cases.length > minCorpus, `corpus too small: ${cases.length}`);
   } finally {
     await destroyRepoPool(repos);
   }

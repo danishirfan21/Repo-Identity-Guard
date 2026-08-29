@@ -88,6 +88,20 @@ export function fuzzCaseCount(defaultCount: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : defaultCount;
 }
 
+/**
+ * Stride for a sweep whose case COUNT isn't itself a parameter (e.g. "every
+ * byte position of this fixed string"), so `fuzzCaseCount` doesn't apply
+ * directly. Default stride 1 (exhaustive) unless `SHIELD_FUZZ_CASES` is
+ * set, in which case every Nth position is used instead so the same env
+ * override that scales the counted harnesses down also scales this kind
+ * down, roughly proportionally to `total / fuzzCaseCount(total)`.
+ */
+export function fuzzStride(total: number, defaultTotal: number): number {
+  const scaled = fuzzCaseCount(defaultTotal);
+  if (scaled >= defaultTotal) return 1;
+  return Math.max(1, Math.floor(total / Math.max(1, scaled)));
+}
+
 // ==================== repository pool ====================
 
 export interface FuzzRepo {
