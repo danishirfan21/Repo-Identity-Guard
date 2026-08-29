@@ -27,6 +27,16 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return stdout.trim();
 }
 
+// Phase 7 Windows finding: `git rev-parse --path-format=absolute` always
+// reports paths with forward slashes, even on Windows, while `path.join`
+// produces native (backslash) separators there -- comparing the two
+// directly fails on Windows alone even when they name the same path.
+// Normalizing both sides to forward slashes before comparing keeps these
+// assertions about *which path* Git resolves to, not slash direction.
+function toPosix(p: string): string {
+  return p.split(path.sep).join("/");
+}
+
 async function makeTempRepo(): Promise<string> {
   // realpath: on macOS, os.tmpdir() returns a path through the /var ->
   // /private/var symlink, but `git rev-parse --path-format=absolute`
@@ -51,7 +61,7 @@ test("a normal (non-worktree) repo: --git-dir and --git-common-dir are the same 
     const gitDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-dir"]);
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     assert.equal(gitDir, commonDir);
-    assert.equal(gitDir, path.join(repo, ".git"));
+    assert.equal(toPosix(gitDir), toPosix(path.join(repo, ".git")));
   } finally {
     await fs.rm(repo, { recursive: true, force: true });
   }
@@ -71,13 +81,13 @@ test("a linked worktree has its own --git-dir but SHARES --git-common-dir with t
 
     // git-dir differs per worktree (each has its own worktrees/<name> dir)...
     assert.notEqual(wtGitDir, mainGitDir);
-    assert.ok(wtGitDir.includes(path.join(".git", "worktrees")));
+    assert.ok(wtGitDir.includes(toPosix(path.join(".git", "worktrees"))));
 
     // ...but git-common-dir is identical from both — the one stable,
     // worktree-portable anchor. This is the empirical basis for storing
     // Shield's policy under the common dir, not the per-worktree git-dir.
     assert.equal(wtCommonDir, mainCommonDir);
-    assert.equal(mainCommonDir, path.join(repo, ".git"));
+    assert.equal(toPosix(mainCommonDir), toPosix(path.join(repo, ".git")));
   } finally {
     await fs.rm(worktreeDir, { recursive: true, force: true }).catch(() => undefined);
     await fs.rm(repo, { recursive: true, force: true }).catch(() => undefined);
@@ -101,7 +111,7 @@ test("hooks resolve to ONE shared directory (derived from git-common-dir) for bo
     // opting into the (separately tested, separately documented as a
     // bypass) worktree-scoped core.hooksPath override.
     assert.equal(mainHooksPath, wtHooksPath);
-    assert.equal(mainHooksPath, path.join(repo, ".git", "hooks"));
+    assert.equal(toPosix(mainHooksPath), toPosix(path.join(repo, ".git", "hooks")));
   } finally {
     await fs.rm(worktreeDir, { recursive: true, force: true }).catch(() => undefined);
     await fs.rm(repo, { recursive: true, force: true }).catch(() => undefined);
@@ -141,7 +151,7 @@ test("a WORKTREE-SCOPED core.hooksPath (extensions.worktreeConfig on) redirects 
     const wtHooksPath = await git(worktreeDir, ["rev-parse", "--git-path", "hooks"]);
 
     // The main worktree is unaffected...
-    assert.equal(mainHooksPath, path.join(".git", "hooks"));
+    assert.equal(mainHooksPath, toPosix(path.join(".git", "hooks")));
     // ...but the linked worktree's hook resolution was silently redirected,
     // entirely independent of the main worktree. Shield cannot prevent
     // this — it can only be documented as a known, deliberate bypass

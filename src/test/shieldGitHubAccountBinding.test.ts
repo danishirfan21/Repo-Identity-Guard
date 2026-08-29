@@ -82,33 +82,50 @@ function push(repo: Repo, args: string[], envOverride?: NodeJS.ProcessEnv): Prom
  *    baseline push after a passing account check still actually lands in
  *    the local bare repo.
  */
+// Phase 7 Windows finding: a bare, extension-less `ssh` file is invisible
+// to Windows' PATH lookup (it tries PATHEXT extensions, not raw
+// filenames), so the real ssh.exe further down PATH would get found
+// instead and genuinely try to reach GitHub. Reimplemented in Node (rather
+// than POSIX `sh`) with a matching `ssh.cmd` shim so the shadow works on
+// every platform without assuming a shell is on PATH. See
+// shieldPrePush.test.ts for the fuller writeup of the Windows PATH-lookup
+// gap this fixes.
 async function makeFakeSshBin(): Promise<string> {
   const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-fakessh-gh-"));
-  const sshPath = path.join(binDir, "ssh");
+  const implPath = path.join(binDir, "fake-ssh-impl.js");
   await fs.writeFile(
-    sshPath,
-    `#!/bin/sh
-case " $* " in
-  *" -G "*)
-    if [ "\${FAKE_SSH_IDENTITIES_ONLY:-yes}" = "yes" ]; then
-      printf 'user %s\\nhostname github.example\\nidentitiesonly yes\\n' "\${FAKE_SSH_USER:-git}"
-    else
-      printf 'user %s\\nhostname github.example\\n' "\${FAKE_SSH_USER:-git}"
-    fi
-    exit 0
-    ;;
-  *" -T "*)
-    printf '%s' "\${FAKE_SSH_AUTH_OUTPUT:-}" >&2
-    exit "\${FAKE_SSH_AUTH_EXIT:-1}"
-    ;;
-  *)
-    shift $(($#-1))
-    exec sh -c "$1"
-    ;;
-esac
+    implPath,
+    `"use strict";
+const { execFileSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const joined = " " + args.join(" ") + " ";
+if (joined.includes(" -G ")) {
+  const identitiesOnly = (process.env.FAKE_SSH_IDENTITIES_ONLY || "yes") === "yes";
+  const user = process.env.FAKE_SSH_USER || "git";
+  process.stdout.write(identitiesOnly
+    ? \`user \${user}\\nhostname github.example\\nidentitiesonly yes\\n\`
+    : \`user \${user}\\nhostname github.example\\n\`);
+  process.exit(0);
+} else if (joined.includes(" -T ")) {
+  process.stderr.write(process.env.FAKE_SSH_AUTH_OUTPUT || "");
+  process.exit(parseInt(process.env.FAKE_SSH_AUTH_EXIT || "1", 10));
+} else {
+  const remoteCommand = args[args.length - 1] || "";
+  const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
+  if (!match) {
+    process.stderr.write("fake-ssh: could not parse remote command: " + remoteCommand + "\\n");
+    process.exit(1);
+  }
+  try {
+    execFileSync(match[1], [match[2]], { stdio: "inherit" });
+  } catch (err) {
+    process.exit(typeof err.status === "number" ? err.status : 1);
+  }
+}
 `,
-    { mode: 0o755 },
   );
+  await fs.writeFile(path.join(binDir, "ssh"), `#!/usr/bin/env node\nrequire(${JSON.stringify(implPath)});\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(binDir, "ssh.cmd"), `@echo off\r\nnode "${implPath}" %*\r\n`);
   return binDir;
 }
 

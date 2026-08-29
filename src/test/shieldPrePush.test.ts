@@ -72,10 +72,10 @@ function push(repo: Repo, args: string[], envOverride?: NodeJS.ProcessEnv): Prom
  * (`git@<alias>:<path>`) actually land in a local bare repo instead of
  * attempting a real network connection — no real SSH daemon involved.
  * Git invokes its configured SSH command as `ssh [options] <host>
- * <remote-command>`; this script drops the host argument and runs the
- * remote command (`git-receive-pack '<path>'` etc.) locally via `sh -c`,
- * which works because the URL's "path" portion is deliberately a real
- * local filesystem path to a bare repo this test created.
+ * <remote-command>`; this drops the host/option arguments and runs the
+ * remote command (`git-receive-pack '<path>'` etc.) locally, which works
+ * because the URL's "path" portion is deliberately a real local filesystem
+ * path to a bare repo this test created.
  *
  * Crucially, this is invoked purely via PATH resolution — no `GIT_SSH`,
  * `GIT_SSH_COMMAND`, or `core.sshCommand` is set for these "should
@@ -84,16 +84,65 @@ function push(repo: Repo, args: string[], envOverride?: NodeJS.ProcessEnv): Prom
  * shadowing PATH this way would be equally invisible to Shield — a
  * documented limitation, not a gap introduced by this test harness: see
  * docs/SHIELD_MODE.md "Phase 4.")
+ *
+ * Phase 7 Windows finding: a PATH lookup for a bare, extension-less `ssh`
+ * file is a POSIX-only mechanism — Windows resolves an unqualified command
+ * by trying `PATHEXT` extensions (.EXE/.CMD/.BAT/...) against each PATH
+ * directory in turn, so a shebang script named plain `ssh` is invisible to
+ * it and the *real* `ssh.exe` further down PATH gets found instead (a real
+ * `git push` then genuinely tries to resolve "github-work" as a DNS name
+ * and fails). Writing an `ssh.cmd` shim alongside it -- delegating to a
+ * plain Node script rather than assuming any particular shell is on PATH
+ * -- makes the shadow visible on Windows too, and the shared regex-based
+ * parser (rather than `sh -c`) sidesteps depending on a POSIX shell being
+ * reachable at all.
  */
 async function makeFakeSshBin(): Promise<string> {
   const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-fakessh-"));
-  const sshPath = path.join(binDir, "ssh");
-  await fs.writeFile(
-    sshPath,
-    `#!/bin/sh\nshift $(($#-1))\nexec sh -c "$1"\n`,
-    { mode: 0o755 },
-  );
+  await writeFakeSshPassthrough(binDir);
   return binDir;
+}
+
+/**
+ * Shared passthrough implementation: git's ssh transport always invokes the
+ * remote command as a single already-quoted argument shaped like
+ * `git-upload-pack '/abs/path'` -- parsing that out with a regex and
+ * running it directly (no intermediate shell) works identically on every
+ * platform this suite runs on.
+ */
+function fakeSshPassthroughImplSource(): string {
+  return `"use strict";
+const { execFileSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const remoteCommand = args[args.length - 1] || "";
+const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
+if (!match) {
+  process.stderr.write("fake-ssh: could not parse remote command: " + remoteCommand + "\\n");
+  process.exit(1);
+}
+try {
+  execFileSync(match[1], [match[2]], { stdio: "inherit" });
+} catch (err) {
+  process.exit(typeof err.status === "number" ? err.status : 1);
+}
+`;
+}
+
+async function writeFakeSshPassthrough(binDir: string): Promise<void> {
+  const implPath = path.join(binDir, "fake-ssh-impl.js");
+  await fs.writeFile(implPath, fakeSshPassthroughImplSource());
+  await fs.writeFile(path.join(binDir, "ssh"), `#!/usr/bin/env node\nrequire(${JSON.stringify(implPath)});\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(binDir, "ssh.cmd"), `@echo off\r\nnode "${implPath}" %*\r\n`);
+}
+
+// MSYS/git-bash (which resolves GIT_SSH_COMMAND / core.sshCommand via its
+// own `sh -c "<command> ..."`) treats a backslash as a POSIX shell escape
+// character -- an unconverted Windows path like `C:\Users\x\ssh` arrives
+// at sh with every backslash silently eaten (`C:Usersxssh`, "command not
+// found"). Any fake-ssh path handed to Git through a config value or env
+// var that Git re-invokes via a shell must be forward-slashed first.
+function toShellPath(p: string): string {
+  return p.split(path.sep).join("/");
 }
 
 async function makeBareRemote(parentDir: string, owner: string, repoName: string): Promise<string> {
@@ -470,7 +519,7 @@ test("GIT_SSH_COMMAND set at push time -> route unverifiable, strict mode blocks
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
 
-    const result = await push(repo, ["origin", "main"], { ...repo.env, GIT_SSH_COMMAND: path.join(fakeSshBin, "ssh") });
+    const result = await push(repo, ["origin", "main"], { ...repo.env, GIT_SSH_COMMAND: toShellPath(path.join(fakeSshBin, "ssh")) });
     assert.notEqual(result.code, 0);
     assert.equal(await remoteRefSha(bare), null);
     assert.match(result.stderr, /push-route-override/);
@@ -491,7 +540,7 @@ test("GIT_SSH set at push time -> route unverifiable, strict mode blocks a push 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
 
-    const result = await push(repo, ["origin", "main"], { ...repo.env, GIT_SSH: path.join(fakeSshBin, "ssh") });
+    const result = await push(repo, ["origin", "main"], { ...repo.env, GIT_SSH: toShellPath(path.join(fakeSshBin, "ssh")) });
     assert.notEqual(result.code, 0);
     assert.equal(await remoteRefSha(bare), null);
     assert.match(result.stderr, /push-route-override/);
@@ -511,7 +560,7 @@ test("core.sshCommand set (persisted repo config) -> route unverifiable, strict 
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    await git(repo, ["config", "core.sshCommand", path.join(fakeSshBin, "ssh")]);
+    await git(repo, ["config", "core.sshCommand", toShellPath(path.join(fakeSshBin, "ssh"))]);
 
     const result = await push(repo, ["origin", "main"]);
     assert.notEqual(result.code, 0);
@@ -537,7 +586,7 @@ test("a command-scoped `git -c core.sshCommand=...` override is visible at hook 
     const result = await new Promise<PushResult>((resolve, reject) => {
       execFile(
         "git",
-        ["-c", `core.sshCommand=${path.join(fakeSshBin, "ssh")}`, "push", "origin", "main"],
+        ["-c", `core.sshCommand=${toShellPath(path.join(fakeSshBin, "ssh"))}`, "push", "origin", "main"],
         { cwd: repo.dir, encoding: "utf8", env: repo.env },
         (error, _stdout, stderr) => {
           if (error && typeof (error as { code?: unknown }).code !== "number") {
@@ -568,7 +617,7 @@ test("an SSH override does NOT block a non-strict profile (route trust is only e
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
-    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}`, GIT_SSH_COMMAND: `${fakeSshBin}/ssh` };
+    const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}`, GIT_SSH_COMMAND: toShellPath(path.join(fakeSshBin, "ssh")) };
 
     const result = await push(repo, ["origin", "main"], env);
     assert.equal(result.code, 0, result.stderr);

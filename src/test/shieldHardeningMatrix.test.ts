@@ -181,11 +181,44 @@ async function enableShield(
   return result;
 }
 
+// Phase 7 Windows findings: (1) a PATH lookup for a bare, extension-less
+// `ssh` file is POSIX-only -- Windows tries PATHEXT extensions and falls
+// through to the real ssh.exe further down PATH, which then genuinely
+// tries to resolve the fake alias as DNS and fails. An `ssh.cmd` shim,
+// delegating to a plain Node script rather than assuming a shell is on
+// PATH, makes the shadow visible on Windows too. (2) a fake-ssh path
+// embedded in GIT_SSH_COMMAND / core.sshCommand goes through git-bash's
+// own `sh -c "<command> ..."`, which treats backslash as a shell escape --
+// an un-converted Windows path arrives with every backslash silently
+// eaten ("command not found"). See toShellPath below.
 async function makeFakeSshBin(): Promise<string> {
   const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-fakessh-"));
-  const sshPath = path.join(binDir, "ssh");
-  await fs.writeFile(sshPath, `#!/bin/sh\nshift $(($#-1))\nexec sh -c "$1"\n`, { mode: 0o755 });
+  const implPath = path.join(binDir, "fake-ssh-impl.js");
+  await fs.writeFile(
+    implPath,
+    `"use strict";
+const { execFileSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const remoteCommand = args[args.length - 1] || "";
+const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
+if (!match) {
+  process.stderr.write("fake-ssh: could not parse remote command: " + remoteCommand + "\\n");
+  process.exit(1);
+}
+try {
+  execFileSync(match[1], [match[2]], { stdio: "inherit" });
+} catch (err) {
+  process.exit(typeof err.status === "number" ? err.status : 1);
+}
+`,
+  );
+  await fs.writeFile(path.join(binDir, "ssh"), `#!/usr/bin/env node\nrequire(${JSON.stringify(implPath)});\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(binDir, "ssh.cmd"), `@echo off\r\nnode "${implPath}" %*\r\n`);
   return binDir;
+}
+
+function toShellPath(p: string): string {
+  return p.split(path.sep).join("/");
 }
 
 async function makeBareRemote(parentDir: string, owner: string, repoName: string): Promise<string> {

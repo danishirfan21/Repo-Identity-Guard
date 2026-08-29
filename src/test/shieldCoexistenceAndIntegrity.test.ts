@@ -253,10 +253,35 @@ test("execution order: Shield's own check runs FIRST — a chained hook never ru
  * `shieldPrePush.test.ts` (Phase 4) established; see that file's
  * `makeFakeSshBin` for the full rationale.
  */
+// Phase 7 Windows finding: a bare, extension-less `ssh` file is invisible
+// to Windows' PATH lookup (it tries PATHEXT extensions, not raw
+// filenames), so the real ssh.exe further down PATH gets found instead.
+// An `ssh.cmd` shim delegating to a plain Node script -- rather than
+// assuming a POSIX shell is reachable -- makes the shadow visible there
+// too. See shieldPrePush.test.ts for the fuller writeup.
 async function makeFakeSshBin(): Promise<string> {
   const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-fakessh-"));
-  const sshPath = path.join(binDir, "ssh");
-  await fs.writeFile(sshPath, `#!/bin/sh\nshift $(($#-1))\nexec sh -c "$1"\n`, { mode: 0o755 });
+  const implPath = path.join(binDir, "fake-ssh-impl.js");
+  await fs.writeFile(
+    implPath,
+    `"use strict";
+const { execFileSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const remoteCommand = args[args.length - 1] || "";
+const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
+if (!match) {
+  process.stderr.write("fake-ssh: could not parse remote command: " + remoteCommand + "\\n");
+  process.exit(1);
+}
+try {
+  execFileSync(match[1], [match[2]], { stdio: "inherit" });
+} catch (err) {
+  process.exit(typeof err.status === "number" ? err.status : 1);
+}
+`,
+  );
+  await fs.writeFile(path.join(binDir, "ssh"), `#!/usr/bin/env node\nrequire(${JSON.stringify(implPath)});\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(binDir, "ssh.cmd"), `@echo off\r\nnode "${implPath}" %*\r\n`);
   return binDir;
 }
 
