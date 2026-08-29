@@ -640,12 +640,39 @@ test("install record: a corrupt or hand-edited record is treated as absent and n
     await manager.disable(repo.dir);
     assert.equal(await exists(victim), true, "Shield must never delete a hook path it cannot prove it owns");
 
-    // And an outright corrupt record is simply ignored, never fatal.
+    // An outright corrupt record is still never FATAL and still never
+    // makes Shield touch a path it cannot prove it owns — but as of Phase
+    // 9 it is no longer reported as a healthy "active" either.
+    //
+    // This assertion used to read `assert.equal(inspection.state,
+    // "active")`. The Part 10 lifecycle torture harness showed that to be
+    // the wrong verdict: a corrupt record reads as *absent* by design, and
+    // absent meant "no previous locations to check", so the single state
+    // this record exists to prevent — live Shield hooks that nothing is
+    // keeping track of — was precisely the state `inspect()` could not
+    // report. Move `core.hooksPath` from there and Disable Shield can no
+    // longer reach those hooks; move it back and they are live again with
+    // no evaluator beside them, blocking every commit and push.
+    //
+    // So the expectation is now DEGRADED with an actionable reason, which
+    // is strictly stricter than before. Everything this test actually
+    // guards — that a tampered record never causes a deletion, and never
+    // makes an operation fail — is unchanged and still asserted.
     await enableFromRealRepo(manager, repo);
     await fs.writeFile(recordPath, "{ not json");
     const inspection = await manager.inspect(repo.dir, { evaluatorScriptSource: EVALUATOR_SOURCE });
-    assert.equal(inspection.state, "active", inspection.reasons.join("; "));
+    assert.equal(inspection.state, "degraded", inspection.reasons.join("; "));
+    assert.ok(
+      inspection.reasons.some((r) => /installation record does not name that directory/.test(r)),
+      inspection.reasons.join("; "),
+    );
     assert.deepEqual(inspection.orphanedHookPaths, []);
+    // Every Shield hook is still installed and still enforcing — a broken
+    // record is a tracking problem, never a reason to stop enforcing.
+    for (const hook of inspection.hooks) assert.equal(hook.ownership, "shield");
+    // And Repair restores the record and the healthy verdict.
+    await enableFromRealRepo(manager, repo);
+    assert.equal((await manager.inspect(repo.dir, { evaluatorScriptSource: EVALUATOR_SOURCE })).state, "active");
   } finally {
     await cleanup(repo.dir, bystander);
   }

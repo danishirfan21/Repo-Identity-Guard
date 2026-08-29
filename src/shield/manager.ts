@@ -572,6 +572,31 @@ export class ShieldManager {
     // straight off disk — the record only says *where to look*.
     const orphanedHookPaths = await this.findOrphanedShieldHookPaths(gitContext);
 
+    // Phase 9 / Part 10: is Shield's lifecycle tracking still intact for
+    // the hooks that are live RIGHT HERE?
+    //
+    // Found by the lifecycle torture harness: corrupt (or delete) the
+    // installation record while Shield is installed and `inspect()`
+    // happily reported ACTIVE. A corrupt record reads as *absent* by
+    // design (see installRecord.ts), and absent meant "no previous
+    // locations to check" — so the one state the record exists to prevent,
+    // "live Shield hooks nobody is keeping track of", was the one state it
+    // could not report. Move `core.hooksPath` from there and Disable
+    // Shield can no longer reach those hooks; move it back and they are
+    // live again with no evaluator beside them.
+    //
+    // This is deliberately narrow: it only fires when a Shield-owned hook
+    // actually exists at the CURRENT hooks directory and the record does
+    // not name that directory. "Repair Shield" rewrites the record and
+    // clears it. It also correctly catches a repository installed by a
+    // Shield version that predates the record entirely.
+    const installRecord = await readShieldInstallRecord(
+      shieldInstallRecordFilePath(shieldStorageDir(gitContext.gitCommonDir)),
+    );
+    const installRecordCoversLiveHooks =
+      !hooks.some((h) => h.ownership === "shield") ||
+      (!!installRecord && installRecord.hookDirs.some((dir) => sameHookDir(dir, gitContext.hooksDir)));
+
     const reasons: string[] = [];
     let state: ShieldLifecycleState;
 
@@ -710,6 +735,11 @@ export class ShieldManager {
             : `A newer Shield ${hook.fileName} hook is available. Run "Repair Shield" to update it.`,
         );
       }
+    } else if (!installRecordCoversLiveHooks) {
+      state = "degraded";
+      reasons.push(
+        `Shield's hooks are installed at ${gitContext.hooksDir}, but Shield's installation record does not name that directory (it is missing, unreadable, or corrupt). Enforcement is working right now, but if "core.hooksPath" is changed before Shield is disabled, "Disable Shield" would not know to look here — and a Shield hook left behind with no evaluator beside it blocks every commit and push. Run "Repair Shield" to restore the record.`,
+      );
     } else if (policyProfileDrift) {
       state = "degraded";
       reasons.push(
