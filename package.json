@@ -25,7 +25,7 @@
     "compile": "npm run build:webview && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "watch:webview": "tailwindcss -i ./src/webview/sidebar.css -o ./media/sidebar.css --watch",
-    "test": "npm run compile && node --test \"out/test/**/*.test.js\""
+    "test": "npm run compile && node scripts/run-tests.js"
   },
   "contributes": {
     "viewsContainers": {
