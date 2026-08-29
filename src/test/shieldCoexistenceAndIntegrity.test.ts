@@ -64,6 +64,13 @@ async function touchFile(repo: Repo, name: string, content: string): Promise<voi
   await git(repo, ["add", name]);
 }
 
+// Same Windows finding as shieldGitTopology.test.ts's toPosix: Git always
+// reports paths with forward slashes, even on Windows, so comparing one
+// against a native-separator Node path spuriously fails there alone.
+function toPosix(p: string): string {
+  return p.split(path.sep).join("/");
+}
+
 // Same Windows PATH-casing fix as shieldPrePush.test.ts — see that file's
 // comment on `normalizePathKey` for why this is necessary: `process.env`
 // on Windows may key the search path as `Path`, not `PATH`, and reading
@@ -285,12 +292,26 @@ try {
   return binDir;
 }
 
-test("a chained pre-push hook receives the same argv AND the same stdin ref lines Shield's own evaluator saw", async () => {
+// Phase 7 Windows finding (see shieldPrePush.test.ts for the fuller
+// writeup): Git for Windows does not resolve its ssh transport through
+// the caller's PATH -- it falls through to its own bundled ssh.exe
+// regardless of what this suite prepends, so a real DNS/auth failure
+// surfaces before Shield's pre-push hook ever runs. A gap in this repo's
+// PATH-shadowing test technique on Windows, not in Shield: covered on
+// ubuntu-latest/macos-latest.
+const SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS =
+  process.platform === "win32"
+    ? "Git for Windows does not resolve ssh via PATH search -- this suite's PATH-shadow fake-ssh technique cannot intercept it here. Covered on ubuntu-latest/macos-latest."
+    : false;
+
+test("a chained pre-push hook receives the same argv AND the same stdin ref lines Shield's own evaluator saw", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-remote-"));
   const fakeSshBin = await makeFakeSshBin();
   try {
-    const bareDir = path.join(remoteParent, "AcmeSoftware", "acme-frontend.git");
+    // Forward-slashed (Phase 7 Windows finding, see shieldPrePush.test.ts's
+    // makeBareRemote): this path is embedded into a scp-like SSH URL below.
+    const bareDir = toPosix(path.join(remoteParent, "AcmeSoftware", "acme-frontend.git"));
     await fs.mkdir(path.dirname(bareDir), { recursive: true });
     await execFileAsync("git", ["init", "-q", "--bare", bareDir]);
 
@@ -497,7 +518,7 @@ test("worktrees: a worktree-scoped core.hooksPath makes ONE linked worktree reso
 
     assert.equal(mainInspection.state, "active", "the main worktree, unaffected by a worktree-scoped override elsewhere, stays active");
     assert.notEqual(linkedInspection.state, "active");
-    assert.equal(linkedInspection.gitContext?.hooksDir, altHooksDir);
+    assert.equal(linkedInspection.gitContext?.hooksDir, toPosix(altHooksDir));
     assert.notEqual(linkedInspection.gitContext?.hooksDir, mainInspection.gitContext?.hooksDir);
   } finally {
     await cleanup(repo.dir, worktreeDir, altHooksDir);

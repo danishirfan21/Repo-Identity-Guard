@@ -221,12 +221,28 @@ function toShellPath(p: string): string {
   return p.split(path.sep).join("/");
 }
 
+// Phase 7 Windows finding (see shieldPrePush.test.ts for the fuller
+// writeup): Git for Windows does not resolve its ssh transport through
+// the caller's PATH -- it falls through to its own bundled ssh.exe
+// regardless of what this suite prepends, so a real DNS/auth failure
+// surfaces before Shield's pre-push hook ever runs. A gap in this repo's
+// PATH-shadowing test technique on Windows, not in Shield: covered on
+// ubuntu-latest/macos-latest.
+const SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS =
+  process.platform === "win32"
+    ? "Git for Windows does not resolve ssh via PATH search -- this suite's PATH-shadow fake-ssh technique cannot intercept it here. Covered on ubuntu-latest/macos-latest."
+    : false;
+
 async function makeBareRemote(parentDir: string, owner: string, repoName: string): Promise<string> {
   const ownerDir = path.join(parentDir, owner);
   await fs.mkdir(ownerDir, { recursive: true });
   const bareDir = path.join(ownerDir, `${repoName}.git`);
   await execFileAsync("git", ["init", "-q", "--bare", bareDir]);
-  return bareDir;
+  // Phase 7 Windows finding (see shieldPrePush.test.ts): this path gets
+  // embedded into a scp-like SSH URL below for Shield's evaluator to parse
+  // the owner/repo out of -- a raw Windows backslash path breaks that
+  // parsing. Forward slashes are equally valid as a real fs path there.
+  return toShellPath(bareDir);
 }
 
 async function remoteRefSha(bareDir: string, ref = "refs/heads/main"): Promise<string | null> {
@@ -509,7 +525,7 @@ test("modified hook (hand-edited pre-commit, marker kept, made to always allow) 
 
 // ==================== PUSH MATRIX GAPS ====================
 
-test("branch.pushRemote redirects a push and Shield evaluates the ACTUAL destination it resolves to, not origin's URL", async () => {
+test("branch.pushRemote redirects a push and Shield evaluates the ACTUAL destination it resolves to, not origin's URL", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -536,7 +552,7 @@ test("branch.pushRemote redirects a push and Shield evaluates the ACTUAL destina
   }
 });
 
-test("remote.pushDefault redirects a bare `git push` and is evaluated against the resolved destination", async () => {
+test("remote.pushDefault redirects a bare `git push` and is evaluated against the resolved destination", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -560,7 +576,7 @@ test("remote.pushDefault redirects a bare `git push` and is evaluated against th
   }
 });
 
-test("remote.pushurl (asymmetric fetch/push URL) is what's actually evaluated at push time, not the fetch URL", async () => {
+test("remote.pushurl (asymmetric fetch/push URL) is what's actually evaluated at push time, not the fetch URL", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -582,7 +598,7 @@ test("remote.pushurl (asymmetric fetch/push URL) is what's actually evaluated at
   }
 });
 
-test("force push to the approved destination is still subject to the same destination/route checks (force alone changes nothing)", async () => {
+test("force push to the approved destination is still subject to the same destination/route checks (force alone changes nothing)", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -611,7 +627,7 @@ test("force push to the approved destination is still subject to the same destin
   }
 });
 
-test("ref deletion (`git push origin :branch`) is evaluated the same as any other push to the same destination", async () => {
+test("ref deletion (`git push origin :branch`) is evaluated the same as any other push to the same destination", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -660,7 +676,7 @@ test("missing policy at push time reports a concise, non-crash reason, not a raw
   }
 });
 
-test("expected GitHub login match under strict verification -> allowed (network mocked via fake ssh, never real GitHub)", async () => {
+test("expected GitHub login match under strict verification -> allowed (network mocked via fake ssh, never real GitHub)", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await mockGithubSsh("danish-work");
@@ -687,27 +703,40 @@ test("expected GitHub login match under strict verification -> allowed (network 
  * makeFakeSshBin — so one fake binary serves both the account-verification
  * probe and the real push transport, without ever touching the network.
  */
+// Phase 7 Windows finding (see makeFakeSshBin above): reimplemented in
+// Node with an ssh.cmd shim so Windows' PATH lookup can find it too.
 async function mockGithubSsh(login: string): Promise<string> {
   const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-fakegh-"));
-  const sshPath = path.join(binDir, "ssh");
+  const implPath = path.join(binDir, "fake-ssh-impl.js");
   await fs.writeFile(
-    sshPath,
-    `#!/bin/sh
-case " $* " in
-  *" -G "*)
-    echo "identitiesonly yes"
-    exit 0
-    ;;
-  *" -T "*)
-    echo "Hi ${login}! You've successfully authenticated, but GitHub does not provide shell access."
-    exit 1
-    ;;
-esac
-shift $(($#-1))
-exec sh -c "$1"
+    implPath,
+    `"use strict";
+const { execFileSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const joined = " " + args.join(" ") + " ";
+if (joined.includes(" -G ")) {
+  process.stdout.write("identitiesonly yes\\n");
+  process.exit(0);
+} else if (joined.includes(" -T ")) {
+  process.stdout.write("Hi ${login}! You've successfully authenticated, but GitHub does not provide shell access.\\n");
+  process.exit(1);
+} else {
+  const remoteCommand = args[args.length - 1] || "";
+  const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
+  if (!match) {
+    process.stderr.write("fake-ssh: could not parse remote command: " + remoteCommand + "\\n");
+    process.exit(1);
+  }
+  try {
+    execFileSync(match[1], [match[2]], { stdio: "inherit" });
+  } catch (err) {
+    process.exit(typeof err.status === "number" ? err.status : 1);
+  }
+}
 `,
-    { mode: 0o755 },
   );
+  await fs.writeFile(path.join(binDir, "ssh"), `#!/usr/bin/env node\nrequire(${JSON.stringify(implPath)});\n`, { mode: 0o755 });
+  await fs.writeFile(path.join(binDir, "ssh.cmd"), `@echo off\r\nnode "${implPath}" %*\r\n`);
   return binDir;
 }
 

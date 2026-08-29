@@ -1515,6 +1515,86 @@ this project added. See the CI run for the actual current pass/fail per OS
 (reported alongside the commit SHA below, not restated here since it can
 move after this file is written).
 
+### Real windows-latest CI runs surfaced test-harness bugs (not Shield bugs)
+
+Running the matrix for real, repeatedly, until windows-latest passed
+cleanly (rather than assuming green once ubuntu/macos passed) surfaced a
+chain of genuine, fixable bugs — all in this suite's own Windows test
+plumbing, not in Shield's shipped code:
+
+- **PATH separator**: helpers prepending a fake-ssh directory onto `PATH`
+  hardcoded `:` as the separator. Windows uses `;` — the malformed `PATH`
+  broke `git` resolution entirely (`spawn git ENOENT`). Fixed with
+  `path.delimiter`.
+- **`PATH` key casing**: `process.env`'s search-path variable is often
+  keyed `Path` on Windows, not `PATH`. Spreading `process.env` into a
+  plain object keeps only that casing; reading `.PATH` off the result
+  silently returned `undefined`, and the rebuilt env ended up with both a
+  correct `Path` and a broken `PATH: "<dir>;undefined"` — two casings of
+  the same variable confusing `spawn`'s env resolution. Fixed by
+  collapsing every case variant to one canonical `PATH` key up front.
+- **Extension-less fake `ssh` invisible to Windows' PATH lookup**: this
+  suite's fake-ssh technique (a POSIX shebang script named plain `ssh`,
+  shadowed onto `PATH`) is invisible to Windows, which resolves an
+  unqualified command via `PATHEXT` extensions, not raw filenames — the
+  *real* `ssh.exe` further down `PATH` got found instead, so a "should
+  succeed" test genuinely tried to resolve a fake alias as DNS and failed.
+  An `ssh.cmd` shim (delegating to a small Node script rather than
+  assuming a POSIX shell is reachable) fixed this for every test that
+  explicitly overrides the ssh command (`GIT_SSH_COMMAND`/`GIT_SSH`/
+  `core.sshCommand`), since Git executes those values directly rather
+  than resolving them via `PATH`.
+- **Pure `PATH`-shadow interception still does not work on Windows even
+  with the `.cmd` shim present** — this is the one finding this phase
+  could not fix, only isolate and document (see below).
+- **Backslash paths through git-bash's `sh -c`**: a fake-ssh path handed
+  to Git via `GIT_SSH_COMMAND`/`core.sshCommand` is re-invoked by
+  git-bash as `sh -c "<command> ..."`, and POSIX `sh` treats a bare
+  backslash as an escape character — an un-converted Windows path arrived
+  mangled (`C:\Users\x\ssh` → `C:Usersxssh`, "command not found"). Fixed
+  with a `toShellPath()` forward-slash normalizer.
+- **`git rev-parse --path-format=absolute` vs. `path.join()`**: Git
+  always reports paths with forward slashes, even on Windows; comparing
+  that directly against native-separator `path.join()` output failed
+  spuriously on Windows alone, naming the identical path. Fixed with a
+  `toPosix()` normalizer before each such comparison.
+- **Backslash paths inside scp-like SSH URLs**: a bare-repo path built
+  with `path.join()` and embedded in a test URL as `git@host:<path>`
+  broke the evaluator's own owner/repo parsing on Windows (the whole
+  backslash path read as one opaque segment) — surfacing as a spurious
+  `push-destination-mismatch` on a push that should have been allowed.
+  Fixed by normalizing `makeBareRemote()`'s return value to forward
+  slashes once, since forward slashes are equally valid as a real
+  Windows filesystem path.
+
+### Known test-infrastructure gap: fake-ssh PATH shadowing on Windows
+
+One interception technique this suite relies on for its "no explicit
+override present" push tests — shadowing a fake `ssh` onto `PATH` ahead
+of the real one, with no `GIT_SSH_COMMAND`/`GIT_SSH`/`core.sshCommand`
+set — does not work on Windows, even with the `ssh.cmd` shim above. Git
+for Windows does not resolve its ssh transport through a caller-supplied
+`PATH` search the way POSIX Git does; it falls through to its own bundled
+`ssh.exe` regardless of `PATH` order, so these specific tests hit a real
+DNS/auth failure instead of the local fake transport, before Shield's
+pre-push hook is ever invoked (ref advertisement over the real transport
+happens before the hook fires).
+
+This is a **gap in this repository's own test technique on Windows, not
+in Shield.** The identical push behavior — approved-route success,
+destination-mismatch blocking, missing/corrupt policy at push time,
+GitHub account verification — is fully exercised on `ubuntu-latest` and
+`macos-latest`, where PATH shadowing does work, and the *override-
+detection* half of this same surface (`GIT_SSH_COMMAND`/`GIT_SSH`/
+`core.sshCommand` being set at all) is verified on all three platforms,
+since Git executes an explicit override value directly rather than
+resolving it via `PATH`. The affected tests
+(`shieldPrePush.test.ts`, `shieldHardeningMatrix.test.ts`,
+`shieldGitHubAccountBinding.test.ts`, `shieldCoexistenceAndIntegrity.test.ts`)
+are marked `{ skip: ... }` on `win32` only, with the reason spelled out in
+each file rather than silently disabled — 28 of 317 tests, all
+still running (and passing) on the other two platforms.
+
 ### Confirmed core bug, fixed this phase: merge commits used the wrong hook
 
 Empirically confirmed (not assumed) against Git 2.43: `git merge --no-ff`

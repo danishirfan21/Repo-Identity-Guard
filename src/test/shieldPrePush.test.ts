@@ -150,7 +150,15 @@ async function makeBareRemote(parentDir: string, owner: string, repoName: string
   await fs.mkdir(ownerDir, { recursive: true });
   const bareDir = path.join(ownerDir, `${repoName}.git`);
   await execFileAsync("git", ["init", "-q", "--bare", bareDir]);
-  return bareDir;
+  // Phase 7 Windows finding: this path gets embedded directly into a
+  // scp-like SSH URL below (`git@host:<path>`) for Shield's evaluator to
+  // parse the owner/repo out of. A raw Windows backslash path there breaks
+  // that parsing (the whole thing reads as one opaque segment, not
+  // "AcmeSoftware/acme-frontend"), producing a spurious destination
+  // mismatch. Forward slashes work equally well as a real filesystem path
+  // on Windows, so normalizing once here keeps every downstream URL and
+  // fs operation consistent.
+  return toShellPath(bareDir);
 }
 
 async function remoteRefSha(bareDir: string, ref = "refs/heads/main"): Promise<string | null> {
@@ -256,9 +264,26 @@ async function enableShield(
   assert.equal(result.ok, true, `enable() should succeed: ${result.inspection.reasons.join("; ")}`);
 }
 
+// Phase 7 Windows finding: Git for Windows does not resolve its ssh
+// transport through the caller's PATH the way POSIX git does -- it falls
+// through to its own bundled ssh.exe regardless of what this suite
+// prepends to PATH, so a real DNS/auth failure surfaces (git connects for
+// real ref advertisement BEFORE the pre-push hook ever runs) instead of
+// reaching our fake-ssh transport at all. This is a gap in this repo's
+// PATH-shadowing test *technique* on Windows, not in Shield: the identical
+// push behavior is exercised on ubuntu-latest/macos-latest, where PATH
+// shadowing does work, and the override-DETECTION half of this same
+// surface (GIT_SSH_COMMAND/GIT_SSH/core.sshCommand) is verified on all
+// three platforms since Git executes those values directly rather than
+// resolving them via PATH.
+const SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS =
+  process.platform === "win32"
+    ? "Git for Windows does not resolve ssh via PATH search -- this suite's PATH-shadow fake-ssh technique cannot intercept it here (see comment above). Covered on ubuntu-latest/macos-latest."
+    : false;
+
 // ==================== approved-route baseline (real SSH-shaped transport) ====================
 
-test("push to the approved destination through a trusted SSH alias -> allowed, and the remote ref IS updated", async () => {
+test("push to the approved destination through a trusted SSH alias -> allowed, and the remote ref IS updated", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -278,7 +303,7 @@ test("push to the approved destination through a trusted SSH alias -> allowed, a
   }
 });
 
-test("pushing multiple refs in one invocation still allows/enforces correctly (multi-ref stdin input)", async () => {
+test("pushing multiple refs in one invocation still allows/enforces correctly (multi-ref stdin input)", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -320,7 +345,7 @@ test("--no-verify bypasses Shield's pre-push hook entirely (documented, expected
 
 // ==================== destination checks (route held constant: trusted alias) ====================
 
-test("a pushurl changed to a different owner after Shield approval -> blocked, ref NOT updated", async () => {
+test("a pushurl changed to a different owner after Shield approval -> blocked, ref NOT updated", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -350,7 +375,7 @@ test("a pushurl changed to a different owner after Shield approval -> blocked, r
   }
 });
 
-test("a different remote entirely (not 'origin') is still checked against the same policy -> blocked", async () => {
+test("a different remote entirely (not 'origin') is still checked against the same policy -> blocked", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -371,7 +396,7 @@ test("a different remote entirely (not 'origin') is still checked against the sa
   }
 });
 
-test("a direct URL push (git push <url>, no configured remote) to an unexpected destination -> blocked", async () => {
+test("a direct URL push (git push <url>, no configured remote) to an unexpected destination -> blocked", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -391,7 +416,7 @@ test("a direct URL push (git push <url>, no configured remote) to an unexpected 
   }
 });
 
-test("no approved destination on file (policy predates a resolvable remote) -> fails closed, blocked", async () => {
+test("no approved destination on file (policy predates a resolvable remote) -> fails closed, blocked", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   // ShieldManager's own profile resolution requires *some* remote fact to
   // match a profile against, so "Shield enabled with literally no remote"
   // and "profile resolved" can't co-occur through enable() itself. The
@@ -428,7 +453,7 @@ test("no approved destination on file (policy predates a resolvable remote) -> f
 
 // ==================== route / account checks (destination held constant) ====================
 
-test("a generic SSH host (github.com) under a strict profile -> blocked, ref NOT updated", async () => {
+test("a generic SSH host (github.com) under a strict profile -> blocked, ref NOT updated", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -450,7 +475,7 @@ test("a generic SSH host (github.com) under a strict profile -> blocked, ref NOT
   }
 });
 
-test("an untrusted SSH alias under a strict profile -> blocked, ref NOT updated", async () => {
+test("an untrusted SSH alias under a strict profile -> blocked, ref NOT updated", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -629,7 +654,7 @@ test("an SSH override does NOT block a non-strict profile (route trust is only e
 
 // ==================== policy / evaluator failure modes ====================
 
-test("missing Shield policy at push time -> blocked, ref NOT updated", async () => {
+test("missing Shield policy at push time -> blocked, ref NOT updated", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -653,7 +678,7 @@ test("missing Shield policy at push time -> blocked, ref NOT updated", async () 
   }
 });
 
-test("malformed (corrupted) Shield policy at push time -> blocked, ref NOT updated", async () => {
+test("malformed (corrupted) Shield policy at push time -> blocked, ref NOT updated", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -677,7 +702,7 @@ test("malformed (corrupted) Shield policy at push time -> blocked, ref NOT updat
   }
 });
 
-test("an evaluator that fails unexpectedly (corrupted copy) still blocks the push -- fail-closed, not fail-open", async () => {
+test("an evaluator that fails unexpectedly (corrupted copy) still blocks the push -- fail-closed, not fail-open", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();

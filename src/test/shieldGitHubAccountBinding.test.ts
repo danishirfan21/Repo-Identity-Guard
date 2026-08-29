@@ -134,7 +134,11 @@ async function makeBareRemote(parentDir: string, owner: string, repoName: string
   await fs.mkdir(ownerDir, { recursive: true });
   const bareDir = path.join(ownerDir, `${repoName}.git`);
   await execFileAsync("git", ["init", "-q", "--bare", bareDir]);
-  return bareDir;
+  // Phase 7 Windows finding (see shieldPrePush.test.ts): this path gets
+  // embedded into a scp-like SSH URL below for Shield's evaluator to parse
+  // the owner/repo out of -- a raw Windows backslash path breaks that
+  // parsing. Forward slashes are equally valid as a real fs path there.
+  return bareDir.split(path.sep).join("/");
 }
 
 async function remoteRefSha(bareDir: string, ref = "refs/heads/main"): Promise<string | null> {
@@ -236,9 +240,21 @@ async function pushWithFakeSsh(scenario: Scenario, extraEnv: NodeJS.ProcessEnv):
   return push(scenario.repo, ["origin", "main"], env);
 }
 
+// Phase 7 Windows finding (see shieldPrePush.test.ts for the fuller
+// writeup): Git for Windows does not resolve its ssh transport through
+// the caller's PATH -- it falls through to its own bundled ssh.exe
+// regardless of what this suite prepends, so a real DNS/auth failure
+// surfaces before Shield's pre-push hook ever runs. A gap in this repo's
+// PATH-shadowing test technique on Windows, not in Shield: covered on
+// ubuntu-latest/macos-latest.
+const SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS =
+  process.platform === "win32"
+    ? "Git for Windows does not resolve ssh via PATH search -- this suite's PATH-shadow fake-ssh technique cannot intercept it here. Covered on ubuntu-latest/macos-latest."
+    : false;
+
 // ==================== verified account matches ====================
 
-test("authenticated login matches expectedGitHubLogin -> allowed, ref IS updated", async () => {
+test("authenticated login matches expectedGitHubLogin -> allowed, ref IS updated", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
@@ -253,7 +269,7 @@ test("authenticated login matches expectedGitHubLogin -> allowed, ref IS updated
 
 // ==================== wrong account ====================
 
-test("authenticated as a different GitHub account -> push-account-mismatch, blocked, ref NOT updated", async () => {
+test("authenticated as a different GitHub account -> push-account-mismatch, blocked, ref NOT updated", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
@@ -272,7 +288,7 @@ test("authenticated as a different GitHub account -> push-account-mismatch, bloc
 
 // ==================== deploy-key identity ====================
 
-test("a deploy-key-style identity (owner/repo) can never be confirmed against a personal login -> unverified, blocked", async () => {
+test("a deploy-key-style identity (owner/repo) can never be confirmed against a personal login -> unverified, blocked", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
@@ -289,7 +305,7 @@ test("a deploy-key-style identity (owner/repo) can never be confirmed against a 
 
 // ==================== permission denied ====================
 
-test("SSH permission denied while verifying the account -> unverified, blocked", async () => {
+test("SSH permission denied while verifying the account -> unverified, blocked", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
@@ -307,7 +323,7 @@ test("SSH permission denied while verifying the account -> unverified, blocked",
 
 // ==================== timeout ====================
 
-test("SSH connection timeout while verifying the account -> unverified, blocked", async () => {
+test("SSH connection timeout while verifying the account -> unverified, blocked", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
@@ -325,7 +341,7 @@ test("SSH connection timeout while verifying the account -> unverified, blocked"
 
 // ==================== unknown host key ====================
 
-test("an untrusted/unknown SSH host key -> Shield refuses to connect automatically, unverified, blocked, tells the user to verify manually", async () => {
+test("an untrusted/unknown SSH host key -> Shield refuses to connect automatically, unverified, blocked, tells the user to verify manually", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
@@ -344,7 +360,7 @@ test("an untrusted/unknown SSH host key -> Shield refuses to connect automatical
 
 // ==================== malformed output ====================
 
-test("malformed/unrecognized SSH response while verifying the account -> unverified, blocked, never guessed at", async () => {
+test("malformed/unrecognized SSH response while verifying the account -> unverified, blocked, never guessed at", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
@@ -361,7 +377,7 @@ test("malformed/unrecognized SSH response while verifying the account -> unverif
 
 // ==================== IdentitiesOnly not set ====================
 
-test("route not strongly bound (IdentitiesOnly not set) -> unverified without even attempting the network ssh -T probe", async () => {
+test("route not strongly bound (IdentitiesOnly not set) -> unverified without even attempting the network ssh -T probe", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
@@ -382,7 +398,7 @@ test("route not strongly bound (IdentitiesOnly not set) -> unverified without ev
 
 // ==================== non-strict profile ====================
 
-test("a non-strict profile never runs account verification even with a mismatched account set up to respond", async () => {
+test("a non-strict profile never runs account verification even with a mismatched account set up to respond", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
   const scenario = await setUpScenario([relaxedProfile]);
   try {
@@ -398,7 +414,7 @@ test("a non-strict profile never runs account verification even with a mismatche
 
 // ==================== no expectedGitHubLogin ====================
 
-test("a profile without expectedGitHubLogin never runs account verification (route trust alone is sufficient, unchanged from Phase 4)", async () => {
+test("a profile without expectedGitHubLogin never runs account verification (route trust alone is sufficient, unchanged from Phase 4)", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const noLoginProfile: Profile = { ...workProfile, expectedGitHubLogin: undefined };
   const scenario = await setUpScenario([noLoginProfile]);
   try {
