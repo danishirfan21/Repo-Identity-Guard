@@ -235,12 +235,13 @@ reporting "not locked" after a worktree-scoped fix. Full per-worktree
 config management isn't built — this is deliberately just an honest,
 correctly-scoped mutation and warning before you confirm.
 
-**Shield Mode** (local pre-commit AND pre-push Git hooks that block unsafe
-commits and pushes — wrong identity, a protected branch, detached HEAD, an
-in-progress merge/rebase, a push to a destination or over a route that
-doesn't match what Shield approved for this repo, or — for a strict GitHub
-SSH profile with `expectedGitHubLogin` set — a route that authenticates
-live as the wrong GitHub account) exists behind
+**Shield Mode** (local pre-commit, pre-merge-commit, AND pre-push Git
+hooks that block unsafe commits and pushes — wrong identity, a protected
+branch, detached HEAD, an in-progress merge/rebase, a push to a
+destination or over a route that doesn't match what Shield approved for
+this repo, or — for a strict GitHub SSH profile with `expectedGitHubLogin`
+set — a route that authenticates live as the wrong GitHub account) exists
+behind
 command-palette commands only: `Repo Identity Guard: Enable/Disable/Repair
 Shield` and `...: Check Shield Health`. There is still no Settings/sidebar
 toggle for it — a disabled "Coming soon" card in Settings remains the only
@@ -397,12 +398,23 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
 
 ## Limitations in this build
 
-- **Shield Mode has no sidebar UI yet.** Its pre-commit and pre-push hooks
-  can be installed/removed/repaired/health-checked only via
-  command-palette commands (`Repo Identity Guard: Enable/Disable/Repair
+- **Shield Mode has no sidebar UI yet.** Its pre-commit, pre-merge-commit,
+  and pre-push hooks can be installed/removed/repaired/health-checked only
+  via command-palette commands (`Repo Identity Guard: Enable/Disable/Repair
   Shield`, `...: Check Shield Health`) — the sidebar's Settings card still
   just says "Coming soon," and there's no toggle there that could be
   mistaken for a working one.
+- **Shield cannot see a clean cherry-pick or revert.** Git commits those
+  (when there's no conflict to resolve) via an internal fast path that
+  invokes no commit hook at all — not specific to Shield, and not fixable
+  by any local hook. A conflicting cherry-pick/revert finalized via
+  `--continue` runs a normal `git commit` and IS enforced. See
+  docs/SHIELD_MODE.md's Phase 7 section.
+- **`--no-verify` and a `core.hooksPath` override bypass Shield entirely.**
+  This is Git's own documented hook-bypass mechanism, not a Shield defect
+  — no client-side hook tool can prevent it. Shield's promise is blocking
+  ordinary accidental unsafe operations, not containing a process acting
+  with intent to bypass a local hook.
 - **Fork detection is naming-convention-based, not verified.** The
   fork/upstream conflict check only looks for a remote literally named
   `upstream` — there's no reliable way to detect a fork relationship from

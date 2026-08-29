@@ -313,3 +313,31 @@ this matrix there, beyond the scenario-by-scenario tables above:
 - Watcher freshness during live branch switches, conflicts, and rebases
   started outside VS Code (a terminal, another tool) while the sidebar is
   open.
+
+## Shield Mode: manual Windows matrix (Extension Host + Git Bash + PowerShell)
+
+CI now runs the automated suite on `windows-latest` (see `.github/workflows/ci.yml`),
+which proves the hook shims and evaluator run correctly under the `sh.exe`
+Git for Windows puts on `PATH` there. It does **not** prove the Extension
+Host / VS Code UI side behaves, or that a real user's shell of choice
+(PowerShell, Git Bash, cmd.exe) sees consistent results. Run this matrix by
+hand on a real Windows machine before calling Shield ready for anyone else
+to use there:
+
+| Scenario | Setup | Expected |
+| --- | --- | --- |
+| Enable Shield from VS Code, commit from PowerShell | Run "Enable Shield" from the Command Palette in a Windows VS Code window, then open a PowerShell terminal (integrated or external) in the same repo and run `git commit`. | Blocked/allowed exactly as the automated suite predicts; a block's message renders readably in PowerShell (no mangled line endings, no missing color/formatting causing unreadable output). |
+| Enable Shield from VS Code, commit from Git Bash | Same as above but from a Git Bash terminal. | Same result as PowerShell — the hook itself doesn't know or care which shell invoked `git`; this is a regression check that nothing about hook installation assumed one shell's quoting/escaping. |
+| Enable Shield from VS Code, commit from cmd.exe | Same, from `cmd.exe`. | Same result again. |
+| Push from each of the three shells | Configure a strict profile with a trusted SSH alias (a real `~/.ssh/config` entry, or Windows's `%USERPROFILE%\.ssh\config`), push from PowerShell, Git Bash, and cmd.exe in turn. | Consistent allow/block across all three — push route/account evaluation must not depend on which shell launched `git push`. |
+| Real GitHub SSH account verification, Windows OpenSSH vs. Git for Windows' bundled ssh | Set `expectedGitHubLogin` on a strict profile pointed at a real personal GitHub SSH alias (see the "Manual GitHub SSH account verification" scenarios below/in the Phase 5 section), once using Windows' built-in OpenSSH client (`ssh.exe` from `C:\Windows\System32\OpenSSH`) and once using the `ssh.exe` that ships with Git for Windows, whichever the ambient `PATH` picks up first. | Both resolve the same account for the same alias; if `PATH` ordering ever picks the "wrong" ssh, verify Shield reports `push-account-unverified` rather than a wrong-but-confident answer. |
+| Line-ending sanity | Diff Shield's installed hook files (`.git/hooks/pre-commit`, `pre-merge-commit`, `pre-push`) as raw bytes after installing from a Windows VS Code session. | LF line endings throughout (no CRLF), even though the surrounding repo/workspace may have `core.autocrlf` set — a CRLF-mangled shebang line (`#!/bin/sh\r`) would silently break the hook on some `sh` builds. |
+| Executable bit on NTFS | After "Enable Shield" on Windows, inspect the hook files' permissions. | Git for Windows' own `sh.exe` shim mechanism runs the hook regardless of NTFS's lack of a real POSIX executable bit — confirm the hook actually fires (it does not silently no-op) rather than assuming Unix permission semantics apply. |
+| `core.hooksPath` / worktree scenarios on Windows | Repeat a couple of `shieldGitTopology.test.ts`/`shieldCoexistenceAndIntegrity.test.ts` scenarios (a linked worktree, a worktree-scoped `core.hooksPath`) by hand on Windows. | Same behavior as the automated Linux/macOS runs — this is a spot-check that Windows path handling (drive letters, backslashes in `git rev-parse --path-format=absolute` output) doesn't quietly break hook resolution. |
+| Merge commit and cherry-pick on Windows | Reproduce the Phase 7 merge-commit fix (`pre-merge-commit`) and the documented clean-cherry-pick gap by hand. | Same results as the automated suite: a mismatched-identity merge is blocked; a clean cherry-pick is not (documented gap, not a Windows-specific difference). |
+
+None of the above are automated — Windows CI proves the shell scripts
+execute correctly under Git for Windows' `sh.exe`; it says nothing about
+the Extension Host UI, VS Code's own terminal integration, or a real
+user's day-to-day shell. Treat this table as a pre-beta checklist, not a
+one-time verification.

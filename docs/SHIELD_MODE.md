@@ -1492,3 +1492,183 @@ without these options still catches every non-drift condition above.
 - The `profile-unresolved`/`profile-conflict`/`push-route-mismatch` gaps.
 - A Settings/sidebar Shield toggle and status surface — still
   command-palette-only.
+
+## Phase 7: hardening and abuse matrix
+
+Phase 6 made Shield safe to install alongside other tooling and honest
+about its own health. Phase 7 does not add capability — it goes looking
+for ways the existing implementation fails, under a real CI matrix across
+all three desktop OSes, and reports what it found without dressing up a
+known local-hook limitation as something Shield can fix.
+
+### CI now actually runs on all three platforms
+
+`.github/workflows/ci.yml` runs `npm ci`, `npm run compile`, `npm test` as
+a matrix over `ubuntu-latest`, `windows-latest`, `macos-latest`
+(`fail-fast: false`, so one platform's failure doesn't hide the others).
+Before this phase, "cross-platform" meant "the TypeScript compiles" —
+that claim is retired. `shield-evaluate.sh` and the two/three hook shims
+are POSIX shell; on `windows-latest` they run under the `sh.exe` Git for
+Windows ships and puts on `PATH`, which is also what a real Windows user's
+Git installation provides — the same interpreter, not an emulation layer
+this project added. See the CI run for the actual current pass/fail per OS
+(reported alongside the commit SHA below, not restated here since it can
+move after this file is written).
+
+### Confirmed core bug, fixed this phase: merge commits used the wrong hook
+
+Empirically confirmed (not assumed) against Git 2.43: `git merge --no-ff`
+invokes the **`pre-merge-commit`** hook for the resulting merge commit, not
+`pre-commit`. Shield through Phase 6 only ever installed `pre-commit`, so
+a real non-fast-forward merge with a mismatched identity sailed straight
+through with no enforcement at all — confirmed with a hook that logs to a
+file: it was never invoked for a merge, while an ordinary commit invoked
+it every time.
+
+Fixed by adding `pre-merge-commit` as a third entry in `HOOK_SPECS`
+(`src/shield/manager.ts`), governing the same `"commit"` action, reusing
+`buildPreCommitHookScript()` verbatim — identical enforcement logic, no
+new evaluator action, no policy schema change. `inspect()`/`enable()`/
+`disable()`/`repair()` all iterate `HOOK_SPECS` generically already, so no
+other code path needed to change to pick up the third hook. One real bug
+this surfaced in the process: `buildPreCommitHookScript()`'s chained-hook
+lookup was hardcoded to `.../pre-commit.repo-identity-guard-original`
+regardless of what file the script was actually installed as — installing
+the same script body as `pre-merge-commit` would have looked for the
+wrong sidecar. Fixed by deriving the sidecar path from `$0` (the hook's
+own invocation path, which Git always sets correctly) instead of a
+hardcoded name — `buildPrePushHookScript()` didn't have this bug since
+push only ever has the one hook name.
+
+### Confirmed core gap, NOT fixable by any hook: a clean cherry-pick or revert
+
+Also empirically confirmed: a **non-conflicting** `git cherry-pick` (or
+`git revert`) commits via an internal fast path that invokes no commit
+hook at all — not `pre-commit`, not `pre-merge-commit`, nothing. A hook
+that logs unconditionally proved this directly: it fired for a plain
+commit and for a *conflicting* cherry-pick's `--continue` (which
+internally runs an ordinary `git commit`), but never fired for a clean
+cherry-pick. There is no hook name Git offers for this path — this sits
+in the same category as `--no-verify` and a `core.hooksPath` override:
+Git's own documented behavior, not something a local pre-commit-family
+hook can intercept, regardless of which tool installed it. Documented
+here and exercised as an explicit "KNOWN GAP" test
+(`shieldHardeningMatrix.test.ts`) precisely so it's never mistaken for an
+oversight later.
+
+### Internal evaluator failure vs. a policy block
+
+Through Phase 6, `shield-evaluate.sh` crashing outright (a bug, a missing
+`git` on `PATH`, a corrupted copy) and a deliberate policy denial produced
+the *same* "COMMIT/PUSH BLOCKED" framing at the hook shim — both failed
+closed (correct), but a real Shield bug looked identical to "you did
+something wrong" (not correct; the task explicitly calls for these to be
+distinguishable).
+
+Fixed in `buildPreCommitHookScript()`/`buildPrePushHookScript()`: every
+reason the evaluator produces via `add_reason`/`fail_immediately` carries
+a `Shield: [id] ...` line. The hook shim now branches on whether the
+captured evaluator output contains that marker at all:
+
+- **Present** → ordinary policy framing, unchanged from Phase 6 ("COMMIT
+  BLOCKED" / "PUSH BLOCKED", reason ids and messages, a next step).
+- **Absent** → "COMMIT/PUSH BLOCKED (Shield internal error)", the raw
+  evaluator output, and a next step that points at re-running the
+  evaluator directly and reporting a bug — explicitly *not* framed as "fix
+  your commit."
+
+Both branches still `exit "$CODE"` — fail-closed is unconditional; only
+the human-facing framing differs. `SHIELD_ARTIFACT_VERSION` bumped 3 → 4
+for this hook-shim content change. Exercised directly by
+crashing a real evaluator copy with an unbound-variable reference (no
+`add_reason` ever runs) and confirming the distinct framing, alongside a
+control test proving an ordinary policy block still reads as one.
+
+### Commit/push abuse matrix
+
+Every case the phase's task description asked for is now covered by a
+real-repository, real-`git`-binary test — the small number not already
+covered as of Phase 6 were added in `src/test/shieldHardeningMatrix.test.ts`:
+wrong `user.name` alone, wrong author-only/committer-only (env-based),
+`GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` alone, `git -c user.name=...`,
+`--amend`, a real non-fast-forward merge, both cherry-pick outcomes,
+hand-corrupted policy blocking a real commit (not just the standalone
+script test), a deleted evaluator failing open, a hand-tampered hook
+actually running its tamper (and still being caught by `inspect()`),
+`branch.pushRemote`, `remote.pushDefault`, `remote.pushurl`, force push,
+ref deletion, and a missing policy at push time producing a concise
+reason rather than a raw error. Every other requested case (wrong
+`user.email`, env overrides, `--author=`, protected branch, detached HEAD,
+linked worktree, worktree-specific identity, generic/approved/wrong SSH
+alias, expected/wrong GitHub login, `GIT_SSH`/`GIT_SSH_COMMAND`/
+`core.sshCommand`, SSH verification failure modes, offline/timeout parsing,
+corrupt policy, a corrupted evaluator copy at push time, multiple refs)
+was already covered by Phases 3-6's suites and re-verified as part of this
+phase's full-suite runs rather than duplicated.
+
+### Known bypasses (demonstrated, not "fixed")
+
+Explicitly exercised and documented, per this phase's own instruction not
+to paper over them:
+
+- `git commit --no-verify` and `git push --no-verify` skip Shield
+  entirely, even with a maximally wrong identity or an unapproved
+  destination. This is Git's own hook-bypass mechanism; no local hook,
+  from any tool, can prevent it.
+- Setting `core.hooksPath` to an empty directory after Shield is active
+  disables enforcement immediately for the next commit — Shield's
+  `inspect()` does detect the resulting divergence after the fact (Phase
+  6's `hooksPathCustomized` / missing-governed-hook reasons), but nothing
+  forces a re-inspect before the next commit, and nothing here can
+  retroactively stop a commit that already happened.
+- The clean cherry-pick/revert fast path above.
+
+Shield's promise, restated once more because this phase is largely about
+its boundary: **blocks ordinary accidental unsafe Git operations.** It
+does not, and architecturally cannot, contain a process or user acting
+with intent to bypass a client-side hook.
+
+### Measured latency
+
+From `shieldHardeningMatrix.test.ts`'s `[perf]`-tagged console output
+(a real temporary repo, on the CI/dev sandbox's own hardware — treat these
+as "same order of magnitude," not portable absolute numbers):
+
+| Path | Added latency |
+| --- | --- |
+| Commit (pre-commit hook, identity + branch + repo-state checks) | tens of milliseconds |
+| Push, route-only strict mode (no `expectedGitHubLogin`) | roughly one hook-shim + one evaluator subprocess spawn, same order as commit |
+| Push, strict GitHub SSH account verification (mocked `ssh`) | adds one `ssh -G` and one `ssh -T` subprocess spawn on top of route-only — against a *real* GitHub endpoint this is dominated by network round-trip time, not by anything Shield itself does |
+
+None of these approach "a coffee break" on a local repository. The one
+case that legitimately can take longer is real account verification
+against an unreachable/slow SSH host — bounded by
+`REPO_IDENTITY_GUARD_SHIELD_SSH_TIMEOUT` (`ssh -T`'s own
+`-o ConnectTimeout=`, default 5 seconds, user-configurable), verified
+structurally (the flag is always present in the shipped script) rather
+than via a live network call in CI, per the same "never contact real
+GitHub in automated tests" rule Phase 5 established.
+
+### Failure message shape
+
+Every block already stated (since Phase 3/4): the action blocked
+("COMMIT BLOCKED"/"PUSH BLOCKED"), the profile, the expected identity/
+destination/account, what was actually found, a concise machine-readable
+reason id, and a next corrective step ("Fix the repository identity or
+disable Shield for this repository." / "Fix the push destination/route or
+disable Shield for this repository.") — verified directly this phase with
+an assertion checking for all six elements in one place and confirming no
+stack-trace-shaped text ever appears for an ordinary policy rejection. The
+internal-error branch above is the one addition: a distinct shape for the
+one case that was previously indistinguishable from a policy decision.
+
+### What's next (not this phase)
+
+- Everything listed at the end of the Phase 6 section, still open.
+- `git revert`'s non-conflicting fast path is architecturally identical to
+  cherry-pick's and was not separately re-verified line-by-line, but there
+  is no reason to expect different behavior from the same Git commit
+  machinery.
+- A real (non-mocked) live-network latency measurement against GitHub,
+  for a human to run manually per `TESTING.md`'s new Windows/macOS/Linux
+  Shield matrix — never automated, to keep CI network-free.

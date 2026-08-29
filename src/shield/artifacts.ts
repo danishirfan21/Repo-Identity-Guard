@@ -27,7 +27,7 @@ export const SHIELD_ARTIFACT_MARKER = "repo-identity-guard-shield-artifact";
  * flags an on-disk artifact whose embedded version is older than this as
  * "repair available," without treating it as broken or non-owned.
  */
-export const SHIELD_ARTIFACT_VERSION = 3;
+export const SHIELD_ARTIFACT_VERSION = 4;
 
 /**
  * The sidecar file name suffix a hook's exact original foreign bytes are
@@ -95,7 +95,7 @@ set -eu
 
 GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
 EVAL_SCRIPT="$GIT_COMMON_DIR/repo-identity-guard/shield-evaluate.sh"
-ORIGINAL_HOOK="$(dirname "$0")/pre-commit${SHIELD_CHAIN_ORIGINAL_SUFFIX}"
+ORIGINAL_HOOK="$0${SHIELD_CHAIN_ORIGINAL_SUFFIX}"
 
 # No evaluator copy present -- nothing to enforce. Fail open: a half
 # installed/removed Shield must never be the reason an ordinary commit is
@@ -108,16 +108,43 @@ CODE=$?
 set -e
 
 if [ "$CODE" -ne 0 ]; then
-  {
-    echo ""
-    echo "Repo Identity Guard Shield"
-    echo ""
-    echo "COMMIT BLOCKED"
-    echo ""
-    printf '%s\\n' "$REASON" | grep -v '^Shield: BLOCKED'
-    echo ""
-    echo "Fix the repository identity or disable Shield for this repository."
-  } >&2
+  # A structured policy reason always contains at least one "Shield: [id]"
+  # line (add_reason/fail_immediately's own format). Its ABSENCE means the
+  # evaluator crashed or exited before reaching a decision (e.g. an
+  # unbound variable under \`set -eu\`, a missing \`git\` on PATH, a corrupted
+  # copy of the script itself) -- that is a Shield bug, not a policy
+  # verdict, and must never be presented to the user as one. Both branches
+  # still fail closed (the commit is blocked either way); only the
+  # framing differs, so "why was I blocked" is never answered wrong.
+  case "$REASON" in
+    *'Shield: ['*)
+      {
+        echo ""
+        echo "Repo Identity Guard Shield"
+        echo ""
+        echo "COMMIT BLOCKED"
+        echo ""
+        printf '%s\\n' "$REASON" | grep -v '^Shield: BLOCKED'
+        echo ""
+        echo "Fix the repository identity or disable Shield for this repository."
+      } >&2
+      ;;
+    *)
+      {
+        echo ""
+        echo "Repo Identity Guard Shield"
+        echo ""
+        echo "COMMIT BLOCKED (Shield internal error)"
+        echo ""
+        echo "Shield's evaluator failed unexpectedly instead of reaching a policy decision. Failing closed: the commit is blocked, but this is most likely a Shield bug, not a problem with your commit."
+        echo ""
+        echo "Raw evaluator output:"
+        printf '%s\\n' "$REASON"
+        echo ""
+        echo "Next step: re-run \\"sh $EVAL_SCRIPT commit\\" directly to see the full error, then repair or disable Shield for this repository. If this persists, please report it."
+      } >&2
+      ;;
+  esac
   exit "$CODE"
 fi
 
@@ -198,19 +225,45 @@ CODE=$?
 set -e
 
 if [ "$CODE" -ne 0 ]; then
-  {
-    echo ""
-    echo "Repo Identity Guard Shield"
-    echo ""
-    echo "PUSH BLOCKED"
-    echo ""
-    echo "Remote: $REMOTE_NAME"
-    echo "Destination: $REMOTE_LOCATION"
-    echo ""
-    printf '%s\\n' "$REASON" | grep -v '^Shield: BLOCKED'
-    echo ""
-    echo "Fix the push destination/route or disable Shield for this repository."
-  } >&2
+  # See the pre-commit hook's identical comment: a structured policy
+  # reason always contains a "Shield: [id]" line; its absence means the
+  # evaluator itself crashed, which is a Shield bug, not a policy verdict
+  # -- both still fail closed (block the push), only the framing differs.
+  case "$REASON" in
+    *'Shield: ['*)
+      {
+        echo ""
+        echo "Repo Identity Guard Shield"
+        echo ""
+        echo "PUSH BLOCKED"
+        echo ""
+        echo "Remote: $REMOTE_NAME"
+        echo "Destination: $REMOTE_LOCATION"
+        echo ""
+        printf '%s\\n' "$REASON" | grep -v '^Shield: BLOCKED'
+        echo ""
+        echo "Fix the push destination/route or disable Shield for this repository."
+      } >&2
+      ;;
+    *)
+      {
+        echo ""
+        echo "Repo Identity Guard Shield"
+        echo ""
+        echo "PUSH BLOCKED (Shield internal error)"
+        echo ""
+        echo "Remote: $REMOTE_NAME"
+        echo "Destination: $REMOTE_LOCATION"
+        echo ""
+        echo "Shield's evaluator failed unexpectedly instead of reaching a policy decision. Failing closed: the push is blocked, but this is most likely a Shield bug, not a problem with your push."
+        echo ""
+        echo "Raw evaluator output:"
+        printf '%s\\n' "$REASON"
+        echo ""
+        echo "Next step: re-run \\"sh $EVAL_SCRIPT push $REMOTE_NAME $REMOTE_LOCATION\\" directly to see the full error, then repair or disable Shield for this repository. If this persists, please report it."
+      } >&2
+      ;;
+  esac
   exit "$CODE"
 fi
 

@@ -135,7 +135,7 @@ export interface ShieldGitContext {
 export type ShieldArtifactOwnership = "shield" | "foreign" | "absent";
 
 /** One of the two hook files Shield can install — see `HOOK_SPECS`. */
-export type ShieldHookFileName = "pre-commit" | "pre-push";
+export type ShieldHookFileName = "pre-commit" | "pre-merge-commit" | "pre-push";
 
 export interface ShieldHookInspection {
   fileName: ShieldHookFileName;
@@ -242,6 +242,15 @@ interface HookSpec {
 /** The hook files Shield can install, and which Git action each one governs — order here is the order `ShieldInspection.hooks` reports them in. */
 const HOOK_SPECS: readonly HookSpec[] = [
   { fileName: "pre-commit", action: "commit", build: buildPreCommitHookScript },
+  // Phase 7 finding: since Git 2.24, `git merge` invokes `pre-merge-commit`
+  // for a real (non-fast-forward) merge commit -- NOT `pre-commit` -- so a
+  // Shield install that only wrote `pre-commit` never saw a merge commit
+  // at all (empirically confirmed: a mismatched identity sailed straight
+  // through `git merge --no-ff`). Governs the same "commit" action, using
+  // the identical evaluator call and script body as pre-commit -- Git
+  // guarantees at most one of the two ever fires for a given commit, so
+  // there is no double-evaluation to worry about.
+  { fileName: "pre-merge-commit", action: "commit", build: buildPreCommitHookScript },
   { fileName: "pre-push", action: "push", build: buildPrePushHookScript },
 ];
 
