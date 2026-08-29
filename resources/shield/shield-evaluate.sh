@@ -751,48 +751,89 @@ evaluate_push() {
   PROTOCOL=unknown
   HOST=""
   REPO_PATH=""
-  case "$REMOTE_URL" in
-    https://*|http://*)
-      PROTOCOL=https
-      rest=$(printf '%s' "$REMOTE_URL" | sed -E 's#^https?://##')
-      HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
-      REPO_PATH=$(printf '%s' "$rest" | sed -E 's#^[^/]*/##')
-      ;;
-    ssh://*)
-      PROTOCOL=ssh
-      rest=$(printf '%s' "$REMOTE_URL" | sed -E 's#^ssh://##')
-      HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
-      REPO_PATH=$(printf '%s' "$rest" | sed -E 's#^[^/]*/##')
-      ;;
-    *://*)
-      # Any other <scheme>://... (git://, ftp://, file://, ...) -- mirrors
-      # parseRemoteUrl()'s generic URL branch: protocol is "unknown" (only
-      # https/ssh get their own label), but host/path are still extracted
-      # the same way, EXCEPT an authority-less form (file:///path, where
-      # what follows the scheme starts with "/") has no host at all --
-      # matching `new URL(...).hostname` being "" for that shape.
-      PROTOCOL=unknown
-      rest=$(printf '%s' "$REMOTE_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##')
-      case "$rest" in
-        /*)
-          HOST=""
-          REPO_PATH="$rest"
-          ;;
-        *)
-          HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
-          REPO_PATH=$(printf '%s' "$rest" | sed -E 's#^[^/]*/##')
-          ;;
-      esac
-      ;;
+  # The scheme is detected with an ANCHORED match, exactly like
+  # parseRemoteUrl()'s `/^[a-z][a-z0-9+.-]*:\/\//i` test -- not with a
+  # `*://*` glob, which matches anywhere in the string.
+  #
+  # Phase 9 / Part 9 finding: the glob form took the URL branch for
+  # "://github.com/acme/repo.git" (no scheme NAME at all), where the
+  # scheme-stripping sed then did nothing, the host regex could not match a
+  # leading ":", and the path fell out as "github.com/acme/repo.git" --
+  # producing owner "acme", repo "repo" and ALLOWING the push. TypeScript
+  # parses that same string to `{protocol: "unknown"}` with no owner and no
+  # repo, and blocks. Same class of bug for a "://" appearing inside an
+  # scp-like path ("git@host:a://b"), which TypeScript reads as scp-like.
+  URL_SCHEME=$(lower "$(printf '%s' "$REMOTE_URL" | sed -nE 's#^([a-zA-Z][a-zA-Z0-9+.-]*)://.*$#\1#p')")
+
+  if [ -n "$URL_SCHEME" ]; then
+    # ---- a real <scheme>://... URL ----
+    case "$URL_SCHEME" in
+      https|http) PROTOCOL=https ;;
+      ssh) PROTOCOL=ssh ;;
+      # Any other scheme (git://, ftp://, file://, ...) -- mirrors
+      # parseRemoteUrl()'s generic URL branch: only https/ssh get their own
+      # label, everything else stays "unknown", but host/path are still
+      # extracted the same way.
+      *) PROTOCOL=unknown ;;
+    esac
+    rest=$(printf '%s' "$REMOTE_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##')
+    case "$rest" in
+      /*)
+        # An authority-less form (file:///path) has no host at all --
+        # matching `new URL(...).hostname` being "" for that shape.
+        HOST=""
+        REPO_PATH="$rest"
+        ;;
+      *)
+        HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
+        REPO_PATH=$(printf '%s' "$rest" | sed -E 's#^[^/]*/##')
+        ;;
+    esac
+  else
+    case "$REMOTE_URL" in
     *:*)
-      # scp-like: [user@]host:path (also covers a bare SSH host alias)
-      PROTOCOL=ssh
-      HOST=$(printf '%s' "$REMOTE_URL" | sed -E 's/^([^@]*@)?([^:]+):.*/\2/')
-      REPO_PATH=$(printf '%s' "$REMOTE_URL" | sed -E 's/^[^:]*://')
+      # scp-like: [user@]host:path (also covers a bare SSH host alias).
+      #
+      # Phase 9 / Part 9 finding, found by the URL differential harness:
+      # this used to be `s/^([^@]*@)?([^:]+):.*/\2/` for the host and
+      # `s/^[^:]*://` for the path, which accepted shapes parseRemoteUrl()
+      # in src/services/gitService.ts rejects outright -- and did so
+      # FAIL-OPEN. Two concrete cases:
+      #
+      #   ":acme/repo.git"            -- no host at all
+      #   "://github.com/acme/repo.git" -- a "://" with no scheme name
+      #
+      # TypeScript's scp-like regex requires a NON-EMPTY host containing
+      # neither "/" nor whitespace, so both parsed to `{protocol:
+      # "unknown"}` with no owner and no repo, and the push was blocked as
+      # a destination mismatch. The shell happily produced
+      # owner="acme", repo="repo" for both and ALLOWED the push -- i.e. an
+      # unparseable, hostless destination satisfied an approved one.
+      #
+      # This now mirrors
+      #   /^(?:[^@\/\s]+@)?([^:\/\s]+):(.+)$/
+      # exactly: non-empty host, no "/" or whitespace in it, non-empty
+      # path, whole-string anchored. No match leaves PROTOCOL "unknown"
+      # with an empty host and path, which fails closed on both the
+      # destination check and the route check.
+      SCP_LIKE='^([^@/[:space:]]+@)?([^:/[:space:]]+):(.+)$'
+      SCP_HOST=$(printf '%s' "$REMOTE_URL" | sed -nE "s#$SCP_LIKE#\\2#p")
+      if [ -n "$SCP_HOST" ]; then
+        PROTOCOL=ssh
+        HOST="$SCP_HOST"
+        REPO_PATH=$(printf '%s' "$REMOTE_URL" | sed -nE "s#$SCP_LIKE#\\3#p")
+      fi
       ;;
-  esac
+    esac
+  fi
   REPO_PATH=$(printf '%s' "$REPO_PATH" | sed -E 's#^/+##; s#/+$##')
-  PARSED_REPO=$(printf '%s' "$REPO_PATH" | awk -F/ '{print $NF}' | sed -E 's/\.git$//')
+  # The ".git" suffix is stripped CASE-INSENSITIVELY, matching
+  # parseRemoteUrl()'s `.replace(/\.git$/i, "")`. Phase 9 / Part 9: this
+  # used to be a case-sensitive `s/\.git$//`, so a remote written
+  # "git@GITHUB.COM:ACME/REPO.GIT" yielded repo "REPO.GIT" here and "REPO"
+  # in TypeScript -- Shield blocked a legitimate push and told the user its
+  # destination had "changed since Shield approval".
+  PARSED_REPO=$(printf '%s' "$REPO_PATH" | awk -F/ '{print $NF}' | sed -E 's/\.[Gg][Ii][Tt]$//')
   PARSED_OWNER=$(printf '%s' "$REPO_PATH" | awk -F/ '{ if (NF>=2) print $(NF-1) }')
 
   # SSH connection user, e.g. "git" in "git@github-work:owner/repo.git" --
@@ -810,11 +851,11 @@ evaluate_push() {
   # (Phase 8); an unparseable/absent port simply means "whatever this
   # alias's effective config says", which is also what git would use.
   URL_PORT=""
-  case "$REMOTE_URL" in
-    ssh://*)
-      URL_PORT=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^ssh://([^/@]*@)?[^/:]+:([0-9]+)(/.*)?$#\2#p')
-      ;;
-  esac
+  # Keyed off the ANCHORED scheme detected above, not a `ssh://*` glob, so
+  # this can never fire for a string that merely contains "ssh://".
+  if [ "$URL_SCHEME" = "ssh" ]; then
+    URL_PORT=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^[sS][sS][hH]://([^/@]*@)?[^/:]+:([0-9]+)(/.*)?$#\2#p')
+  fi
 
   # ---- destination: OWNER-based, never host-based (see evaluator.ts's
   # destinationReasons for why a host comparison would falsely flag every
