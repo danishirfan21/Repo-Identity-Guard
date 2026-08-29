@@ -146,6 +146,21 @@ export function isLinkedWorktree(gitDir: string | null, gitCommonDir: string | n
   return path.resolve(gitDir) !== path.resolve(gitCommonDir);
 }
 
+/**
+ * The effective `core.hooksPath` value (any scope: worktree, local,
+ * global, or system), or `null` when unset — i.e. Git is using its
+ * built-in `<git-dir>/hooks`. Used by Shield (Phase 6) purely for
+ * diagnostics: when a governed hook is unexpectedly missing, knowing
+ * whether `core.hooksPath` has been pointed elsewhere (by Shield's own
+ * install, by Husky, or by hand) turns a generic "hook is missing"
+ * message into a specific, actionable one. Never used to decide *where*
+ * to install — `getHooksDir` (via `git rev-parse --git-path hooks`)
+ * remains the single source of truth for that.
+ */
+export async function getCoreHooksPathConfig(repoRoot: string): Promise<string | null> {
+  return tryGit(repoRoot, ["config", "--get", "core.hooksPath"]);
+}
+
 /** Returns null when unset/unknown (older Git or never configured) rather than defaulting either way. */
 export async function getWorktreeConfigEnabled(repoRoot: string): Promise<boolean | null> {
   const value = await tryGit(repoRoot, ["config", "--get", "extensions.worktreeConfig"]);

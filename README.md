@@ -248,9 +248,14 @@ sidebar-visible state (see Limitations) — so this is opt-in and easy to
 miss unless you go looking for it, deliberately, until a dedicated UI
 phase. Enforcement itself runs standalone (a POSIX shell script Shield
 installs alongside both hooks) and works with VS Code completely closed.
-Full details — threat model, policy schema, worktree handling, the
-evaluator, and the installation lifecycle — are in
-[docs/SHIELD_MODE.md](docs/SHIELD_MODE.md).
+A repository that already runs Husky, `pre-commit`, or another hook
+manager is never silently overridden — by default Shield simply won't
+install into an occupied hook slot (reported degraded), and an explicit
+opt-in (`chainForeignHooks`, not yet exposed as a command prompt) chains
+the existing hook exactly, restoring it byte-for-byte on disable. Full
+details — threat model, policy schema, worktree handling, the evaluator,
+the installation lifecycle, hook coexistence, and integrity detection —
+are in [docs/SHIELD_MODE.md](docs/SHIELD_MODE.md).
 
 ## Push setup: destination vs. account
 

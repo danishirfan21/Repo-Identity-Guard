@@ -1222,7 +1222,7 @@ impossible rather than merely likely.
   "decisions are never cached" (see above), but it does mean the network
   cost is paid every time, not amortized.
 
-### What's next (not this phase)
+### What's next after Phase 5 (superseded below by Phase 6, except where noted)
 
 - A manual/on-demand "Verify GitHub Account" command, independent of a
   real push.
@@ -1232,4 +1232,263 @@ impossible rather than merely likely.
 - The `profile-unresolved`/`profile-conflict`/`push-route-mismatch` gaps.
 - A Settings/sidebar Shield toggle and status surface — still
   command-palette-only.
-- Coexisting with a pre-existing third-party hook manager, for both hooks.
+- Coexisting with a pre-existing third-party hook manager, for both
+  hooks — resolved below.
+
+## Phase 6: hook coexistence, worktree correctness, integrity, and recovery
+
+Everything through Phase 5 assumed Shield was the only thing that would
+ever want a `pre-commit`/`pre-push` hook. Phase 6 makes Shield safe to
+enable in a repository that already runs Husky, `pre-commit`, lint-staged,
+or a hand-written hook — without ever silently destroying or replacing
+that tooling — and makes Shield's own health reporting catch the specific
+ways an installation can drift or be tampered with over time.
+
+### Research: does Git have a native multi-hook mechanism now?
+
+Checked directly against the Git version this repository's dev/CI
+environment actually runs (`git --version` → 2.43.0), including the
+newest hook-related plumbing command:
+
+```
+$ git hook run -h
+usage: git hook run [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]
+```
+
+`git hook run` (added in Git 2.36) still resolves and runs **exactly one
+script** for a given hook name — the same single-file-per-`<hookname>`
+model Git has always had, whether that file lives under `<git-dir>/hooks`
+or wherever `core.hooksPath` points. There is no `hooks.d`-style
+multi-script directory convention anywhere in core Git, in this version or
+any later one at the time of writing. Conclusion: **there is no cleaner
+native coexistence mechanism to fall back to** — chaining has to be
+Shield's own responsibility, in the hook script itself, for every
+supported Git version alike. This finding is why nothing in this phase is
+gated behind a Git version check: there was no newer feature found that
+would justify one.
+
+Shield's minimum supported Git version is **2.9** (when `core.hooksPath`
+— which `getHooksDir`'s `git rev-parse --git-path hooks` fundamentally
+depends on for correct worktree/hooksPath resolution — was introduced).
+Every other Git invocation Shield makes (`rev-parse`, `config`, `var`,
+`symbolic-ref`, `status --porcelain=v2`, `worktree list`) predates that by
+a wide margin. Nothing in Phase 6 raises this floor.
+
+### Hook coexistence: chaining is explicit opt-in, never automatic
+
+Default behavior (`chainForeignHooks` unset) is **completely unchanged**
+from Phase 3/4/5: a foreign hook already occupying a slot Shield wants is
+left untouched, byte-for-byte, and Shield simply doesn't install into
+that slot (`degraded`, with a specific reason). This is still the
+out-of-the-box behavior — nothing about coexistence is silent or
+automatic.
+
+Passing `chainForeignHooks: true` to `enable()`/`repair()` is how a user
+deliberately opts into chaining. What actually happens:
+
+1. The foreign hook's exact bytes and executable permission are moved to
+   a sidecar file, `<hookPath>.repo-identity-guard-original`, in the same
+   hooks directory.
+2. Shield's own hook shim is installed at the original path.
+3. At run time, Shield's hook shim evaluates its own policy **first**. If
+   Shield blocks, the chained original is never invoked at all — a
+   deliberate execution-order choice: Shield's check is cheap and local,
+   and short-circuiting avoids running a foreign tool (a linter, a
+   formatter that rewrites files) on an operation Shield was going to
+   reject anyway.
+4. If Shield allows the action, it hands off to the chained original hook
+   with the exact same argv and stdin Git gave Shield's own hook, and the
+   original's own exit code becomes the final result. A chained tool's
+   own failure is never silently swallowed — the whole operation still
+   fails when the original hook does.
+
+For `pre-push` specifically, Git feeds the `<local-ref> <local-sha1>
+<remote-ref> <remote-sha1>` lines on stdin exactly once, and both the
+evaluator AND a chained original hook may need to read them — so the
+wrapper captures stdin to a private temp file up front (falling back to a
+PID-suffixed fixed path if `mktemp` itself is unavailable) and feeds that
+same captured content to each consumer as an independent read, cleaned up
+via a shell `trap ... EXIT`.
+
+**Never guesses when it's unsafe to proceed:** if a sidecar already
+exists at the exact path a new chain would use (a previous chain that was
+never cleanly disabled, or something else wrote there), `enable()` fails
+that hook's write closed — neither the existing sidecar nor the new
+foreign hook is touched — rather than silently deciding which one to
+keep.
+
+**Repairing an already-chained hook is idempotent**: `enable()`/
+`repair()` recognize a slot Shield already owns (marker present) and
+never re-chain on top of it or disturb an existing sidecar.
+
+### Restoring exactly on uninstall
+
+`disable()` restores a chained original to its exact original path,
+byte-for-byte, executable bit included, and removes the sidecar — the
+precise reverse of chaining. This restoration is gated on the same
+ownership check `disable()` already used before deleting a Shield-owned
+hook in every earlier phase: it only ever fires when the CURRENT occupant
+of the hook path is still Shield's own. If something else has since
+overwritten that slot, the sidecar is left exactly where it is (never
+deleted, never blindly restored over unrelated content) and `disable()`
+reports it explicitly so the user can resolve it by hand.
+
+### Surviving extension upgrades
+
+Nothing about chaining depends on extension-install-path state: the
+sidecar's location is a pure naming convention
+(`SHIELD_CHAIN_ORIGINAL_SUFFIX`) shared between the hook-script template
+(`artifacts.ts`) and `ShieldManager`, and the hook script looks it up via
+`dirname "$0"` at run time — so an extension upgrade that regenerates the
+hook shim (via "Repair Shield") keeps finding the exact same sidecar. The
+hook shim's own content is identical whether or not a chain is active
+(the `[ -f "$ORIGINAL_HOOK" ]` check simply finds nothing when there
+isn't one) — there is deliberately only ever one script variant to keep
+in sync with the artifact version, not two.
+
+`SHIELD_ARTIFACT_VERSION` was bumped to **3** this phase (both hook shims'
+content materially changed to add the chaining lookup; the evaluator's
+version marker was bumped alongside it for consistency, though its own
+enforcement logic is unchanged this phase) — an existing Phase 3/4/5
+install correctly reports "a newer hook is available, repair to update"
+until repaired.
+
+### Worktree correctness
+
+`getHooksDir` (via `git rev-parse --git-path hooks`) already accounted
+for `core.hooksPath` at every scope before this phase — Phase 6 adds the
+test matrix that proves it, plus one new diagnostic (`core.hooksPath`
+drift detection, below). Verified directly against real repositories with
+real linked worktrees:
+
+| Scenario | Result |
+| --- | --- |
+| Main worktree only | `active` after `enable()`, as always. |
+| A linked worktree, added AFTER `enable()` from the main worktree | Reports `active` immediately — no separate enable needed, since hooks (default) and policy/evaluator (always) live under the shared git-common-dir. |
+| Multiple linked worktrees simultaneously | All report `active` from a single `enable()`. |
+| `extensions.worktreeConfig` off (default) | `core.hooksPath` (if set at all) is repo-wide; every worktree resolves the same `hooksDir`. |
+| `extensions.worktreeConfig` on, `core.hooksPath` set with `--worktree` scope in ONE linked worktree only | That worktree's `hooksDir` resolves to the alternate path — Shield correctly reports it NOT active there (hooks aren't installed at the new path), while the main worktree and any other linked worktrees, untouched by that scoped override, correctly stay `active`. Shield never claims a single global ACTIVE state that papers over one worktree actually being unprotected — `inspect()` is always called (and answers) per-repoRoot, i.e. per-worktree. |
+| Shared git-common-dir | `policyPath`/`evaluatorPath` are asserted identical (same absolute string) from the main worktree and a linked one. |
+
+The one gap this leaves, explicitly: Shield has no mechanism to
+proactively warn "you enabled Shield here, but a linked worktree has its
+own scoped `core.hooksPath` and isn't covered" — the affected worktree's
+own `inspect()` correctly reports its own true state, but nothing
+currently cross-checks worktrees against each other. See "What's next"
+below.
+
+### Integrity: what's detected, and what deliberately isn't auto-fixed
+
+`ShieldInspection` gained three new pieces of state — `evaluatorModified`,
+`hooksPathCustomized`, `policyProfileDrift`, `pushDestinationDrift` — and
+per-hook `contentModified`/`hasChainedOriginal`. **None of these are ever
+computed and then silently repaired.** `inspect()` remains, as in every
+earlier phase, 100% read-only; turning `degraded`/`broken` back into
+`active` always requires an explicit `enable()`/`repair()` call.
+
+| Condition | Detected via | Resulting state |
+| --- | --- | --- |
+| Missing Shield hook | `ownership === "absent"` for a governed action | `degraded` |
+| Modified Shield hook (marker kept, body hand-edited) | Exact content compared against `spec.build()` when `version === SHIELD_ARTIFACT_VERSION` | `degraded` (was previously indistinguishable from a healthy hook — a real gap this phase closes) |
+| Missing evaluator | `evaluatorPresent === false` | `degraded` |
+| Evaluator modified (marker kept) | Exact content compared against the caller-supplied `evaluatorScriptSource` — **opt-in**: `inspect()` never assumes a source path, so this check is skipped (never "unknown," always `false`) unless the caller passes it | `degraded` |
+| Incompatible/outdated evaluator or hook version | `version !== SHIELD_ARTIFACT_VERSION` (older → "repair available"; newer → "incompatible, update the extension") — reclassified this phase from "active, but here's a note" to `degraded`, since an outdated/incompatible artifact is a real integrity gap, not just an FYI | `degraded` |
+| Missing/corrupt policy | Unchanged from Phase 3 (`policyPresent`/`validateShieldPolicy`) | `degraded`/`broken` |
+| Policy version mismatch | Unchanged — `validateShieldPolicy` rejects an unrecognized `policyVersion` outright | `broken` |
+| `core.hooksPath` changed after activation | `getCoreHooksPathConfig` (new) surfaces the current value; combined with a governed hook being missing from the newly-resolved `hooksDir`, the reason names `core.hooksPath` specifically instead of a generic "hook is missing" | `degraded` |
+| Foreign hook appeared after activation | Same `ownership` re-derivation `inspect()` always did — no new mechanism needed, just confirmed by a dedicated test this phase | `degraded` |
+| Approved push destination changed | **Opt-in**: `ShieldInspectOptions.currentPushDestination`, compared owner/repo the same way the evaluator itself compares them | `degraded` |
+| Account verification configuration changed (e.g. `expectedGitHubLogin` edited in Settings) | **Opt-in**: `ShieldInspectOptions.currentProfiles`, matched by `matchedProfileId`, compared field-by-field (`gitName`, `gitEmail`, `strictPushSetup`, `expectedGitHubLogin`, `trustedSshHostAliases`) against what's baked into the policy | `degraded` |
+
+The two "opt-in" checks (`currentProfiles`, `currentPushDestination`) are
+deliberately not run by a bare `inspect(repoRoot)` call: computing them
+needs live data (the current profile list, a fresh remote scan) that only
+a caller already holding it can supply cheaply — `inspect()` itself makes
+no Git calls beyond what it already needed and never re-implements
+profile resolution. A future sidebar/status-bar integration that already
+has this data on hand can pass it through for the extra drift coverage;
+until then, a periodic explicit "Check Shield Health" (already a command)
+without these options still catches every non-drift condition above.
+
+### Install/uninstall robustness
+
+- **Atomic replacement**, unchanged mechanism from Phase 3
+  (`writeFileAtomic`: write to a same-directory temp file, then rename) —
+  verified this phase with a dedicated test asserting no stray `.tmp-*`
+  file survives a normal `enable()`.
+- **Interrupted/partial installs** are handled by construction, not by
+  special-casing: `inspect()` re-derives state from whatever is actually
+  on disk, so a process that died after writing only the policy file
+  (before the evaluator or hooks) is reported `degraded` with the correct
+  specific reason, and a subsequent `enable()`/`repair()` completes it —
+  verified directly by manufacturing exactly that on-disk state and
+  checking both the diagnosis and the repair.
+- **`disable()` never deletes a file it doesn't recognize as its own**,
+  even one sitting inside Shield's own storage subdirectory — verified by
+  planting an unrelated file there and confirming both it and the
+  now-non-empty storage directory survive `disable()`.
+- **`disable()` is a safe, idempotent no-op** when Shield was never
+  enabled, and when called twice in a row.
+
+### Empirical findings from this phase
+
+- **A Shield-owned hook could previously be hand-edited (keeping the
+  marker comment) and Shield would report it as perfectly healthy** —
+  ownership was checked (marker present → "shield," safe to over-
+  write/delete) but content was never compared against what `enable()`
+  would actually write. This is a real integrity gap the Phase 6 task
+  explicitly called out ("modified Shield hook"), now closed by comparing
+  exact content whenever the version matches what this build would
+  produce.
+- **An outdated evaluator/hook version was previously reported as
+  `active`** (with an informational "repair available" note) rather than
+  `degraded` — reclassified this phase, since "the enforcement running
+  right now is not the enforcement Shield's current settings actually
+  describe" is exactly what `degraded` means elsewhere in this same
+  state machine.
+- **`git hook run` (Git 2.36+) does not change the single-script-per-hook
+  model at all** — confirmed by reading its own `-h` output rather than
+  assuming from its name; this directly shaped the decision to implement
+  chaining entirely in Shield's own hook shim rather than deferring to
+  any native Git mechanism.
+
+### Limitations (documented, not hidden)
+
+- **No cross-worktree warning.** Each worktree's `inspect()` correctly
+  reports its own true state, but Shield doesn't proactively flag "a
+  sibling worktree has its own scoped `core.hooksPath` and isn't
+  covered" — a user has to check each worktree themselves (or the
+  sidebar would need to, in a future phase where it operates across
+  worktrees at all).
+- **Chaining is not wired into any command yet.** `chainForeignHooks` is
+  a real, tested `ShieldManager` capability; the "Enable Shield"/"Repair
+  Shield" commands don't yet ask the user whether to use it (no UI
+  changes in this phase, per its own scope) — see "What's next."
+- **The two opt-in drift checks require a caller-supplied snapshot.**
+  Nothing currently calls `inspect()` with `currentProfiles`/
+  `currentPushDestination` outside tests — wiring that into "Check Shield
+  Health" (so it always sees live data) is a small, deliberately deferred
+  follow-up.
+- **A hook that isn't executable is neither auto-fixed nor specially
+  diagnosed.** `contentModified` is a pure string comparison; a
+  permissions-only change (e.g. `chmod -x` on Shield's own hook) isn't
+  distinguished from "everything's fine" by `inspect()` today — Git
+  itself would simply stop invoking a non-executable hook silently
+  (matching ordinary Git behavior for any hook, not a Shield-specific
+  gap).
+
+### What's next (not this phase)
+
+- Wiring `chainForeignHooks` into the "Enable Shield" command (a prompt:
+  "A pre-commit hook already exists — chain it or leave Shield
+  degraded?").
+- Wiring the two opt-in drift checks into "Check Shield Health" with live
+  data, so drift is caught without a caller having to know to ask.
+- A cross-worktree health view.
+- A manual/on-demand "Verify GitHub Account" command, independent of a
+  real push.
+- HTTPS account verification.
+- Per-ref push inspection (force-push detection, etc.).
+- The `profile-unresolved`/`profile-conflict`/`push-route-mismatch` gaps.
+- A Settings/sidebar Shield toggle and status surface — still
+  command-palette-only.

@@ -1,6 +1,6 @@
 #!/bin/sh
 # shield-evaluate.sh — Shield Mode's standalone enforcement evaluator.
-# repo-identity-guard-shield-artifact v2 (evaluator)
+# repo-identity-guard-shield-artifact v3 (evaluator)
 #
 # This is the actual runtime artifact a future Git hook (pre-commit /
 # pre-push) invokes. It has NO dependency on Node, VS Code, or any running

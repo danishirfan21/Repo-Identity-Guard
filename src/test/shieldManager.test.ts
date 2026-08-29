@@ -179,14 +179,14 @@ test("enable() installs a policy, an evaluator copy, and owned pre-commit AND pr
     ] as const) {
       const hookPath = path.join(hooksDir, fileName);
       const hookContent = await fs.readFile(hookPath, "utf8");
-      assert.match(hookContent, new RegExp(`repo-identity-guard-shield-artifact v2 \\(${marker}\\)`));
+      assert.match(hookContent, new RegExp(`repo-identity-guard-shield-artifact v3 \\(${marker}\\)`));
       const mode = (await fs.stat(hookPath)).mode;
       assert.equal(mode & 0o100, 0o100, `${fileName} hook file should be executable`);
     }
 
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     const evaluatorContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh"), "utf8");
-    assert.match(evaluatorContent, /repo-identity-guard-shield-artifact v2 \(evaluator\)/);
+    assert.match(evaluatorContent, /repo-identity-guard-shield-artifact v3 \(evaluator\)/);
     const policyContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-policy.json"), "utf8");
     assert.match(policyContent, /"profileLabel": "Work"/);
     assert.match(policyContent, /"push"/); // enabledActions now includes push as of Phase 4
