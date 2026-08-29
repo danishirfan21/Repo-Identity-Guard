@@ -28,7 +28,14 @@ async function git(cwd: string, args: string[]): Promise<string> {
 }
 
 async function makeTempRepo(): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-topology-"));
+  // realpath: on macOS, os.tmpdir() returns a path through the /var ->
+  // /private/var symlink, but `git rev-parse --path-format=absolute`
+  // resolves symlinks and returns the canonical /private/var/... form.
+  // Comparing a raw mkdtemp() path against git's own absolute-path output
+  // would spuriously fail on macOS alone (confirmed via CI) without this
+  // -- resolving once up front keeps every path this file computes
+  // consistent with what git itself reports.
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "shield-topology-")));
   await git(dir, ["init", "-q"]);
   await git(dir, ["config", "user.email", "test@example.com"]);
   await git(dir, ["config", "user.name", "Test"]);

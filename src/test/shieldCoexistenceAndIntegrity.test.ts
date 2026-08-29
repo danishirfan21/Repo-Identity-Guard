@@ -65,7 +65,12 @@ async function touchFile(repo: Repo, name: string, content: string): Promise<voi
 }
 
 async function makeTempRepo(): Promise<Repo> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-"));
+  // realpath: on macOS, os.tmpdir() resolves through the /var ->
+  // /private/var symlink, while `git rev-parse --path-format=absolute`
+  // returns the canonical /private/var/... form -- without this, every
+  // assertion comparing a computed path against git's own absolute-path
+  // output would spuriously fail on macOS alone (confirmed via CI).
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-")));
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     GIT_CONFIG_GLOBAL: path.join(dir, ".test-global-gitconfig"),
@@ -426,7 +431,7 @@ test("worktrees: multiple linked worktrees are all protected by a single enable(
 test("worktrees: a worktree-scoped core.hooksPath makes ONE linked worktree resolve a different, unprotected hooks dir — surfaced there, not silently assumed active", async () => {
   const repo = await makeTempRepo();
   const worktreeDir = `${repo.dir}-wt`;
-  const altHooksDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-althooks-"));
+  const altHooksDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-althooks-")));
   try {
     const manager = new ShieldManager();
     await enableShield(manager, repo);
@@ -546,7 +551,7 @@ test("integrity: a hook version NEWER than this build recognizes is reported as 
 
 test("integrity: core.hooksPath changed after activation surfaces a specific reason, not just a generic 'hook missing'", async () => {
   const repo = await makeTempRepo();
-  const altHooksDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-althooks2-"));
+  const altHooksDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "shield-p6-althooks2-")));
   try {
     const manager = new ShieldManager();
     await enableShield(manager, repo);
