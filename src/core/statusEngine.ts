@@ -23,8 +23,8 @@ import {
   noPinnedMemoryNote,
   overlappingProfilesResult,
   profileUnknownResult,
-  pushAccountConfirmedResult,
   pushAccountNotApplicableResult,
+  pushAccountTrustedRouteResult,
   pushAccountUnverifiedResult,
   pushDestinationConfirmedResult,
   pushDestinationMismatchResult,
@@ -207,7 +207,19 @@ function checkPushDestination(facts: RepoFacts, profile: Profile | undefined): C
   return pushDestinationConfirmedResult(facts, profile);
 }
 
-/** Can we tell *which account* authenticates the push? Evaluated independently of the destination match outcome. */
+/**
+ * Can we tell *which account* authenticates the push? Evaluated
+ * independently of the destination match outcome.
+ *
+ * A non-generic SSH host alias is a *push route*, not a verified account —
+ * and it is never trusted just because its name looks dedicated. It's only
+ * ever trusted when the matched profile explicitly lists it in
+ * `trustedSshHostAliases`; anything else (HTTPS, an unrecognized protocol,
+ * a well-known generic host, or an alias the profile hasn't listed) reads
+ * as unverified. This is the fix for the pre-Shield-Mode weakness where any
+ * non-generic SSH host was auto-trusted, which would have let, e.g., a
+ * `github-personal` alias read as trusted under a Work profile.
+ */
 function checkPushAccount(facts: RepoFacts, profile: Profile | undefined): CapabilityResult {
   if (!profile || !facts.pushRemoteUrl) {
     return pushAccountNotApplicableResult();
@@ -216,14 +228,22 @@ function checkPushAccount(facts: RepoFacts, profile: Profile | undefined): Capab
   const strict = !!profile.strictPushSetup;
   const host = facts.pushRemoteHost?.toLocaleLowerCase();
 
-  if (facts.pushRemoteProtocol === "https" || facts.pushRemoteProtocol === "unknown") {
-    return pushAccountUnverifiedResult(facts, profile, strict);
+  if (facts.pushRemoteProtocol === "https") {
+    return pushAccountUnverifiedResult(facts, profile, strict, "https");
   }
-  if (facts.pushRemoteProtocol === "ssh" && host && GENERIC_REMOTE_HOSTS.has(host)) {
-    return pushAccountUnverifiedResult(facts, profile, strict);
+  if (facts.pushRemoteProtocol === "unknown") {
+    return pushAccountUnverifiedResult(facts, profile, strict, "unknown_protocol");
+  }
+  if (host && GENERIC_REMOTE_HOSTS.has(host)) {
+    return pushAccountUnverifiedResult(facts, profile, strict, "generic_ssh_host");
   }
 
-  return pushAccountConfirmedResult(facts, profile);
+  const trustedAliases = (profile.trustedSshHostAliases ?? []).map((alias) => alias.toLocaleLowerCase());
+  if (host && trustedAliases.includes(host)) {
+    return pushAccountTrustedRouteResult(facts, profile);
+  }
+
+  return pushAccountUnverifiedResult(facts, profile, strict, "untrusted_alias");
 }
 
 function checkBranchPolicy(

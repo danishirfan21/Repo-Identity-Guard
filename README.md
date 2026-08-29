@@ -255,12 +255,20 @@ answers them separately instead of collapsing them into one claim:
   not verified" — regardless of any profile's strictness setting, because
   an unresolved destination isn't a judgment call.
 - **Push account** — once the destination is confirmed, can we tell which
-  account will actually authenticate? HTTPS (credential manager) and a
-  generic SSH host (`github.com` with no dedicated alias) can't be
-  confirmed locally, so they're reported as "Push account is unverified."
-  Whether that's **NOT SAFE** or just a warning depends on the profile's
-  **Strict push setup** setting. This is never phrased as verifying the
-  account — only ever "trusted from your profile configuration."
+  *route* a push would authenticate through? HTTPS (credential manager), an
+  unrecognized protocol, and a well-known generic SSH host (`github.com`,
+  `gitlab.com`, `bitbucket.org`) are always reported as "Push account is
+  unverified" — there's no configuration that upgrades those. A custom SSH
+  host alias (e.g. `github-work`, from a `~/.ssh/config` `Host` entry) is
+  **never** auto-trusted just for being non-generic: it only reads as a
+  trusted route ("Push route trusted") when the *matched* profile
+  explicitly lists it in `trustedSshHostAliases`. An alias trusted under a
+  different profile (e.g. `github-personal` under Personal) still shows as
+  unverified when evaluated against Work. Whether an unverified route is
+  **NOT SAFE** or just a warning depends on the profile's **Strict push
+  setup** setting. None of this is ever phrased as verifying the account —
+  a trusted route is explicitly "not cryptographic proof of the remote
+  account," only ever "trusted by profile configuration."
 
 ## Copy Context for AI
 
@@ -320,13 +328,15 @@ Settings view in the sidebar, or directly in `settings.json`:
       "expectedRemoteOwners": ["AcmeSoftware"],
       "exactRepos": ["github.com/some-other-org/one-specific-repo"],
       "expectedBranchPatterns": ["feature/*", "fix/*"],
-      "strictPushSetup": true
+      "strictPushSetup": true,
+      "trustedSshHostAliases": ["github-work"]
     },
     {
       "id": "personal",
       "label": "Personal",
       "gitEmail": "jane@example.com",
-      "expectedRemoteOwners": ["jane-doe"]
+      "expectedRemoteOwners": ["jane-doe"],
+      "trustedSshHostAliases": ["github-personal"]
     }
   ],
   "repoIdentityGuard.protectedBranches": ["main", "master"],
@@ -338,9 +348,14 @@ Settings view in the sidebar, or directly in `settings.json`:
 `expectedRemoteOwners`, `exactRepos`, and `expectedBranchPatterns` all
 support `*` wildcards and are matched case-insensitively. `exactRepos`
 always takes precedence over `expectedRemoteOwners` for the same repo.
-`protectedBranches` is a **local** branch policy Repo Identity Guard
-enforces on this machine — it is not synced with, and does not check,
-GitHub's own branch protection settings.
+`trustedSshHostAliases` is matched case-insensitively but does **not**
+support wildcards — it's an exact list of SSH host aliases (e.g. `Host`
+entries from `~/.ssh/config`) this profile vouches for as push routes; a
+custom alias not listed here always reads as unverified, even under a
+strict-looking name, and an alias listed under a *different* profile never
+carries over. `protectedBranches` is a **local** branch policy Repo
+Identity Guard enforces on this machine — it is not synced with, and does
+not check, GitHub's own branch protection settings.
 
 ## Commands
 

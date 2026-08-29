@@ -96,6 +96,7 @@ function submitOnboarding() {
     exactRepos: [],
     expectedBranchPatterns: [],
     strictPushSetup: false,
+    trustedSshHostAliases: [],
   };
   if (obScope === "owner" && facts.remoteOwner) {
     profile.expectedRemoteOwners = [facts.remoteOwner];

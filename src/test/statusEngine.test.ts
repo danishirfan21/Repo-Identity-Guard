@@ -11,6 +11,10 @@ const workProfile: Profile = {
   expectedRemoteOwners: ["AcmeSoftware"],
   expectedBranchPatterns: [],
   strictPushSetup: false,
+  // safeFacts() below defaults to a "github-work" push remote host; this is
+  // the profile explicitly trusting it as a push route (see the
+  // trustedSshHostAliases tests further down for the untrusted-alias case).
+  trustedSshHostAliases: ["github-work"],
 };
 
 const defaultPreferences: SafetyPreferences = {
@@ -354,10 +358,10 @@ test("push account is unverified over a generic SSH host (no dedicated alias)", 
   assert.equal(result?.title, "Push account is unverified");
 });
 
-test("a dedicated SSH host alias produces a confirmed push account result", () => {
-  const strictProfile: Profile = { ...workProfile, strictPushSetup: true };
+test("a dedicated SSH host alias explicitly listed in the matched profile is a trusted route, not a verified account", () => {
+  const strictProfile: Profile = { ...workProfile, strictPushSetup: true, trustedSshHostAliases: ["github-work"] };
   const summary = computeStatus({
-    facts: safeFacts(),
+    facts: safeFacts({ pushRemoteHost: "github-work" }),
     profiles: [strictProfile],
     protectedBranches: ["main"],
     preferences: defaultPreferences,
@@ -365,6 +369,106 @@ test("a dedicated SSH host alias produces a confirmed push account result", () =
   assert.equal(summary.level, "safe");
   const result = summary.capabilityResults.find((r) => r.capability === "push_account");
   assert.equal(result?.state, "confirmed");
+  assert.equal(result?.title, "Push route trusted");
+  assert.equal(result?.blocksOverallSafety, false);
+  assert.match(result?.summary ?? "", /"github-work" is explicitly trusted by the Work profile/);
+  assert.doesNotMatch(result?.summary ?? "", /account verified|verified account|verified key|cryptographically verif/i);
+});
+
+test("a dedicated-looking SSH alias is NOT auto-trusted just for being non-generic — it must be explicitly listed on the matched profile", () => {
+  const profileWithNoAliases: Profile = { ...workProfile, trustedSshHostAliases: [] };
+  const summary = computeStatus({
+    facts: safeFacts({ pushRemoteHost: "github-work" }),
+    profiles: [profileWithNoAliases],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+  });
+  const result = summary.capabilityResults.find((r) => r.capability === "push_account");
+  assert.equal(result?.state, "unverified");
+  assert.equal(result?.title, "Push account is unverified");
+});
+
+test("an alias trusted only under a different profile (github-personal under Personal) is unverified when evaluated against Work", () => {
+  const personalProfile: Profile = {
+    id: "personal",
+    label: "Personal",
+    gitEmail: "personal@example.com",
+    expectedRemoteOwners: ["jane-doe"],
+    trustedSshHostAliases: ["github-personal"],
+  };
+  const workProfileNoOverlap: Profile = { ...workProfile, trustedSshHostAliases: ["github-work"] };
+
+  const summary = computeStatus({
+    facts: safeFacts({ pushRemoteHost: "github-personal" }),
+    profiles: [workProfileNoOverlap, personalProfile],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+  });
+  // Matched profile here is still Work (owner AcmeSoftware) — github-personal
+  // is only trusted under Personal, so it must not be trusted here.
+  assert.equal(summary.matchedProfile?.id, "work");
+  const result = summary.capabilityResults.find((r) => r.capability === "push_account");
+  assert.equal(result?.state, "unverified");
+  assert.equal(result?.title, "Push account is unverified");
+  assert.match(result?.whatWeFound ?? "", /github-personal/);
+});
+
+test("an untrusted push route blocks overall safety under a strict profile", () => {
+  const strictProfile: Profile = { ...workProfile, strictPushSetup: true, trustedSshHostAliases: [] };
+  const summary = computeStatus({
+    facts: safeFacts({ pushRemoteHost: "github-work" }),
+    profiles: [strictProfile],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+  });
+  assert.equal(summary.level, "not_safe");
+  const result = summary.capabilityResults.find((r) => r.capability === "push_account");
+  assert.equal(result?.state, "unverified");
+  assert.equal(result?.blocksOverallSafety, true);
+});
+
+test("an untrusted push route stays non-blocking under a relaxed (non-strict) profile", () => {
+  const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false, trustedSshHostAliases: [] };
+  const summary = computeStatus({
+    facts: safeFacts({ pushRemoteHost: "github-work" }),
+    profiles: [relaxedProfile],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+  });
+  assert.equal(summary.level, "safe");
+  const result = summary.capabilityResults.find((r) => r.capability === "push_account");
+  assert.equal(result?.state, "unverified");
+  assert.equal(result?.blocksOverallSafety, false);
+});
+
+test("no push_account result, trusted or unverified, ever claims cryptographic account verification", () => {
+  const scenarios: RepoFacts[] = [
+    safeFacts({ pushRemoteProtocol: "https", pushRemoteHost: "github.com", pushRemoteUrl: "https://github.com/AcmeSoftware/acme-frontend.git" }),
+    safeFacts({ pushRemoteProtocol: "unknown", pushRemoteHost: undefined }),
+    safeFacts({ pushRemoteHost: "github.com" }),
+    safeFacts({ pushRemoteHost: "github-work" }),
+  ];
+  const profiles = [
+    { ...workProfile, trustedSshHostAliases: [] },
+    { ...workProfile, trustedSshHostAliases: ["github-work"] },
+  ];
+  for (const profile of profiles) {
+    for (const facts of scenarios) {
+      const summary = computeStatus({
+        facts,
+        profiles: [profile],
+        protectedBranches: ["main"],
+        preferences: defaultPreferences,
+      });
+      const result = summary.capabilityResults.find((r) => r.capability === "push_account");
+      const text = [result?.title, result?.summary, result?.whyItMatters, result?.whatWeExpected, result?.whatWeFound].join(" ");
+      assert.doesNotMatch(text, /account (is |has been )?verified\b/i);
+      assert.doesNotMatch(text, /verified account/i);
+      assert.doesNotMatch(text, /verified key/i);
+      assert.doesNotMatch(text, /cryptographically verif/i);
+      assert.doesNotMatch(text, /GitHub account verified/i);
+    }
+  }
 });
 
 test("working directly on a protected branch is NOT SAFE with agent restrictions", () => {

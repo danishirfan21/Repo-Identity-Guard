@@ -76,6 +76,18 @@ export interface Profile {
   exactRepos?: string[];
   expectedBranchPatterns?: string[];
   strictPushSetup?: boolean;
+  /**
+   * SSH host aliases (e.g. `github-work`, from a `~/.ssh/config` `Host`
+   * entry) this profile explicitly trusts as an approved push route.
+   * Matched case-insensitively against `RepoFacts.pushRemoteHost`. This is
+   * the *only* thing that can make a non-generic SSH host's Push Account
+   * check read as a trusted route — a custom alias is never trusted just
+   * because it isn't one of the well-known generic hosts. Listing an alias
+   * here is never cryptographic proof of who controls the account behind
+   * it — it only records that you, the user, vouch for this alias under
+   * this profile.
+   */
+  trustedSshHostAliases?: string[];
 }
 
 export type SuggestedActionCommand =

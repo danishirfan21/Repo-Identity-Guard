@@ -105,7 +105,7 @@ document.addEventListener("click", (event) => {
   if (selectProfileBtn) { selectedProfileId = selectProfileBtn.dataset.selectProfile; render(); return; }
 
   if (target.closest("#addProfileButton")) {
-    const profile = { id: "profile-" + Date.now().toString(36), label: "New Profile", gitEmail: "", expectedRemoteOwners: [], exactRepos: [], expectedBranchPatterns: [], strictPushSetup: false };
+    const profile = { id: "profile-" + Date.now().toString(36), label: "New Profile", gitEmail: "", expectedRemoteOwners: [], exactRepos: [], expectedBranchPatterns: [], strictPushSetup: false, trustedSshHostAliases: [] };
     selectedProfileId = profile.id;
     send("saveProfile", { profile });
     return;

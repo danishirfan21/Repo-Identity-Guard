@@ -120,6 +120,11 @@
               "strictPushSetup": {
                 "type": "boolean",
                 "description": "When true, HTTPS remotes and generic SSH hosts are treated as Not Safe until locked to this profile."
+              },
+              "trustedSshHostAliases": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "SSH host aliases (e.g. github-work, from a ~/.ssh/config Host entry) this profile explicitly trusts as an approved push route. A custom SSH alias is never trusted just for being non-generic — only aliases listed here can make Push Account read as a trusted route, and even then it is never cryptographic proof of the remote account."
               }
             }
           }

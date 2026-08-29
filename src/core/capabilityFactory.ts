@@ -315,28 +315,64 @@ export function pushDestinationNotApplicableResult(): CapabilityResult {
 // ==================== push_account ====================
 
 /**
- * Push destination is confirmed correct, but we still can't say *which
- * account* will authenticate the push (HTTPS credential helper, or SSH with
- * no dedicated host alias). This is deliberately never phrased as verifying
- * the account — only ever "unverified," regardless of whether it blocks.
+ * Why a push account/route couldn't be trusted this scan. Kept as an
+ * explicit discriminant (rather than re-deriving it from `facts` inside the
+ * wording tables below) so the caller in statusEngine.ts — which already
+ * knows exactly why it's calling this — states its reasoning once, instead
+ * of this function re-guessing it from a protocol/host combination that
+ * could drift out of sync with statusEngine's own checks.
  */
-export function pushAccountUnverifiedResult(facts: RepoFacts, profile: Profile, blocking: boolean): CapabilityResult {
-  const isHttps = facts.pushRemoteProtocol === "https";
+export type PushAccountUnverifiedReason =
+  | "https"
+  | "unknown_protocol"
+  | "generic_ssh_host"
+  | "untrusted_alias";
+
+const PUSH_ACCOUNT_UNVERIFIED_SUMMARY: Record<PushAccountUnverifiedReason, string> = {
+  https: "This repo pushes over HTTPS. We can't tell which account your credential manager will actually authenticate with.",
+  unknown_protocol: "We couldn't determine this repo's push protocol, so we can't tell which account would authenticate a push.",
+  generic_ssh_host: "This repo's push remote uses a generic SSH host, so it authenticates with whichever SSH key is used by default — not necessarily the right account.",
+  untrusted_alias: "This repo's push remote uses a custom SSH host alias that isn't listed as trusted by the matched profile.",
+};
+
+const PUSH_ACCOUNT_UNVERIFIED_WHY: Record<PushAccountUnverifiedReason, string> = {
+  https: "Your credential manager could be signed into a different account than the one this repo expects, so a push could go out under the wrong name.",
+  unknown_protocol: "Without a recognized push protocol, there's no basis for trusting which account a push would authenticate as.",
+  generic_ssh_host: "A generic SSH host doesn't guarantee that the account behind your default SSH key matches this repo's expected profile.",
+  untrusted_alias: "A custom SSH alias is only ever trusted because it's explicitly listed in a profile's trusted host aliases — an alias this profile hasn't listed can't be assumed to route to the right account, no matter how dedicated-looking its name is.",
+};
+
+/**
+ * Push destination is confirmed correct, but we still can't say *which
+ * account* will authenticate the push (HTTPS credential helper, an unknown
+ * protocol, a generic SSH host, or a custom SSH alias the matched profile
+ * hasn't explicitly listed as trusted). This is deliberately never phrased
+ * as verifying the account — only ever "unverified," regardless of whether
+ * it blocks.
+ */
+export function pushAccountUnverifiedResult(
+  facts: RepoFacts,
+  profile: Profile,
+  blocking: boolean,
+  reason: PushAccountUnverifiedReason,
+): CapabilityResult {
+  const host = facts.pushRemoteHost ?? "unknown host";
+  const whatWeFound: Record<PushAccountUnverifiedReason, string> = {
+    https: `HTTPS remote (${host})`,
+    unknown_protocol: `Push remote with an unrecognized protocol (${host})`,
+    generic_ssh_host: `SSH remote using generic host: ${host}`,
+    untrusted_alias: `SSH authentication through ${host}`,
+  };
+
   return {
-    id: isHttps ? "push_account:unverified_https" : "push_account:unverified_ssh",
+    id: `push_account:unverified_${reason}`,
     capability: "push_account",
     state: "unverified",
     title: "Push account is unverified",
-    summary: isHttps
-      ? "This repo pushes over HTTPS. We can't tell which account your credential manager will actually authenticate with."
-      : "This repo's push remote uses a generic SSH host, so it authenticates with whichever SSH key is used by default — not necessarily the right account.",
-    whyItMatters: isHttps
-      ? "Your credential manager could be signed into a different account than the one this repo expects, so a push could go out under the wrong name."
-      : "A generic SSH host doesn't guarantee that the account behind your default SSH key matches this repo's expected profile.",
-    whatWeExpected: `An account trusted from your ${profile.label} profile configuration`,
-    whatWeFound: isHttps
-      ? `HTTPS remote (${facts.pushRemoteHost ?? "unknown host"})`
-      : `SSH remote using generic host: ${facts.pushRemoteHost ?? "unknown"}`,
+    summary: PUSH_ACCOUNT_UNVERIFIED_SUMMARY[reason],
+    whyItMatters: PUSH_ACCOUNT_UNVERIFIED_WHY[reason],
+    whatWeExpected: `${profile.label} account`,
+    whatWeFound: whatWeFound[reason],
     blocksOverallSafety: blocking,
     suggestedAction: "Make Push Setup Safer",
     suggestedActionCommand: "makePushSetupSafer",
@@ -345,18 +381,34 @@ export function pushAccountUnverifiedResult(facts: RepoFacts, profile: Profile, 
       pushRemoteUrl: facts.pushRemoteUrl,
       pushRemoteProtocol: facts.pushRemoteProtocol,
       pushRemoteHost: facts.pushRemoteHost,
+      trustedSshHostAliases: profile.trustedSshHostAliases ?? [],
     },
   };
 }
 
-export function pushAccountConfirmedResult(facts: RepoFacts, profile: Profile): CapabilityResult {
+/**
+ * A custom SSH host alias the matched profile explicitly lists in
+ * `trustedSshHostAliases`. This is a *trusted route*, not an authenticated
+ * account: Repo Identity Guard never inspects SSH keys, credential stores,
+ * or makes a network call to confirm who actually controls the account
+ * behind this alias. The wording below must never claim otherwise — it
+ * only ever says the alias is trusted by profile configuration.
+ */
+export function pushAccountTrustedRouteResult(facts: RepoFacts, profile: Profile): CapabilityResult {
+  const alias = facts.pushRemoteHost ?? "unknown";
   return {
-    id: "push_account:confirmed",
+    id: "push_account:trusted_route",
     capability: "push_account",
     state: "confirmed",
-    title: "Push account trusted",
-    summary: `Dedicated SSH host alias (${facts.pushRemoteHost ?? "unknown"}) — trusted from your ${profile.label} profile configuration, not cryptographically verified.`,
+    title: "Push route trusted",
+    summary: `Dedicated SSH host alias "${alias}" is explicitly trusted by the ${profile.label} profile. This identifies an approved authentication route, not cryptographic proof of the remote account.`,
+    whyItMatters: "Trusting this alias reflects your own profile configuration, not a cryptographic guarantee — if the alias itself is later repointed to a different account outside of Repo Identity Guard's knowledge, this result would keep reading as trusted.",
     blocksOverallSafety: false,
+    technicalDetails: {
+      pushRemoteHost: facts.pushRemoteHost,
+      pushRemoteUrl: facts.pushRemoteUrl,
+      trustedSshHostAliases: profile.trustedSshHostAliases ?? [],
+    },
   };
 }
 

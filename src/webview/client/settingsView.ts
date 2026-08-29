@@ -106,6 +106,11 @@ function renderProfileEditor() {
           </label>
         </div>
 
+        <div class="flex flex-col gap-1.5 border-t border-outline-variant pt-2.5">
+          <label class="text-[10.5px] text-on-surface-variant">Trusted SSH host aliases <span class="opacity-70">(e.g. a Host entry in ~/.ssh/config — only these route as a trusted push, never just because a host looks dedicated)</span></label>
+          \${renderChipRow(profile, "trustedSshHostAliases", "Add alias, e.g. github-work")}
+        </div>
+
         <div class="mt-1 flex gap-1.5">
           <button class="vs-button-primary h-7 flex-1 rounded text-[12px] font-semibold" data-save-profile="\${esc(id)}">Save</button>
           <button class="h-7 rounded px-2.5 text-[12px] text-error hover:bg-error-container" data-delete-profile="\${esc(id)}">Delete</button>

@@ -37,7 +37,9 @@ git branch --show-current
 | HTTPS push, relaxed profile | `strictPushSetup: false`, push remote is `https://github.com/...`. | Still SAFE overall; "Push account is unverified" appears as a non-blocking warning. |
 | HTTPS push, strict profile | `strictPushSetup: true`, push remote is `https://github.com/...`. | 🔴 NOT SAFE; "Push account is unverified" is blocking. |
 | Generic SSH host, strict profile | `strictPushSetup: true`, push remote like `git@github.com:org/repo.git`. | 🔴 NOT SAFE; "Push account is unverified". |
-| SSH host alias | Push remote like `git@github-work:AcmeSoftware/repo.git`. | No push-setup issue (treated as a trusted, dedicated host). |
+| Trusted SSH host alias | Profile's `trustedSshHostAliases` includes `github-work`; push remote is `git@github-work:AcmeSoftware/repo.git`. | "Push route trusted" — **Confirmed** state, non-blocking; summary explicitly says this is not cryptographic proof of the remote account. |
+| Untrusted-looking custom alias | Push remote is `git@github-work:AcmeSoftware/repo.git`, but the *matched* profile's `trustedSshHostAliases` is empty or doesn't include `github-work`. | "Push account is unverified" — a dedicated-looking alias name must **not** be auto-trusted just for being non-generic. Blocking iff `strictPushSetup: true`. |
+| Alias trusted only under a different profile | `github-personal` is listed in Personal's `trustedSshHostAliases` but not Work's; the repo matches Work and pushes through `github-personal`. | "Push account is unverified" when evaluated against Work — an alias's trust never carries over from a profile that didn't match. |
 | Protected branch | Check out `main` or `master`. | 🔴 NOT SAFE; "Working directly on main". |
 | Detached HEAD | `git checkout <commit-sha>`. | 🔴 NOT SAFE; "Working in detached HEAD". |
 | Branch pattern mismatch | Profile has `expectedBranchPatterns: ["feature/*"]`; check out `chore/x`. | Non-blocking "Branch does not match repo rules" warning. |
