@@ -26,4 +26,19 @@ jobs:
 
       - run: npm run compile
 
+      # ShellCheck, on the Linux leg only. Shield's enforcement is POSIX
+      # shell, and a bashism or syntax slip there does not fail at build
+      # time -- it fails at `git commit` time on a machine whose /bin/sh is
+      # dash or BusyBox ash, where the v5 fail-CLOSED shims then block
+      # every commit and push in the repository. `shellcheck` ships in the
+      # ubuntu-latest image, so this needs no install step and no
+      # third-party action; `-s sh` forces POSIX mode so a bashism is an
+      # error rather than an accepted convenience. Every generated hook is
+      # analyzed too, by the test suite itself
+      # (src/test/shieldShellStaticAnalysis.test.ts), which skips this tool
+      # gracefully when it is absent rather than failing.
+      - name: ShellCheck the shipped evaluator (POSIX sh mode)
+        if: matrix.os == 'ubuntu-latest'
+        run: shellcheck -s sh resources/shield/shield-evaluate.sh
+
       - run: npm test

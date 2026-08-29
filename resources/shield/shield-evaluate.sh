@@ -624,7 +624,14 @@ verify_github_account() {
   EFFECTIVE_HOSTNAME=$(ssh_config_value hostname)
   EFFECTIVE_PORT=$(ssh_config_value port)
   [ -z "$EFFECTIVE_PORT" ] && EFFECTIVE_PORT=22
-  EFFECTIVE_USER=$(ssh_config_value user)
+  # The effective `user` is deliberately NOT read back and compared
+  # (ShellCheck SC2034 flagged the dead assignment that used to be here,
+  # correctly). `ssh -G` is asked about the very same
+  # "<user>@<alias>" string that the `ssh -T` probe below connects with, so
+  # its answer for `user` is a restatement of the input, not independent
+  # evidence -- unlike `hostname`/`port`, which resolve through the user's
+  # ~/.ssh/config and CAN differ from what the URL implied. Comparing it
+  # would look like a check while proving nothing.
 
   if [ -z "$EFFECTIVE_HOSTNAME" ]; then
     add_reason push-account-unverified "Profile: $PROFILE_LABEL
@@ -733,6 +740,15 @@ Reason: SSH's response while verifying the account could not be parsed."
 # ==================== push ====================
 
 evaluate_push() {
+  # shellcheck disable=SC2034
+  # SC2034 (REMOTE_NAME appears unused) is INTENTIONAL and narrowly
+  # suppressed here. Git's pre-push contract passes the remote NAME as $1
+  # and its location as $2; Shield deliberately evaluates only the
+  # location, because the name is just a local label that can be pointed
+  # anywhere and is therefore not evidence about the destination. The
+  # named assignment is kept as the executable documentation of that
+  # positional contract -- removing it would make $2 look arbitrary and
+  # invite someone to renumber it.
   REMOTE_NAME="${1:-}"
   REMOTE_URL="${2:-}"
   # Drain stdin (the real pre-push hook's <local-ref> <local-sha>
