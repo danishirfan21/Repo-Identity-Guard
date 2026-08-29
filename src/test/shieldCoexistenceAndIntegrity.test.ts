@@ -122,6 +122,17 @@ function baseFacts(repo: Repo, overrides: Partial<RepoFacts> = {}): RepoFacts {
     remoteHost: "github.com",
     remoteOwner: "AcmeSoftware",
     remoteRepo: "acme-frontend",
+    // Phase 8: `approvedPushDestination` is built from the pushRemote*
+    // facts (the destination a plain `git push` actually reaches), never
+    // from origin's fetch facts. These fixtures describe the ordinary
+    // "origin is also the push destination" arrangement, so both sets
+    // agree; tests that deliberately separate them override pushRemote*.
+    pushRemoteName: "origin",
+    pushRemoteUrl: "git@github.com:AcmeSoftware/acme-frontend.git",
+    pushRemoteProtocol: "ssh" as const,
+    pushRemoteHost: "github.com",
+    pushRemoteOwner: "AcmeSoftware",
+    pushRemoteRepo: "acme-frontend",
     ...overrides,
   };
 }

@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { SHIELD_ARTIFACT_VERSION } from "../shield/artifacts";
 import { ShieldManager } from "../shield/manager";
 import { Profile, RepoFacts } from "../types";
 
@@ -126,6 +127,17 @@ function baseFacts(repo: Repo): RepoFacts {
     remoteHost: "github.com",
     remoteOwner: "AcmeSoftware",
     remoteRepo: "acme-frontend",
+    // Phase 8: `approvedPushDestination` is built from the pushRemote*
+    // facts (the destination a plain `git push` actually reaches), never
+    // from origin's fetch facts. These fixtures describe the ordinary
+    // "origin is also the push destination" arrangement, so both sets
+    // agree; tests that deliberately separate them override pushRemote*.
+    pushRemoteName: "origin",
+    pushRemoteUrl: "git@github.com:AcmeSoftware/acme-frontend.git",
+    pushRemoteProtocol: "ssh" as const,
+    pushRemoteHost: "github.com",
+    pushRemoteOwner: "AcmeSoftware",
+    pushRemoteRepo: "acme-frontend",
   };
 }
 
@@ -179,7 +191,7 @@ test("enable() installs a policy, an evaluator copy, and owned pre-commit AND pr
     ] as const) {
       const hookPath = path.join(hooksDir, fileName);
       const hookContent = await fs.readFile(hookPath, "utf8");
-      assert.match(hookContent, new RegExp(`repo-identity-guard-shield-artifact v4 \\(${marker}\\)`));
+      assert.match(hookContent, new RegExp(`repo-identity-guard-shield-artifact v${SHIELD_ARTIFACT_VERSION} \\(${marker}\\)`));
       if (process.platform !== "win32") {
         // NTFS has no POSIX executable bit -- Git for Windows makes a
         // hook run via its own shebang-interpretation mechanism instead,
@@ -193,7 +205,7 @@ test("enable() installs a policy, an evaluator copy, and owned pre-commit AND pr
 
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     const evaluatorContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh"), "utf8");
-    assert.match(evaluatorContent, /repo-identity-guard-shield-artifact v4 \(evaluator\)/);
+    assert.match(evaluatorContent, new RegExp(`repo-identity-guard-shield-artifact v${SHIELD_ARTIFACT_VERSION} \\(evaluator\\)`));
     const policyContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-policy.json"), "utf8");
     assert.match(policyContent, /"profileLabel": "Work"/);
     assert.match(policyContent, /"push"/); // enabledActions now includes push as of Phase 4

@@ -50,6 +50,22 @@ export async function getRepoRoot(cwd: string): Promise<string | null> {
   return tryGit(cwd, ["rev-parse", "--show-toplevel"]);
 }
 
+/**
+ * The raw `git --version` line (e.g. `git version 2.43.0`), or null when
+ * `git` could not be run at all. Parsing/comparison lives in
+ * `src/shield/gitVersion.ts` so it stays pure and testable; this function
+ * only performs the invocation.
+ *
+ * Deliberately not repo-scoped: the Git binary's version is a property of
+ * the machine, not the repository. `cwd` only affects which `git` a
+ * directory-scoped PATH would resolve, which is not a case worth
+ * modelling — it takes the repo root purely so it can share `tryGit`'s
+ * error handling.
+ */
+export async function getGitVersionRaw(cwd: string): Promise<string | null> {
+  return tryGit(cwd, ["--version"]);
+}
+
 export async function getCurrentBranch(repoRoot: string): Promise<string | null> {
   return tryGit(repoRoot, ["branch", "--show-current"]);
 }

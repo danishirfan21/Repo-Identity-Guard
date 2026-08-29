@@ -100,13 +100,33 @@ const { execFileSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const joined = " " + args.join(" ") + " ";
 if (joined.includes(" -G ")) {
+  // Phase 8: the effective ROUTE, not just IdentitiesOnly. Shield now
+  // resolves the alias with \`ssh -G\` and refuses to treat a
+  // non-GitHub endpoint's self-report as a GitHub account, so this
+  // stub must produce a realistic hostname/port. FAKE_SSH_HOSTNAME
+  // lets a test point the "trusted" alias somewhere else entirely --
+  // which is the whole attack this check exists to stop.
+  // FAKE_SSH_G_FAIL simulates \`ssh -G\` producing no hostname at all.
+  if (process.env.FAKE_SSH_G_FAIL === "1") {
+    process.stdout.write("user git\\n");
+    process.exit(0);
+  }
   const identitiesOnly = (process.env.FAKE_SSH_IDENTITIES_ONLY || "yes") === "yes";
   const user = process.env.FAKE_SSH_USER || "git";
-  process.stdout.write(identitiesOnly
-    ? \`user \${user}\\nhostname github.example\\nidentitiesonly yes\\n\`
-    : \`user \${user}\\nhostname github.example\\n\`);
+  const hostname = process.env.FAKE_SSH_HOSTNAME || "github.com";
+  const port = process.env.FAKE_SSH_PORT || "22";
+  process.stdout.write(
+    \`user \${user}\\nhostname \${hostname}\\nport \${port}\\n\` +
+    (identitiesOnly ? "identitiesonly yes\\n" : "identitiesonly no\\n")
+  );
   process.exit(0);
 } else if (joined.includes(" -T ")) {
+  // Record the exact probe argv so a test can assert the probe travels
+  // the same route (alias, and -p when the URL carried a port) that the
+  // push itself would.
+  if (process.env.FAKE_SSH_PROBE_LOG) {
+    require("node:fs").appendFileSync(process.env.FAKE_SSH_PROBE_LOG, args.join(" ") + "\\n");
+  }
   process.stderr.write(process.env.FAKE_SSH_AUTH_OUTPUT || "");
   process.exit(parseInt(process.env.FAKE_SSH_AUTH_EXIT || "1", 10));
 } else {
@@ -208,6 +228,17 @@ function approvedFacts(repo: Repo, overrides: Partial<RepoFacts> = {}): RepoFact
     remoteHost: "github-work",
     remoteOwner: "AcmeSoftware",
     remoteRepo: "acme-frontend",
+    // Phase 8: `approvedPushDestination` is built from the pushRemote*
+    // facts (the destination a plain `git push` actually reaches), never
+    // from origin's fetch facts. These fixtures describe the ordinary
+    // "origin is also the push destination" arrangement, so both sets
+    // agree; tests that deliberately separate them override pushRemote*.
+    pushRemoteName: "origin",
+    pushRemoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git",
+    pushRemoteProtocol: "ssh" as const,
+    pushRemoteHost: "github-work",
+    pushRemoteOwner: "AcmeSoftware",
+    pushRemoteRepo: "acme-frontend",
     ...overrides,
   };
 }

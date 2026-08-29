@@ -190,16 +190,61 @@ function checkPushDestination(facts: RepoFacts, profile: Profile | undefined): C
 
   const pushKey = canonicalRepoKey(facts.pushRemoteHost, facts.pushRemoteOwner, facts.pushRemoteRepo);
   const exactRepoPatterns = profile.exactRepos ?? [];
-  const matchesExactRepo = !!pushKey && exactRepoPatterns.some((pattern) => wildcardMatch(pushKey, pattern));
-
   const expectedOwners = profile.expectedRemoteOwners ?? [];
-  const matchesOwnerPattern =
-    expectedOwners.length === 0 ||
-    (facts.pushRemoteOwner
-      ? expectedOwners.some((pattern) => wildcardMatch(facts.pushRemoteOwner as string, pattern))
-      : false);
 
-  const destinationMatches = matchesExactRepo || matchesOwnerPattern;
+  // ==================== the one destination rule ====================
+  //
+  // Phase 8 finding. The previous rule was
+  //
+  //   matchesExactRepo || expectedOwners.length === 0 || ownerPatternMatches
+  //
+  // whose middle term is an unconditional `true` for any profile that
+  // lists `exactRepos` but no `expectedRemoteOwners` — so such a profile
+  // reported "destination confirmed" for LITERALLY ANY push destination,
+  // including one whose repository is not among its exact repos and whose
+  // owner is a complete stranger. Empirically reproduced (see
+  // statusEngine.test.ts, "a profile that lists exactRepos but no owner
+  // patterns…"). It also read a destination whose owner could not be
+  // parsed at all as confirmed, on the same path.
+  //
+  // The rule now, stated once and shared by the sidebar and Shield:
+  //
+  //  1. A profile that declares NO destination constraint at all (neither
+  //     `exactRepos` nor `expectedRemoteOwners`) makes no claim about
+  //     where pushes may go, so any resolvable destination is confirmed.
+  //     This is the only "everything passes" case, and it now requires
+  //     the profile to actually be unconstrained rather than merely to
+  //     have left one of the two lists empty.
+  //  2. Otherwise the destination must positively satisfy at least one
+  //     declared constraint: its canonical `host/owner/repo` key matches
+  //     an `exactRepos` pattern, OR its owner matches an
+  //     `expectedRemoteOwners` pattern. Owner-level matching is retained
+  //     deliberately — a fork, a mirror, or a new repository under an
+  //     owner the profile already trusts is a legitimate destination, and
+  //     requiring an exact repo listing for those would make the feature
+  //     unusable — but it is now a *positive* match, never a default.
+  //  3. Missing evidence is never a match. An unparseable owner cannot
+  //     satisfy an owner pattern, and an unparseable owner/repo cannot
+  //     produce a canonical key to satisfy an exact-repo pattern; a
+  //     constrained profile therefore reports mismatch rather than
+  //     confirming a destination it could not identify.
+  //
+  // How this stays consistent with Shield rather than contradicting it:
+  // this check answers "is this destination within the PROFILE's declared
+  // scope?", while Shield's `push-destination-mismatch` answers the
+  // strictly narrower "is this the exact owner/repo that was approved
+  // when Shield was enabled or repaired?". Shield's approved destination
+  // is always a single concrete owner/repo drawn from the push remote, so
+  // anything Shield allows this check also allows; the reverse is not
+  // true, and when they diverge (the repo moved within a trusted owner)
+  // Shield reports `pushDestinationDrift` and asks for an explicit
+  // Repair. Neither ever calls a destination the other rejects "safe".
+  const declaresConstraint = exactRepoPatterns.length > 0 || expectedOwners.length > 0;
+  const matchesExactRepo = !!pushKey && exactRepoPatterns.some((pattern) => wildcardMatch(pushKey, pattern));
+  const matchesOwnerPattern =
+    !!facts.pushRemoteOwner && expectedOwners.some((pattern) => wildcardMatch(facts.pushRemoteOwner as string, pattern));
+
+  const destinationMatches = !declaresConstraint || matchesExactRepo || matchesOwnerPattern;
   if (!destinationMatches) {
     return pushDestinationMismatchResult(facts, profile);
   }

@@ -627,19 +627,70 @@ export function activate(context: vscode.ExtensionContext): void {
    * mutating action Workspace Trust exists to gate; a plain health check
    * is read-only and works regardless.
    */
+  /**
+   * Re-collects everything a durable Shield policy is built from, right
+   * now, immediately before the write that persists it.
+   *
+   * Phase 8 finding: `enableShield`/`repairShield` used to build a policy
+   * out of `latestSummary.facts` — the shared module-level snapshot that a
+   * background file watcher, a sidebar scan, or a workspace-folder switch
+   * writes to, and which can therefore be arbitrarily old (or belong to a
+   * *different* repository) by the time the command runs. That snapshot is
+   * fine for painting UI, which is refreshed constantly and costs nothing
+   * when wrong. It is not fine for `approvedPushDestination`,
+   * `approvedRepositoryKey`, `expectedGitEmail`, or the matched profile:
+   * those get written to disk and then enforced by hooks, with VS Code
+   * closed, until someone explicitly repairs them. A stale fact there is a
+   * silently wrong enforcement rule with a long lifetime.
+   *
+   * `collectRepoFacts` re-runs every underlying `git` invocation
+   * (including the full `branch.<name>.pushRemote` → `remote.pushDefault`
+   * → `branch.<name>.remote` → `origin` push-remote resolution and
+   * `remote get-url --push`), and profiles/protected branches are re-read
+   * from Settings, so the profile match and the push destination are both
+   * resolved from live state rather than inherited from the scan.
+   *
+   * `repoRoot` is passed in from the summary only as a *starting
+   * directory* — the freshly collected facts' own `repoRoot` is what is
+   * then used, so even a repo-root change is picked up rather than
+   * assumed.
+   */
+  async function collectFreshShieldInputs(startDir: string): Promise<
+    { ok: true; facts: RepoFacts; profiles: Profile[]; protectedBranches: string[] } | { ok: false; message: string }
+  > {
+    const facts = await collectRepoFacts(startDir);
+    if (!facts.isGitRepo || !facts.repoRoot) {
+      return { ok: false, message: "This folder is no longer a Git repository. Nothing was changed." };
+    }
+    if (facts.gitError) {
+      return {
+        ok: false,
+        message: `Shield refused to act because this repository's current state could not be read: ${facts.gitError}. Nothing was changed.`,
+      };
+    }
+    return { ok: true, facts, profiles: getProfiles(), protectedBranches: getProtectedBranches() };
+  }
+
   async function enableShield(): Promise<void> {
-    const { facts } = latestSummary;
-    if (!facts.repoRoot) {
+    const startDir = latestSummary.facts.repoRoot;
+    if (!startDir) {
       await vscode.window.showInformationMessage("Open a Git repository first.");
       return;
     }
     if (!(await requireWorkspaceTrust())) return;
 
+    const fresh = await collectFreshShieldInputs(startDir);
+    if (!fresh.ok) {
+      await vscode.window.showWarningMessage(`Could not enable Shield: ${fresh.message}`);
+      return;
+    }
+    const { facts } = fresh;
+
     try {
-      const result = await shieldManager.enable(facts.repoRoot, shieldEvaluatorScriptSource, {
+      const result = await shieldManager.enable(facts.repoRoot as string, shieldEvaluatorScriptSource, {
         facts,
-        profiles: getProfiles(),
-        protectedBranches: getProtectedBranches(),
+        profiles: fresh.profiles,
+        protectedBranches: fresh.protectedBranches,
       });
       if (result.ok) {
         await vscode.window.showInformationMessage(
@@ -656,18 +707,30 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   async function repairShield(): Promise<void> {
-    const { facts } = latestSummary;
-    if (!facts.repoRoot) {
+    const startDir = latestSummary.facts.repoRoot;
+    if (!startDir) {
       await vscode.window.showInformationMessage("Open a Git repository first.");
       return;
     }
     if (!(await requireWorkspaceTrust())) return;
 
+    // Same fresh-facts rule as enableShield: a repair rewrites the durable
+    // policy, so it must never be built from a cached scan either. Repair
+    // is in fact the more important of the two — it exists precisely to
+    // re-sync a policy after something changed, and reading a stale
+    // snapshot would re-persist the very drift the user is repairing.
+    const fresh = await collectFreshShieldInputs(startDir);
+    if (!fresh.ok) {
+      await vscode.window.showWarningMessage(`Could not repair Shield: ${fresh.message}`);
+      return;
+    }
+    const { facts } = fresh;
+
     try {
-      const result = await shieldManager.repair(facts.repoRoot, shieldEvaluatorScriptSource, {
+      const result = await shieldManager.repair(facts.repoRoot as string, shieldEvaluatorScriptSource, {
         facts,
-        profiles: getProfiles(),
-        protectedBranches: getProtectedBranches(),
+        profiles: fresh.profiles,
+        protectedBranches: fresh.protectedBranches,
       });
       if (result.ok) {
         await vscode.window.showInformationMessage(`Shield repaired for ${facts.repoName ?? facts.repoRoot}.`);
@@ -704,14 +767,61 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  /**
+   * Shield health check — a FULL integrity check, not a file-presence
+   * check.
+   *
+   * Phase 8 finding: this command called `healthCheck(repoRoot)` with no
+   * options at all. `ShieldManager.inspect` supports three drift checks,
+   * and every one of them is opt-in via an input the caller must supply —
+   * so with none supplied, all three were silently skipped and a Shield
+   * whose evaluator had been hand-edited (marker and version comment left
+   * intact), whose profile had since changed `trustedSshHostAliases` /
+   * `expectedGitHubLogin` / `strictPushSetup` / Git identity, or whose
+   * push destination had moved, reported a confident "Shield is active."
+   * The checks existed and were tested at the manager level; nothing in
+   * the product ever turned them on.
+   *
+   * All three inputs are gathered live here, for the same reason
+   * `collectFreshShieldInputs` exists: a drift check against a cached
+   * snapshot can only detect drift that the snapshot already happens to
+   * know about.
+   *
+   * `inspect()` remains strictly read-only — this reports drift, it never
+   * repairs it. Turning degraded back into active stays an explicit
+   * "Repair Shield".
+   */
   async function checkShieldHealth(): Promise<void> {
-    const { facts } = latestSummary;
-    if (!facts.repoRoot) {
+    const startDir = latestSummary.facts.repoRoot;
+    if (!startDir) {
       await vscode.window.showInformationMessage("Open a Git repository first.");
       return;
     }
     try {
-      const { summary, state } = await shieldManager.healthCheck(facts.repoRoot);
+      const facts = await collectRepoFacts(startDir);
+      if (!facts.isGitRepo || !facts.repoRoot) {
+        await vscode.window.showInformationMessage("Open a Git repository first.");
+        return;
+      }
+      const { summary, state } = await shieldManager.healthCheck(facts.repoRoot, {
+        // Content drift of Shield's own evaluator copy: compared
+        // byte-for-byte against the bundled source, which is the only way
+        // to catch a hand edit that kept the ownership/version marker.
+        evaluatorScriptSource: shieldEvaluatorScriptSource,
+        // Profile drift: the live profile list from Settings, so an
+        // `expectedGitHubLogin`/`trustedSshHostAliases`/`strictPushSetup`/
+        // identity change made after Shield was enabled is reported.
+        currentProfiles: getProfiles(),
+        // Push-destination drift: the freshly resolved plain-push
+        // destination (branch.<name>.pushRemote / remote.pushDefault /
+        // pushurl all honoured by collectRepoFacts), not origin's fetch
+        // URL — the same fact Shield's policy approves.
+        currentPushDestination: {
+          host: facts.pushRemoteHost,
+          owner: facts.pushRemoteOwner,
+          repo: facts.pushRemoteRepo,
+        },
+      });
       if (state === "active") {
         await vscode.window.showInformationMessage(summary);
       } else {

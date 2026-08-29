@@ -163,6 +163,17 @@ function baseFacts(repo: Repo, overrides: Partial<RepoFacts> = {}): RepoFacts {
     remoteHost: "github-work",
     remoteOwner: "AcmeSoftware",
     remoteRepo: "acme-frontend",
+    // Phase 8: `approvedPushDestination` is built from the pushRemote*
+    // facts (the destination a plain `git push` actually reaches), never
+    // from origin's fetch facts. These fixtures describe the ordinary
+    // "origin is also the push destination" arrangement, so both sets
+    // agree; tests that deliberately separate them override pushRemote*.
+    pushRemoteName: "origin",
+    pushRemoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git",
+    pushRemoteProtocol: "ssh" as const,
+    pushRemoteHost: "github-work",
+    pushRemoteOwner: "AcmeSoftware",
+    pushRemoteRepo: "acme-frontend",
     ...overrides,
   };
 }
@@ -478,7 +489,25 @@ test("malformed policy (real hand-corrupted policy.json on disk) blocks a real c
   }
 });
 
-test("deleted evaluator: removing the evaluator copy after enable fails OPEN for commit (documented: half-removed Shield must never block an ordinary commit)", async () => {
+/**
+ * Phase 8 reversal — this test previously asserted the OPPOSITE ("fails
+ * OPEN"), and that documented behavior was the bug.
+ *
+ * With Shield reported ACTIVE, deleting one file
+ * (`<gitCommonDir>/repo-identity-guard/shield-evaluate.sh`) left the hook
+ * installed and made every commit — including one with a deliberately
+ * mismatched identity — sail straight through, silently and with no
+ * output at all. That is a one-command, no-privileges bypass of the entire
+ * feature. "Hook installed but evaluator missing" is a BROKEN
+ * INSTALLATION, not a disabled Shield, and the only safe reading of a
+ * broken enforcement mechanism is to stop and say so.
+ *
+ * The safety of failing closed here rests entirely on `disable()` being
+ * complete — see the disable/orphan tests below, which prove a legitimate
+ * Disable Shield never leaves a hook behind to block against a
+ * deliberately-removed evaluator.
+ */
+test("deleted evaluator: removing the evaluator copy after enable FAILS CLOSED for commit, framed as a broken Shield installation", async () => {
   const repo = await makeTempRepo();
   try {
     const manager = new ShieldManager();
@@ -486,10 +515,136 @@ test("deleted evaluator: removing the evaluator copy after enable fails OPEN for
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     await fs.rm(path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh"));
 
-    await git(repo, ["config", "user.email", "personal@example.com"]); // would otherwise be blocked
+    await git(repo, ["config", "user.email", "personal@example.com"]);
     await touchFile(repo, "a.txt", "x\n");
-    const result = await commit(repo, "evaluator missing, fails open");
+    const result = await commit(repo, "evaluator missing, must fail closed");
+    assert.notEqual(result.code, 0, "a missing evaluator must never let a commit through");
+    assert.match(result.stderr, /broken installation/i);
+    // Framed as Shield's own problem, never as a verdict about the commit.
+    assert.match(result.stderr, /Repair Shield/);
+    assert.match(result.stderr, /Disable Shield/);
+  } finally {
+    await cleanup(repo.dir);
+  }
+});
+
+test("deleted evaluator: a push FAILS CLOSED the same way, framed as a broken Shield installation", async () => {
+  const repo = await makeTempRepo();
+  const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
+  try {
+    const manager = new ShieldManager();
+    await enableShield(manager, repo);
+    const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
+    await git(repo, ["remote", "add", "origin", bare]);
+
+    const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    await fs.rm(path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh"));
+
+    const result = await push(repo, ["origin", "HEAD:refs/heads/main"]);
+    assert.notEqual(result.code, 0, "a missing evaluator must never let a push through");
+    assert.match(result.stderr, /broken installation/i);
+    assert.equal(await remoteRefSha(bare), null, "the remote ref must NOT have been updated");
+  } finally {
+    await cleanup(repo.dir, remoteParent);
+  }
+});
+
+test("corrupted evaluator (truncated to garbage, marker gone) blocks a commit as a Shield INTERNAL error, never as a policy verdict", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const manager = new ShieldManager();
+    await enableShield(manager, repo);
+    const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const evaluatorPath = path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh");
+    // Present and readable, so the "missing evaluator" branch is NOT what
+    // fires -- this exercises the evaluator actually running and dying.
+    await fs.writeFile(evaluatorPath, "#!/bin/sh\nexit 42\n", { mode: 0o755 });
+
+    await touchFile(repo, "a.txt", "x\n");
+    const result = await commit(repo, "corrupt evaluator");
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /internal error/i);
+    // A crash is never dressed up as a policy decision.
+    assert.doesNotMatch(result.stderr, /Shield: \[/);
+  } finally {
+    await cleanup(repo.dir);
+  }
+});
+
+// ==================== disable safety under fail-closed hooks ====================
+
+test("DISABLE SAFETY: after a completed Disable Shield, ordinary commits and pushes work again (no hook is left to fail closed)", async () => {
+  const repo = await makeTempRepo();
+  const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
+  try {
+    const manager = new ShieldManager();
+    await enableShield(manager, repo);
+    await manager.disable(repo.dir);
+
+    const bare = await makeBareRemote(remoteParent, "SomewhereElse", "anything");
+    await git(repo, ["remote", "add", "origin", bare]);
+    // A deliberately wrong identity AND a destination Shield never
+    // approved: both would be blocked if any Shield hook survived.
+    await git(repo, ["config", "user.email", "personal@example.com"]);
+    await touchFile(repo, "a.txt", "x\n");
+
+    const committed = await commit(repo, "after disable");
+    assert.equal(committed.code, 0, committed.stderr);
+    const pushed = await push(repo, ["origin", "HEAD:refs/heads/main"]);
+    assert.equal(pushed.code, 0, pushed.stderr);
+  } finally {
+    await cleanup(repo.dir, remoteParent);
+  }
+});
+
+test("DISABLE SAFETY: hooks are removed BEFORE the evaluator, so an interrupted disable can only ever over-enforce, never permanently block", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const manager = new ShieldManager();
+    await enableShield(manager, repo);
+    const hooksDir = await hooksDirFor(repo);
+    const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const evaluatorPath = path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh");
+
+    // Simulate the exact state a disable interrupted between its two
+    // phases leaves behind: hooks already gone, evaluator still present.
+    // That state must be harmless -- Git simply has no hook to run.
+    for (const name of ["pre-commit", "pre-merge-commit", "pre-push"]) {
+      await fs.rm(path.join(hooksDir, name), { force: true });
+    }
+    assert.ok(await fs.stat(evaluatorPath).then(() => true).catch(() => false), "evaluator still present, as in a half-finished disable");
+
+    await git(repo, ["config", "user.email", "personal@example.com"]);
+    await touchFile(repo, "a.txt", "x\n");
+    const result = await commit(repo, "hooks gone, evaluator left");
     assert.equal(result.code, 0, result.stderr);
+
+    // And finishing the disable afterwards is still clean and idempotent.
+    const inspection = await manager.disable(repo.dir);
+    assert.equal(inspection.state, "off");
+  } finally {
+    await cleanup(repo.dir);
+  }
+});
+
+test("REPAIR restores enforcement after the evaluator was deleted (broken -> active, and a mismatched commit is blocked by policy again)", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const manager = new ShieldManager();
+    await enableShield(manager, repo);
+    const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    await fs.rm(path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh"));
+
+    const repaired = await enableShield(manager, repo);
+    assert.equal(repaired.inspection.state, "active", repaired.inspection.reasons.join("; "));
+
+    await git(repo, ["config", "user.email", "personal@example.com"]);
+    await touchFile(repo, "a.txt", "x\n");
+    const result = await commit(repo, "blocked by policy again");
+    assert.notEqual(result.code, 0);
+    // A real policy verdict, NOT the internal-error framing.
+    assert.match(result.stderr, /commit-identity-mismatch/);
+    assert.doesNotMatch(result.stderr, /broken installation/i);
   } finally {
     await cleanup(repo.dir);
   }
@@ -715,7 +870,12 @@ const { execFileSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const joined = " " + args.join(" ") + " ";
 if (joined.includes(" -G ")) {
-  process.stdout.write("identitiesonly yes\\n");
+  // Phase 8: Shield now requires the alias's EFFECTIVE route (hostname,
+  // port, user) to actually be a GitHub SSH endpoint before it will treat
+  // a GitHub-shaped greeting as proof of a GitHub account, so this stub
+  // reports a full, realistic \`ssh -G\` response rather than the single
+  // IdentitiesOnly line that used to be enough.
+  process.stdout.write("user git\\nhostname github.com\\nport 22\\nidentitiesonly yes\\n");
   process.exit(0);
 } else if (joined.includes(" -T ")) {
   process.stdout.write("Hi ${login}! You've successfully authenticated, but GitHub does not provide shell access.\\n");

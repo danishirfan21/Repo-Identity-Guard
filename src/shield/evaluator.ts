@@ -259,8 +259,20 @@ function destinationReasons(policy: ShieldPolicy, owner: string | undefined, rep
       },
     ];
   }
-  const ownerMatches = normalize(approved.owner) === normalize(owner);
-  const repoMatches = !approved.repo || !repo || normalize(approved.repo) === normalize(repo);
+  // Phase 8 finding — missing evidence is NOT a match. The previous rule
+  // was `!approved.repo || !repo || approved.repo === repo`, whose middle
+  // term made an *unparseable* repository name in the actual push URL
+  // satisfy an approved repository name. So with an approved destination
+  // of `acme/frontend`, a push whose URL yielded an owner but no repo
+  // (e.g. `git@github.com:acme`, or any shape parseRemoteUrl can only
+  // partially read) matched purely because the owner happened to parse.
+  // Now: if the policy names a repository, the push URL must produce one
+  // and it must match. Only a policy that never recorded a repository at
+  // all (`approved.repo` absent) is satisfied by owner alone — and that
+  // is a property of what Shield approved, not of what it failed to read
+  // at push time.
+  const ownerMatches = !!owner && normalize(approved.owner) === normalize(owner);
+  const repoMatches = !approved.repo || (!!repo && normalize(approved.repo) === normalize(repo));
   if (ownerMatches && repoMatches) {
     return [];
   }
@@ -373,6 +385,19 @@ function accountReasons(policy: ShieldPolicy, isTrustedRoute: boolean, facts: Pu
     case "identities-not-isolated":
       return unverified(
         'This SSH route\'s effective configuration does not set "IdentitiesOnly yes", so ssh-agent could offer a different, unrelated key than the one this route is meant to use — the route cannot be strongly bound to an expected account without it.',
+      );
+    case "route-not-github":
+      // Phase 8: a trusted alias name is not evidence about where the
+      // alias goes. `ssh -G` resolved this route to somewhere that is not
+      // a GitHub SSH endpoint, so nothing it says about "the authenticated
+      // GitHub account" can be believed — including a perfectly
+      // GitHub-shaped greeting.
+      return unverified(
+        `This SSH route's effective destination is ${check.hostname}:${check.port}, which is not a GitHub SSH endpoint, so nothing it reports can confirm a GitHub account. (Shield resolves the alias with "ssh -G" rather than trusting its name.)`,
+      );
+    case "route-unresolvable":
+      return unverified(
+        'Shield could not resolve this SSH route\'s effective destination ("ssh -G" reported no hostname), so it cannot confirm that its verification probe takes the same route the push itself would.',
       );
     case "malformed":
       return unverified("SSH's response while verifying the account could not be parsed.");

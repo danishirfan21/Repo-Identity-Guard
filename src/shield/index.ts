@@ -4,4 +4,6 @@ export * from "./policy";
 export * from "./storage";
 export * from "./evaluator";
 export * from "./artifacts";
+export * from "./gitVersion";
+export * from "./installRecord";
 export * from "./manager";

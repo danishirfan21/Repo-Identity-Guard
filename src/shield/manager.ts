@@ -2,9 +2,16 @@ import { promises as fs } from "node:fs";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { canonicalRepoKey, resolveProfiles } from "../core/profileResolver";
-import { getCoreHooksPathConfig, getGitCommonDir, getGitDir, getHooksDir } from "../services/gitService";
+import {
+  getCoreHooksPathConfig,
+  getGitCommonDir,
+  getGitDir,
+  getGitVersionRaw,
+  getHooksDir,
+} from "../services/gitService";
 import { Profile, RepoFacts } from "../types";
 import {
+  SHIELD_ARTIFACT_MARKER,
   SHIELD_ARTIFACT_VERSION,
   SHIELD_CHAIN_ORIGINAL_SUFFIX,
   buildPreCommitHookScript,
@@ -12,6 +19,14 @@ import {
   extractShieldArtifactVersion,
   isShieldOwnedArtifact,
 } from "./artifacts";
+import { SHIELD_MIN_GIT_VERSION_DISPLAY, evaluateGitVersionSupport } from "./gitVersion";
+import {
+  normalizeHookDirs,
+  readShieldInstallRecord,
+  sameHookDir,
+  shieldInstallRecordFilePath,
+  writeShieldInstallRecord,
+} from "./installRecord";
 import { ShieldPolicy, buildShieldPolicy, parseShieldPolicy, serializeShieldPolicy } from "./policy";
 import { shieldEvaluatorScriptFilePath, shieldPolicyFilePath, shieldStorageDir } from "./storage";
 import { ShieldAction, ShieldLifecycleState } from "./types";
@@ -157,6 +172,13 @@ export interface ShieldHookInspection {
   contentModified: boolean;
   /** True when a sidecar `<fileName>.repo-identity-guard-original` file exists next to this hook — i.e. Shield is (or was) chaining a foreign hook here. */
   hasChainedOriginal: boolean;
+  /**
+   * The filesystem-level kind of whatever occupies this hook path
+   * (`lstat`-based, so a symlink reads as `"symlink"`, never as its
+   * target). Decides whether a *foreign* occupant can be chained at all —
+   * see {@link classifyHookFile}. `"absent"` when nothing is there.
+   */
+  fileKind: HookFileKind;
 }
 
 export interface ShieldInspection {
@@ -182,6 +204,23 @@ export interface ShieldInspection {
   policyProfileDrift: boolean;
   /** True when `ShieldInspectOptions.currentPushDestination` differs (by owner/repo, same comparison the evaluator itself uses) from the policy's `approvedPushDestination` — i.e. the repository's actual remote has moved since Shield was last enabled/repaired. Always `false` when `currentPushDestination` wasn't supplied. */
   pushDestinationDrift: boolean;
+  /**
+   * Hook files still carrying Shield's ownership marker in a hooks
+   * directory Shield previously installed into but which is no longer the
+   * one Git resolves (`core.hooksPath` moved after installation). Read
+   * from Shield's durable installation record — see
+   * `src/shield/installRecord.ts`. Never a reason to consider Shield
+   * active, always a reason to consider it degraded: point
+   * `core.hooksPath` back and those hooks become live again.
+   */
+  orphanedHookPaths: string[];
+  /**
+   * The raw `git --version` line, and whether that version can support
+   * Shield at all (Phase 8 — see `src/shield/gitVersion.ts`). Shield is
+   * never reported `active` when this is unsupported.
+   */
+  gitVersionRaw?: string;
+  gitVersionSupported: boolean;
 }
 
 export interface ShieldOperationResult {
@@ -262,14 +301,42 @@ function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function readFileIfExists(filePath: string): Promise<string | null> {
+/**
+ * Reads a file as raw BYTES, never as decoded text.
+ *
+ * Phase 8 finding: this used to read `utf8`, and every path that
+ * round-tripped a foreign hook through it (chaining an existing
+ * `pre-commit` aside to its sidecar) silently corrupted any hook that was
+ * not valid UTF-8. Empirically reproduced with a native executable hook:
+ * the bytes `ff fe 80 81` came back out as four U+FFFD replacement
+ * characters (`ef bf bd` × 4) — a "preserved" foreign hook that no longer
+ * runs. Ownership detection, content comparison, and sidecar
+ * preservation are all byte-level operations, so they all read bytes;
+ * only content Shield itself wrote (the policy JSON) is decoded as text,
+ * and only where a string is genuinely needed.
+ *
+ * Uses `lstat` semantics implicitly: `fs.readFile` follows symlinks, so
+ * callers that care about link-ness must consult
+ * {@link classifyHookFile} — never infer file type from this.
+ */
+async function readBytesIfExists(filePath: string): Promise<Buffer | null> {
   try {
-    return await fs.readFile(filePath, "utf8");
+    return await fs.readFile(filePath);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return null;
+    // ENOENT: nothing there. EISDIR / ELOOP / dangling symlink (also
+    // ENOENT): nothing readable there either — reported as absent so
+    // `classifyHookFile` is the single place that decides what an
+    // unusual file type means.
+    if (code === "ENOENT" || code === "EISDIR" || code === "ELOOP") return null;
     throw error;
   }
+}
+
+/** Text form of {@link readBytesIfExists}, for files Shield itself wrote as text (the policy). Invalid UTF-8 would be a corrupt policy either way. */
+async function readFileIfExists(filePath: string): Promise<string | null> {
+  const bytes = await readBytesIfExists(filePath);
+  return bytes === null ? null : bytes.toString("utf8");
 }
 
 async function modeOf(filePath: string): Promise<number | undefined> {
@@ -281,12 +348,67 @@ async function modeOf(filePath: string): Promise<number | undefined> {
 }
 
 /**
+ * What actually occupies a hook path, at the filesystem-type level —
+ * `lstat`, so a symlink is reported as a symlink rather than as whatever
+ * it points at.
+ *
+ * Phase 8 finding, hook chaining: chaining used to read whatever was at
+ * the hook path and write those (decoded!) bytes to the sidecar as a
+ * plain regular file. Empirically, that turned a symlinked `pre-commit`
+ * into a regular-file copy (breaking the "edit the target, the hook
+ * changes" arrangement Husky-style setups rely on), and it happily
+ * chained a NON-EXECUTABLE hook — which Git itself would never have run —
+ * into a position where Shield's shim tried to `exec` it, producing
+ * `exec: ...: Permission denied` on every single commit with no
+ * indication of where it came from.
+ *
+ * So chaining is now restricted to the one file type it can support
+ * faithfully and run correctly: an executable regular file, moved
+ * byte-for-byte with its mode preserved. Everything else is left
+ * completely untouched and reported as a precise `degraded` reason (see
+ * `foreignHookRefusalReason`) — option (B) of "preserve exactly, or
+ * refuse and explain". Shield never converts a file type, never decodes
+ * bytes it did not write, and never installs a chain it cannot run.
+ */
+type HookFileKind = "absent" | "executable-regular" | "nonexecutable-regular" | "symlink" | "other";
+
+async function classifyHookFile(filePath: string): Promise<HookFileKind> {
+  let stats;
+  try {
+    stats = await fs.lstat(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+    throw error;
+  }
+  if (stats.isSymbolicLink()) return "symlink";
+  if (!stats.isFile()) return "other";
+  // Windows has no meaningful executable bit — `fs.lstat().mode` reports
+  // 0o666/0o444 for every file regardless — and Git for Windows runs any
+  // hook file it finds. Requiring an x-bit there would refuse to chain
+  // every foreign hook on Windows, so the check is POSIX-only; the
+  // failure it guards against (an `exec` that dies with "Permission
+  // denied") is likewise POSIX-only.
+  if (process.platform === "win32") return "executable-regular";
+  return (stats.mode & 0o111) !== 0 ? "executable-regular" : "nonexecutable-regular";
+}
+
+function foreignHookRefusalReason(fileName: ShieldHookFileName, hookPath: string, kind: HookFileKind): string {
+  const detail =
+    kind === "symlink"
+      ? "it is a symbolic link, and moving it aside would replace the link with a plain copy — silently breaking the arrangement it is part of"
+      : kind === "nonexecutable-regular"
+        ? "it is not executable, so Git never runs it — and chaining it would make Shield's own hook try to execute it on every operation, failing with a bare \"Permission denied\""
+        : "it is not a regular file (e.g. a directory, socket, or device), which Shield has no faithful way to preserve or run";
+  return `A ${fileName} hook already exists at ${hookPath} that Repo Identity Guard did not create, and Shield refused to chain it because ${detail}. Shield left it completely untouched and did not install its own ${fileName} hook here. Resolve it yourself (for a symlink: replace it with a regular executable script, or point core.hooksPath at a directory Shield can manage; for a non-executable file: make it executable or remove it), then run "Repair Shield".`;
+}
+
+/**
  * Writes `content` to `filePath` via a temp-file-then-rename in the same
  * directory, so a process interruption mid-write can never leave a
  * truncated/partial file at the final path — the rename is atomic on the
  * same filesystem, which a same-directory temp file guarantees.
  */
-async function writeFileAtomic(filePath: string, content: string, mode?: number): Promise<void> {
+async function writeFileAtomic(filePath: string, content: string | Buffer, mode?: number): Promise<void> {
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
   const tempPath = path.join(dir, `.${path.basename(filePath)}.tmp-${crypto.randomBytes(6).toString("hex")}`);
@@ -311,6 +433,16 @@ function normalizeAliasList(aliases: string[] | undefined): string {
 
 function normalizeOwnerRepo(value: string | undefined): string {
   return (value ?? "").trim().toLowerCase();
+}
+
+/** Byte-level ownership check — see {@link readBytesIfExists} for why nothing here decodes text it did not write. */
+function isOwnedBytes(bytes: Buffer): boolean {
+  return bytes.includes(SHIELD_ARTIFACT_MARKER);
+}
+
+/** Byte-level version extraction. `latin1` is a lossless byte↔char mapping, so an ASCII marker is found without any risk of mangling surrounding non-UTF-8 bytes. */
+function versionOfBytes(bytes: Buffer): number | undefined {
+  return extractShieldArtifactVersion(bytes.toString("latin1"));
 }
 
 export class ShieldManager {
@@ -345,6 +477,7 @@ export class ShieldManager {
           ownership: "absent" as ShieldArtifactOwnership,
           contentModified: false,
           hasChainedOriginal: false,
+          fileKind: "absent" as HookFileKind,
         })),
         policyPresent: false,
         policyValid: false,
@@ -354,36 +487,48 @@ export class ShieldManager {
         hooksPathCustomized: false,
         policyProfileDrift: false,
         pushDestinationDrift: false,
+        orphanedHookPaths: [],
+        gitVersionSupported: false,
       };
     }
 
     const policyPath = shieldPolicyFilePath(gitContext.gitCommonDir);
     const evaluatorPath = shieldEvaluatorScriptFilePath(gitContext.gitCommonDir);
 
-    const [policyRaw, evaluatorRaw, coreHooksPath, ...hookRaws] = await Promise.all([
+    const [policyRaw, evaluatorRaw, coreHooksPath, gitVersionRaw, ...hookRaws] = await Promise.all([
       readFileIfExists(policyPath),
-      readFileIfExists(evaluatorPath),
+      readBytesIfExists(evaluatorPath),
       getCoreHooksPathConfig(repoRoot),
-      ...HOOK_SPECS.map((spec) => readFileIfExists(path.join(gitContext.hooksDir, spec.fileName))),
+      getGitVersionRaw(repoRoot),
+      ...HOOK_SPECS.map((spec) => readBytesIfExists(path.join(gitContext.hooksDir, spec.fileName))),
     ]);
-    const chainedRaws = await Promise.all(
-      HOOK_SPECS.map((spec) => readFileIfExists(chainedOriginalPath(path.join(gitContext.hooksDir, spec.fileName)))),
-    );
+    const [chainedRaws, hookKinds] = await Promise.all([
+      Promise.all(
+        HOOK_SPECS.map((spec) => readBytesIfExists(chainedOriginalPath(path.join(gitContext.hooksDir, spec.fileName)))),
+      ),
+      Promise.all(HOOK_SPECS.map((spec) => classifyHookFile(path.join(gitContext.hooksDir, spec.fileName)))),
+    ]);
 
     const policyResult = policyRaw !== null ? parseShieldPolicy(policyRaw) : undefined;
-    const evaluatorOwned = evaluatorRaw !== null && isShieldOwnedArtifact(evaluatorRaw);
-    const evaluatorVersion = evaluatorOwned ? extractShieldArtifactVersion(evaluatorRaw as string) : undefined;
+    const evaluatorOwned = evaluatorRaw !== null && isOwnedBytes(evaluatorRaw);
+    const evaluatorVersion = evaluatorOwned ? versionOfBytes(evaluatorRaw as Buffer) : undefined;
     const evaluatorSource = options.evaluatorScriptSource
-      ? await readFileIfExists(options.evaluatorScriptSource).catch(() => null)
+      ? await readBytesIfExists(options.evaluatorScriptSource).catch(() => null)
       : null;
     const evaluatorModified =
-      evaluatorOwned && evaluatorSource !== null && evaluatorVersion === SHIELD_ARTIFACT_VERSION && evaluatorRaw !== evaluatorSource;
+      evaluatorOwned &&
+      evaluatorSource !== null &&
+      evaluatorVersion === SHIELD_ARTIFACT_VERSION &&
+      !(evaluatorRaw as Buffer).equals(evaluatorSource);
 
     const hooks: ShieldHookInspection[] = HOOK_SPECS.map((spec, i) => {
       const raw = hookRaws[i];
-      const ownership: ShieldArtifactOwnership = raw === null ? "absent" : isShieldOwnedArtifact(raw) ? "shield" : "foreign";
-      const version = ownership === "shield" ? extractShieldArtifactVersion(raw as string) : undefined;
-      const contentModified = ownership === "shield" && version === SHIELD_ARTIFACT_VERSION && raw !== spec.build();
+      const ownership: ShieldArtifactOwnership = raw === null ? "absent" : isOwnedBytes(raw) ? "shield" : "foreign";
+      const version = ownership === "shield" ? versionOfBytes(raw as Buffer) : undefined;
+      const contentModified =
+        ownership === "shield" &&
+        version === SHIELD_ARTIFACT_VERSION &&
+        !(raw as Buffer).equals(Buffer.from(spec.build(), "utf8"));
       return {
         fileName: spec.fileName,
         action: spec.action,
@@ -392,14 +537,28 @@ export class ShieldManager {
         version,
         contentModified,
         hasChainedOriginal: chainedRaws[i] !== null,
+        fileKind: hookKinds[i],
       };
     });
+
+    // Phase 8: never report ACTIVE on a Git that cannot run the hooks
+    // Shield claims to enforce — see src/shield/gitVersion.ts.
+    const gitVersionSupport = evaluateGitVersionSupport(gitVersionRaw);
+
+    // Shield-owned hooks left behind at a hooks directory Shield installed
+    // into earlier but that `core.hooksPath` has since moved away from.
+    // Read-only: every candidate is re-verified as Shield-owned right now,
+    // straight off disk — the record only says *where to look*.
+    const orphanedHookPaths = await this.findOrphanedShieldHookPaths(gitContext);
 
     const reasons: string[] = [];
     let state: ShieldLifecycleState;
 
     const anyShieldArtifactPresent =
-      policyRaw !== null || evaluatorRaw !== null || hooks.some((h) => h.ownership === "shield");
+      policyRaw !== null ||
+      evaluatorRaw !== null ||
+      hooks.some((h) => h.ownership === "shield") ||
+      orphanedHookPaths.length > 0;
 
     const foreignHooks = hooks.filter((h) => h.ownership === "foreign");
     // Only a hook whose action this policy actually governs matters for
@@ -455,12 +614,37 @@ export class ShieldManager {
       : "";
 
     if (!anyShieldArtifactPresent) {
+      // Shield genuinely isn't installed here. Report "off" even on an
+      // unsupported Git — nagging about a Git version for a feature the
+      // user never enabled would be noise, and `enable()` refuses (with
+      // the full explanation) at the moment it actually matters.
       state = "off";
+    } else if (!gitVersionSupport.supported) {
+      // Ahead of every other check: on a Git this old, the hooks either
+      // cannot run at all or cannot cover merge commits, so no amount of
+      // correct-looking on-disk state adds up to real enforcement.
+      state = "degraded";
+      reasons.push(gitVersionSupport.reason as string);
     } else if (foreignHooks.length > 0) {
       state = "degraded";
       for (const hook of foreignHooks) {
         reasons.push(
-          `A ${hook.fileName} hook already exists at ${hook.path} that Repo Identity Guard did not create. Shield will not overwrite or delete it — move it aside yourself, enable Shield with hook chaining, or run "Repair Shield" after resolving it.`,
+          hook.fileKind === "executable-regular"
+            ? `A ${hook.fileName} hook already exists at ${hook.path} that Repo Identity Guard did not create. Shield will not overwrite or delete it — move it aside yourself, enable Shield with hook chaining, or run "Repair Shield" after resolving it.`
+            : foreignHookRefusalReason(hook.fileName, hook.path, hook.fileKind),
+        );
+      }
+    } else if (orphanedHookPaths.length > 0) {
+      // Reported before the policy/evaluator checks: a hook Shield can no
+      // longer see (because core.hooksPath moved) but that would spring
+      // back to life the moment it moves back is the single most
+      // dangerous inconsistency Shield can be in, now that its hooks fail
+      // CLOSED. "Repair Shield" adopts them; "Disable Shield" removes
+      // them.
+      state = "degraded";
+      for (const orphan of orphanedHookPaths) {
+        reasons.push(
+          `A Shield-owned hook is still installed at ${orphan}, which is not the hooks directory Git currently uses${coreHooksPath ? ` ("core.hooksPath" is set to "${coreHooksPath}")` : ""}. It is inert right now, but would take effect again if that setting changed back. Run "Repair Shield" or "Disable Shield" — both clean up Shield's previous installation locations.`,
         );
       }
     } else if (!policyResult) {
@@ -536,7 +720,41 @@ export class ShieldManager {
       hooksPathCustomized,
       policyProfileDrift,
       pushDestinationDrift,
+      orphanedHookPaths,
+      gitVersionRaw: gitVersionRaw ?? undefined,
+      gitVersionSupported: gitVersionSupport.supported,
     };
+  }
+
+  /**
+   * Shield-owned hook files sitting in a hooks directory Shield's durable
+   * installation record names, but which is NOT the hooks directory Git
+   * resolves right now.
+   *
+   * Two invariants, both deliberate:
+   *  - the record is only ever a list of *places to look*; every path it
+   *    yields is re-read and re-verified as carrying Shield's ownership
+   *    marker before it is reported (and, in `disable()`/`enable()`,
+   *    before it is touched). A tampered record can point Shield at
+   *    `/etc`; it still cannot get Shield to delete anything there.
+   *  - a hooks directory that IS the current one is excluded, because
+   *    those hooks are inspected properly by the main path above and are
+   *    not orphans at all.
+   */
+  private async findOrphanedShieldHookPaths(gitContext: ShieldGitContext): Promise<string[]> {
+    const record = await readShieldInstallRecord(shieldInstallRecordFilePath(shieldStorageDir(gitContext.gitCommonDir)));
+    if (!record) return [];
+
+    const staleDirs = record.hookDirs.filter((dir) => !sameHookDir(dir, gitContext.hooksDir));
+    const found: string[] = [];
+    for (const dir of staleDirs) {
+      for (const spec of HOOK_SPECS) {
+        const hookPath = path.join(dir, spec.fileName);
+        const bytes = await readBytesIfExists(hookPath).catch(() => null);
+        if (bytes !== null && isOwnedBytes(bytes)) found.push(hookPath);
+      }
+    }
+    return found;
   }
 
   /**
@@ -573,10 +791,40 @@ export class ShieldManager {
     }
 
     const profile = resolution.matches[0];
+
+    // ---- canonical identity vs. approved push destination ----
+    //
+    // These are two DIFFERENT facts and Phase 8 found them conflated:
+    // `approvedPushDestination` was built from the `remote*` (origin
+    // fetch) facts, so every repository whose actual plain-push
+    // destination differs from origin's fetch URL had Shield approving
+    // the wrong place. That is not a rare shape — Git offers four
+    // separate ways to arrange it, all of which `getPushRemoteName` /
+    // `getPushUrl` already resolve correctly for the sidebar:
+    // `branch.<name>.pushRemote`, `remote.pushDefault`,
+    // `remote.<name>.pushurl`, and a `branch.<name>.remote` that isn't
+    // origin. In each, Shield would previously approve origin's owner/repo
+    // and then evaluate a real push that legitimately goes elsewhere —
+    // blocking correct pushes, and (in the mirror case) approving a
+    // destination nobody pushes to.
+    //
+    // - `approvedRepositoryKey` stays origin-based: it is the repository's
+    //   canonical IDENTITY, the same key `resolveProfiles`/`exactRepos`
+    //   match against, and origin is the right notion of "which repo is
+    //   this" even for a repo that pushes somewhere else.
+    // - `approvedPushDestination` is now built strictly from the
+    //   `pushRemote*` facts: the destination a plain `git push` would
+    //   ACTUALLY reach, which is the only thing pre-push evaluation
+    //   compares against.
+    //
+    // No fallback to origin when the push destination didn't resolve: an
+    // absent `approvedPushDestination` already fails closed at push time
+    // (see `destinationReasons`), and silently substituting origin here
+    // would reintroduce exactly the bug this fixes.
     const approvedRepositoryKey = canonicalRepoKey(facts.remoteHost, facts.remoteOwner, facts.remoteRepo);
     const approvedPushDestination =
-      facts.remoteOwner || facts.remoteHost || facts.remoteRepo
-        ? { host: facts.remoteHost, owner: facts.remoteOwner, repo: facts.remoteRepo }
+      facts.pushRemoteOwner || facts.pushRemoteHost || facts.pushRemoteRepo
+        ? { host: facts.pushRemoteHost, owner: facts.pushRemoteOwner, repo: facts.pushRemoteRepo }
         : undefined;
 
     const policy = buildShieldPolicy({
@@ -620,6 +868,25 @@ export class ShieldManager {
       throw new Error(`Cannot enable Shield: ${toMessage(error)}`);
     });
 
+    // Phase 8: refuse outright on a Git that cannot run the hooks Shield
+    // would install. Writing them anyway would produce artifacts that can
+    // only ever fail closed (or, worse, never fire) while Shield claims to
+    // be protecting the repository — see src/shield/gitVersion.ts.
+    const gitVersionSupport = evaluateGitVersionSupport(await getGitVersionRaw(repoRoot));
+    if (!gitVersionSupport.supported) {
+      const inspection = await this.inspect(repoRoot);
+      return {
+        ok: false,
+        inspection: {
+          ...inspection,
+          reasons: [
+            `${gitVersionSupport.reason as string} Shield was not installed; nothing on disk was changed.`,
+            ...inspection.reasons,
+          ],
+        },
+      };
+    }
+
     const built = this.buildPolicyForRepo(input);
     if ("error" in built) {
       const inspection = await this.inspect(repoRoot);
@@ -634,19 +901,41 @@ export class ShieldManager {
     // original) behind.
     type HookWrite =
       | { spec: HookSpec; hookPath: string; mode: "direct" }
-      | { spec: HookSpec; hookPath: string; mode: "chain"; originalContent: string; originalMode: number | undefined }
+      | { spec: HookSpec; hookPath: string; mode: "chain"; originalContent: Buffer; originalMode: number | undefined }
       | { spec: HookSpec; hookPath: string; mode: "skip" };
 
     const hookWrites: HookWrite[] = await Promise.all(
       HOOK_SPECS.map(async (spec): Promise<HookWrite> => {
         const hookPath = path.join(gitContext.hooksDir, spec.fileName);
-        const existing = await readFileIfExists(hookPath);
+        const kind = await classifyHookFile(hookPath);
+        const existing = kind === "absent" ? null : await readBytesIfExists(hookPath);
 
-        if (existing === null || isShieldOwnedArtifact(existing)) {
+        // A symlink or non-regular file at the hook path can never be
+        // Shield's own (Shield only ever writes plain regular files), so
+        // it is foreign by construction and must be left alone — reading
+        // through the link to check for a marker would be meaningless and
+        // overwriting it would follow the link to somewhere Shield does
+        // not own.
+        if (kind === "absent" || (kind === "executable-regular" && existing !== null && isOwnedBytes(existing))) {
+          return { spec, hookPath, mode: "direct" };
+        }
+        if (kind === "nonexecutable-regular" && existing !== null && isOwnedBytes(existing)) {
+          // Shield's own hook that lost its executable bit somehow — still
+          // Shield's, still safe to rewrite (with mode 0o755 restored).
           return { spec, hookPath, mode: "direct" };
         }
 
         if (!input.chainForeignHooks) {
+          return { spec, hookPath, mode: "skip" };
+        }
+
+        // Phase 8: only an executable REGULAR file can be chained
+        // faithfully — see `classifyHookFile`. A symlink, a
+        // non-executable file, or anything that isn't a regular file is
+        // left exactly as it is, with `inspect()` reporting a precise
+        // reason, rather than being converted into something Shield can
+        // handle.
+        if (kind !== "executable-regular" || existing === null) {
           return { spec, hookPath, mode: "skip" };
         }
 
@@ -657,8 +946,7 @@ export class ShieldManager {
         // whichever one is already there. Fail this hook's write closed
         // rather than guess which one the user meant to keep.
         const sidecarPath = chainedOriginalPath(hookPath);
-        const existingSidecar = await readFileIfExists(sidecarPath);
-        if (existingSidecar !== null) {
+        if ((await classifyHookFile(sidecarPath)) !== "absent") {
           return { spec, hookPath, mode: "skip" };
         }
 
@@ -671,7 +959,35 @@ export class ShieldManager {
     // wired hook, and rewriting them keeps Shield's recorded intent
     // current (matches ShieldPolicy's "intent, not cached status"
     // design) and self-heals a previously-corrupted copy of either.
-    const evaluatorScript = await fs.readFile(evaluatorScriptSource, "utf8");
+    const evaluatorScript = await fs.readFile(evaluatorScriptSource);
+
+    // Adopt any Shield-owned hooks stranded at a previous install location
+    // BEFORE installing here, so a repair genuinely consolidates rather
+    // than adding a third live copy. Same conservative ownership rule as
+    // `disable()`: a chained original is restored if one is waiting,
+    // otherwise the hook is simply removed; anything Shield cannot prove
+    // it owns is left completely alone.
+    const orphanCleanup = await this.cleanUpOrphanedInstallations(gitContext);
+
+    // Record where Shield is about to install BEFORE writing the hooks,
+    // never after. If the process dies mid-install, the record naming this
+    // directory is strictly better than no record: `disable()` then still
+    // knows to look here. The reverse order could leave a hook with no
+    // record pointing at it — the exact orphan this record exists to
+    // prevent.
+    const installRecordPath = shieldInstallRecordFilePath(shieldStorageDir(gitContext.gitCommonDir));
+    const previousRecord = await readShieldInstallRecord(installRecordPath);
+    const recordedDirs = normalizeHookDirs([
+      // Locations that could not be fully cleaned above stay on the list so
+      // a later disable/repair tries again; cleaned ones are dropped.
+      ...(previousRecord?.hookDirs ?? []).filter((dir) => orphanCleanup.stillPresentDirs.some((d) => sameHookDir(d, dir))),
+      gitContext.hooksDir,
+    ]);
+    // mkdir first: writeShieldInstallRecord is best-effort and must not be
+    // the thing that creates Shield's storage directory by luck.
+    await fs.mkdir(shieldStorageDir(gitContext.gitCommonDir), { recursive: true });
+    const recordWritten = await writeShieldInstallRecord(installRecordPath, recordedDirs, input.now ?? Date.now());
+
     await writeFileAtomic(policyPath, serializeShieldPolicy(built.policy));
     await writeFileAtomic(evaluatorPath, evaluatorScript, 0o755);
 
@@ -691,7 +1007,103 @@ export class ShieldManager {
     }
 
     const inspection = await this.inspect(repoRoot);
-    return { ok: inspection.state === "active", inspection };
+    const extraReasons = [
+      ...orphanCleanup.reasons,
+      ...(recordWritten
+        ? []
+        : [
+            `Shield could not write its installation record at ${installRecordPath}. Shield is installed and enforcing, but if "core.hooksPath" is changed before Shield is disabled, Disable Shield may not find these hooks to remove them — check that this directory is writable and run "Repair Shield".`,
+          ]),
+    ];
+    return {
+      ok: inspection.state === "active" && extraReasons.length === 0,
+      inspection: extraReasons.length === 0 ? inspection : { ...inspection, reasons: [...extraReasons, ...inspection.reasons] },
+    };
+  }
+
+  /**
+   * Removes/restores Shield-owned hooks left at hooks directories Shield
+   * previously installed into but that Git no longer resolves. Shared by
+   * `enable()`/`repair()` (which consolidates onto the current location)
+   * and `disable()` (which must reach every location or risk leaving a
+   * fail-closed hook behind with no evaluator — see `artifacts.ts`).
+   *
+   * Applies exactly the same conservative ownership rule as `disable()`
+   * at the current location: a path is only ever touched after its
+   * CURRENT content is re-read and proven to carry Shield's marker, and a
+   * chained original is restored over the hook rather than the hook
+   * simply being deleted. `stillPresentDirs` reports directories where
+   * something Shield-related remains (an unrestorable chained original,
+   * an I/O failure), so a caller can keep them on the record and try
+   * again later rather than forgetting they exist.
+   */
+  private async cleanUpOrphanedInstallations(
+    gitContext: ShieldGitContext,
+  ): Promise<{ reasons: string[]; stillPresentDirs: string[] }> {
+    const record = await readShieldInstallRecord(shieldInstallRecordFilePath(shieldStorageDir(gitContext.gitCommonDir)));
+    if (!record) return { reasons: [], stillPresentDirs: [] };
+
+    const reasons: string[] = [];
+    const stillPresentDirs: string[] = [];
+
+    for (const dir of record.hookDirs) {
+      if (sameHookDir(dir, gitContext.hooksDir)) continue;
+      let leftovers = false;
+      for (const spec of HOOK_SPECS) {
+        const hookPath = path.join(dir, spec.fileName);
+        try {
+          const outcome = await this.removeOwnedHook(hookPath);
+          if (outcome === "unresolved-chain") {
+            leftovers = true;
+            reasons.push(
+              `A chained original hook at ${chainedOriginalPath(hookPath)} (from a previous Shield installation location) could not be restored automatically because something other than Shield now occupies ${hookPath}. Resolve this manually — the original is preserved at that exact path.`,
+            );
+          }
+        } catch (error) {
+          leftovers = true;
+          reasons.push(
+            `Shield could not clean up its previously-installed hook at ${hookPath}: ${toMessage(error)}. That hook is inert while "core.hooksPath" points elsewhere, but should be removed by hand.`,
+          );
+        }
+      }
+      if (leftovers) stillPresentDirs.push(dir);
+    }
+
+    return { reasons, stillPresentDirs };
+  }
+
+  /**
+   * Removes one hook path if — and only if — its current content proves
+   * it is Shield's own, restoring a chained original over it when one is
+   * waiting. The single place this rule is implemented, so the current
+   * location and every recorded previous location are treated identically.
+   *
+   * Returns `"removed"`, `"restored"` (a chained original was folded
+   * back), `"absent"` (nothing of Shield's here), or `"unresolved-chain"`
+   * (a sidecar exists but the hook slot is no longer Shield's, so neither
+   * deleting nor overwriting would be safe).
+   */
+  private async removeOwnedHook(hookPath: string): Promise<"removed" | "restored" | "absent" | "unresolved-chain"> {
+    const sidecarPath = chainedOriginalPath(hookPath);
+    const hookKind = await classifyHookFile(hookPath);
+    // A symlink at the hook path is never Shield's own — Shield only ever
+    // writes regular files — so it is never removed, and following it to
+    // read a marker would be misleading.
+    const existingHook = hookKind === "executable-regular" || hookKind === "nonexecutable-regular" ? await readBytesIfExists(hookPath) : null;
+    const existingSidecar = await readBytesIfExists(sidecarPath).catch(() => null);
+
+    if (existingHook !== null && isOwnedBytes(existingHook)) {
+      if (existingSidecar !== null) {
+        const originalMode = await modeOf(sidecarPath);
+        await writeFileAtomic(hookPath, existingSidecar, originalMode);
+        await deleteIfExists(sidecarPath);
+        return "restored";
+      }
+      await deleteIfExists(hookPath);
+      return "removed";
+    }
+    if (existingSidecar !== null) return "unresolved-chain";
+    return "absent";
   }
 
   /** Same mechanics as `enable` — exposed separately so callers/commands can frame it as "repair" (re-sync an already-enabled Shield after a profile edit, an extension update, or a previously-blocking foreign hook being cleared) without implying a fresh first-time activation. */
@@ -723,52 +1135,76 @@ export class ShieldManager {
   async disable(repoRoot: string): Promise<ShieldInspection> {
     const gitContext = await this.resolveGitContext(repoRoot);
     const unresolvedChains: string[] = [];
+    const extraReasons: string[] = [];
+
+    // ============ ORDER MATTERS — hooks first, artifacts second ============
+    //
+    // Shield's hook shims fail CLOSED as of artifact v5: a hook that is
+    // installed but whose evaluator is missing blocks the operation and
+    // says "broken Shield installation". That is exactly right for
+    // tampering, and exactly wrong if a *legitimate, completed* disable
+    // could ever leave a hook behind after deleting the evaluator — the
+    // user would be permanently unable to commit or push, with no Shield
+    // left to repair or disable.
+    //
+    // So disable removes/disarms every hook it can prove it owns, at the
+    // current hooks directory AND at every hooks directory in Shield's
+    // durable installation record, strictly BEFORE deleting the evaluator,
+    // policy, and the record itself. If the process dies partway through,
+    // the state it dies in is always "some hooks removed, evaluator still
+    // present" — which enforces slightly more than intended (safe) rather
+    // than blocking everything (unsafe). Never the reverse.
+    //
+    // The installation record must therefore be read here, before it is
+    // deleted, and only deleted once every location it names has been
+    // handled.
+    const orphanCleanup = await this.cleanUpOrphanedInstallations(gitContext);
+    extraReasons.push(...orphanCleanup.reasons);
 
     for (const spec of HOOK_SPECS) {
       const hookPath = path.join(gitContext.hooksDir, spec.fileName);
-      const sidecarPath = chainedOriginalPath(hookPath);
-      const existingHook = await readFileIfExists(hookPath);
-      const existingSidecar = await readFileIfExists(sidecarPath);
-
-      if (existingHook !== null && isShieldOwnedArtifact(existingHook)) {
-        if (existingSidecar !== null) {
-          const originalMode = await modeOf(sidecarPath);
-          await writeFileAtomic(hookPath, existingSidecar, originalMode);
-          await deleteIfExists(sidecarPath);
-        } else {
-          await deleteIfExists(hookPath);
-        }
-      } else if (existingSidecar !== null) {
+      if ((await this.removeOwnedHook(hookPath)) === "unresolved-chain") {
         // Never restore over content that isn't Shield's own, and never
         // delete a sidecar we can't safely fold back — surfaced as a
         // diagnostic below instead.
-        unresolvedChains.push(sidecarPath);
+        unresolvedChains.push(chainedOriginalPath(hookPath));
       }
     }
 
+    // Only now — with every hook Shield owns gone — are the artifacts the
+    // hooks depend on removed.
     const storageDir = shieldStorageDir(gitContext.gitCommonDir);
     await deleteIfExists(shieldPolicyFilePath(gitContext.gitCommonDir));
     await deleteIfExists(shieldEvaluatorScriptFilePath(gitContext.gitCommonDir));
+    if (orphanCleanup.stillPresentDirs.length === 0) {
+      await deleteIfExists(shieldInstallRecordFilePath(storageDir));
+    } else {
+      // A location Shield could not finish cleaning stays recorded, so a
+      // later Disable/Repair still knows where to look. Deleting the
+      // record here would strand it permanently.
+      await writeShieldInstallRecord(
+        shieldInstallRecordFilePath(storageDir),
+        orphanCleanup.stillPresentDirs,
+        Date.now(),
+      );
+    }
     try {
       await fs.rmdir(storageDir);
     } catch {
-      // Non-empty (unexpected extra file) or already gone — never force-remove
-      // anything Shield didn't itself just delete above.
+      // Non-empty (unexpected extra file, or a retained install record) or
+      // already gone — never force-remove anything Shield didn't itself
+      // just delete above.
     }
 
     const inspection = await this.inspect(repoRoot);
-    if (unresolvedChains.length === 0) {
-      return inspection;
-    }
-    return {
-      ...inspection,
-      reasons: [
-        ...unresolvedChains.map(
-          (p) => `A chained original hook at ${p} could not be restored automatically because something other than Shield now occupies its hook slot. Resolve this manually — the original is preserved at that exact path.`,
-        ),
-        ...inspection.reasons,
-      ],
-    };
+    const reasons = [
+      ...extraReasons,
+      ...unresolvedChains.map(
+        (p) => `A chained original hook at ${p} could not be restored automatically because something other than Shield now occupies its hook slot. Resolve this manually — the original is preserved at that exact path.`,
+      ),
+      ...inspection.reasons,
+    ];
+    return reasons.length === inspection.reasons.length ? inspection : { ...inspection, reasons };
   }
 
   /** Convenience wrapper over `inspect()` for a quick "is Shield actually working here" answer (status bar, a health-check command) without the caller re-deriving it from `ShieldInspection.state` itself. */

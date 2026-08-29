@@ -61,6 +61,30 @@ export type GitHubAccountVerificationOutcome =
    * SSH client configuration.
    */
   | { kind: "identities-not-isolated" }
+  /**
+   * `ssh -G <alias>`'s *effective* route does not actually lead to a
+   * GitHub SSH endpoint (Phase 8 hardening).
+   *
+   * Without this check, "verified" rested entirely on a trusted alias
+   * name plus a greeting that merely *looked* like GitHub's. An alias is
+   * just a label in the user's own `~/.ssh/config`: nothing stops
+   * `Host github-work` from resolving to `HostName evil.example`, and
+   * nothing stops whatever answers there from replying `Hi octocat! You've
+   * successfully authenticated...`. That would have satisfied every
+   * pre-Phase-8 condition — trusted alias, `IdentitiesOnly yes`,
+   * GitHub-shaped greeting — and Shield would have reported the account
+   * verified. Resolving the alias to its real `HostName` first, and
+   * refusing to treat a non-GitHub endpoint's self-report as a GitHub
+   * account, closes that.
+   */
+  | { kind: "route-not-github"; hostname: string; port: string }
+  /**
+   * The effective route could not be resolved at all (`ssh -G` failed or
+   * produced no `hostname` line), so the probe cannot be shown to
+   * reproduce the route the real push would take. Never assumed to be
+   * fine.
+   */
+  | { kind: "route-unresolvable" }
   /** Output that doesn't match any recognized GitHub SSH response shape. Never guessed at — treated the same as any other unverifiable outcome. */
   | { kind: "malformed"; raw: string };
 
@@ -118,7 +142,78 @@ export function parseGitHubSshAuthOutput(output: string): GitHubAccountVerificat
  * it only inspects the effective config `ssh` itself would already use.
  */
 export function sshConfigHasIdentitiesOnly(sshDashGOutput: string): boolean {
-  return sshDashGOutput
-    .split(/\r?\n/)
-    .some((line) => line.trim().toLowerCase() === "identitiesonly yes");
+  return sshConfigValue(sshDashGOutput, "identitiesonly") === "yes";
+}
+
+/**
+ * The effective route `ssh` itself would use for an alias, as reported by
+ * `ssh -G [-p <port>] <user>@<alias>`.
+ *
+ * `ssh -G` prints the fully-resolved configuration — every `Host`/`Match`
+ * block already applied — as lowercase `keyword value` lines. That makes
+ * it the only local, read-only way to answer "where does this alias
+ * actually go?" without guessing at `~/.ssh/config` parsing rules
+ * (`Include`, `Match exec`, per-user vs system config, command-line
+ * overrides) that Shield has no business reimplementing.
+ */
+export interface SshEffectiveRoute {
+  /** The real host `ssh` will connect to — NOT the alias. Empty when `ssh -G` did not report one. */
+  hostname: string;
+  /** Effective port, as a string (`ssh -G` always prints one; "22" when nothing set it). */
+  port: string;
+  /** Effective login user for the SSH connection (`git` for a normal GitHub route). */
+  user: string;
+  /** Whether `IdentitiesOnly yes` is in effect for this route. */
+  identitiesOnly: boolean;
+}
+
+function sshConfigValue(sshDashGOutput: string, keyword: string): string | undefined {
+  for (const line of sshDashGOutput.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    const spaceAt = trimmed.search(/\s/);
+    if (spaceAt < 0) continue;
+    if (trimmed.slice(0, spaceAt).toLowerCase() !== keyword) continue;
+    return trimmed.slice(spaceAt + 1).trim().toLowerCase();
+  }
+  return undefined;
+}
+
+/**
+ * Parses `ssh -G`'s effective-configuration output. Purely textual and
+ * read-only: it never spawns `ssh`, never reads a key, and never writes
+ * SSH configuration. Returns `undefined` when the output carries no
+ * `hostname` line at all, which is what `ssh -G` failing (or being handed
+ * something it could not resolve) looks like — treated as "route
+ * unresolvable", never as a route that happens to be fine.
+ */
+export function parseSshEffectiveRoute(sshDashGOutput: string): SshEffectiveRoute | undefined {
+  const hostname = sshConfigValue(sshDashGOutput, "hostname");
+  if (!hostname) return undefined;
+  return {
+    hostname,
+    port: sshConfigValue(sshDashGOutput, "port") ?? "22",
+    user: sshConfigValue(sshDashGOutput, "user") ?? "",
+    identitiesOnly: sshConfigValue(sshDashGOutput, "identitiesonly") === "yes",
+  };
+}
+
+/**
+ * The hostnames GitHub's own SSH Git endpoint answers on. `ssh.github.com`
+ * is GitHub's documented port-443 alternative endpoint, and
+ * `<something>.github.com` covers the same family; anything else — an IP
+ * literal, a look-alike domain, a corporate proxy, a GitHub Enterprise
+ * Server install — is NOT github.com and therefore cannot be the source
+ * of a github.com account identity.
+ *
+ * Deliberately conservative rather than clever: `expectedGitHubLogin` is
+ * specifically a github.com username (see `Profile.expectedGitHubLogin`),
+ * so a route to a GitHub Enterprise Server host must read as unverified
+ * rather than have its usernames silently compared against github.com's
+ * namespace. Widening this would need an explicit, separate profile field
+ * naming the Enterprise host.
+ */
+export function isGitHubSshEndpoint(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/\.$/, "");
+  return host === "github.com" || host === "ssh.github.com" || host.endsWith(".github.com");
 }

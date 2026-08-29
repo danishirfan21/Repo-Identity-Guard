@@ -247,9 +247,23 @@ function approvedFacts(repo: Repo, overrides: Partial<RepoFacts> = {}): RepoFact
     isGitRepo: true,
     repoRoot: repo.dir,
     repoName: path.basename(repo.dir),
+    // Origin (fetch) facts -- these establish the repository's canonical
+    // IDENTITY (approvedRepositoryKey, profile matching).
     remoteHost: "github-work",
     remoteOwner: "AcmeSoftware",
     remoteRepo: "acme-frontend",
+    // Push facts -- as of Phase 8 these, and ONLY these, are what
+    // ShieldManager builds `approvedPushDestination` from (see
+    // buildPolicyForRepo). Set to the same values here because these
+    // tests describe the ordinary "origin is also the push destination"
+    // arrangement; the tests that deliberately separate the two override
+    // the pushRemote* fields explicitly.
+    pushRemoteName: "origin",
+    pushRemoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git",
+    pushRemoteProtocol: "ssh",
+    pushRemoteHost: "github-work",
+    pushRemoteOwner: "AcmeSoftware",
+    pushRemoteRepo: "acme-frontend",
     ...overrides,
   };
 }
