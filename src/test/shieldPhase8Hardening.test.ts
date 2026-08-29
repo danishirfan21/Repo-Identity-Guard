@@ -521,7 +521,12 @@ test("hooksPath drift: enable at A, move core.hooksPath to B, then DISABLE — S
     const dirB = path.join(repo.dir, "hooks-b");
     await fs.mkdir(dirB, { recursive: true });
     await git(repo, ["config", "core.hooksPath", dirB]);
-    assert.equal(path.resolve(await hooksDirFor(repo)), path.resolve(dirB));
+    // `git rev-parse --path-format=absolute` canonicalizes the path (it
+    // resolves the macOS /var -> /private/var symlink and Windows' 8.3
+    // short-name TEMP form), while `dirB` here is a plain JS-side string
+    // join off `repo.dir` that never went through that canonicalization.
+    // Compare like-for-like via realpath rather than raw string equality.
+    assert.equal(path.resolve(await hooksDirFor(repo)), await fs.realpath(dirB));
 
     // Health reports the orphan rather than a bare "hook is missing".
     const health = await manager.healthCheck(repo.dir, { evaluatorScriptSource: EVALUATOR_SOURCE });
