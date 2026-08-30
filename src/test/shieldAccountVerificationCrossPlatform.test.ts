@@ -175,14 +175,15 @@ function runInEvaluatorShell(fixture: Fixture, shellCommand: string, args: strin
     ...extraEnv,
     FAKE_SSH_POSIX_DIR: fixture.fakeSshBinPosix,
   };
-  return execFileAsync(
+  const command = execFileAsync(
     "sh",
     ["-c", `PATH="$FAKE_SSH_POSIX_DIR:$PATH"; export PATH; ${shellCommand}`, "shield-test-shell", ...args],
-    // Shield reads pre-push ref lines from stdin. `execFile` used to close
-    // that stream explicitly; with the promise API, ignore it so the
-    // evaluator receives the same immediate EOF instead of waiting forever.
-    { cwd: fixture.repoDir, encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: fixture.repoDir, encoding: "utf8", env },
   );
+  // Shield reads pre-push ref lines from stdin. The original callback
+  // launcher closed this stream explicitly; retain that immediate EOF.
+  command.child.stdin?.end("");
+  return command;
 }
 
 function evaluatePush(fixture: Fixture, extraEnv: NodeJS.ProcessEnv = {}, url = REMOTE_URL): Promise<Result> {
