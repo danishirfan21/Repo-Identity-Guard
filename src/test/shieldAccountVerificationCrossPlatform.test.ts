@@ -185,7 +185,10 @@ function runInEvaluatorShell(fixture: Fixture, shellCommand: string, args: strin
 function evaluatePush(fixture: Fixture, extraEnv: NodeJS.ProcessEnv = {}, url = REMOTE_URL): Promise<Result> {
   const launch = async (): Promise<{ stdout: string; stderr: string }> => {
     const scriptPath = await toGitForWindowsPath(SCRIPT_PATH, fixture.baseEnv);
-    return runInEvaluatorShell(fixture, 'exec "$SHIELD_SCRIPT" "$@"', ["push", "origin", url], { ...extraEnv, SHIELD_SCRIPT: scriptPath });
+    // Source the evaluator in the shell whose POSIX PATH the preflight just
+    // verified. Executing the file via its shebang starts a second MSYS
+    // process, which can reinterpret that PATH before `ssh` is resolved.
+    return runInEvaluatorShell(fixture, '. "$SHIELD_SCRIPT" "$@"', ["push", "origin", url], { ...extraEnv, SHIELD_SCRIPT: scriptPath });
   };
   return new Promise((resolve, reject) => {
     launch().then(({ stderr }) => {
