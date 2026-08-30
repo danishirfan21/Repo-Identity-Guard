@@ -1,3 +1,5 @@
+import type { ShieldInspection } from "../shield/manager";
+
 export type SafetyLevel = "safe" | "not_safe" | "not_checked";
 
 export type RemoteProtocol = "ssh" | "https" | "unknown";
@@ -261,6 +263,14 @@ export interface RepositorySafetyState {
   repoId: string;
   workspaceFolderName?: string;
   summary: StatusSummary;
+  /**
+   * Shield's own read-only inspection for THIS repo — independent of
+   * `summary.level`. Never inferred from SAFE/NOT SAFE: a repo can be SAFE
+   * with Shield off, or NOT SAFE with Shield active. `undefined` only when
+   * `summary.facts.isGitRepo` is false (nothing to inspect) or the scan
+   * failed before Shield could be inspected.
+   */
+  shieldInspection?: ShieldInspection;
 }
 
 /**

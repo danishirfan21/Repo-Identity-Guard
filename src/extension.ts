@@ -347,7 +347,23 @@ export function activate(context: vscode.ExtensionContext): void {
           isWorkspaceTrusted: vscode.workspace.isTrusted,
         });
 
-        byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary });
+        // Shield's own state, independent of the safety verdict above — read
+        // only, no writes, no network. Per-repo: a multi-root workspace never
+        // gets one workspace-wide Shield state (see docs/SHIELD_MODE.md and
+        // the FINAL Multi-Repository Workspace design).
+        const shieldInspection = await shieldManager
+          .inspect(facts.repoRoot, {
+            evaluatorScriptSource: shieldEvaluatorScriptSource,
+            currentProfiles: getProfiles(),
+            currentPushDestination: {
+              host: facts.pushRemoteHost,
+              owner: facts.pushRemoteOwner,
+              repo: facts.pushRemoteRepo,
+            },
+          })
+          .catch(() => undefined);
+
+        byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary, shieldInspection });
       } catch (error) {
         // Same guarantee for the synchronous half of the pipeline
         // (canonicalization, computeStatus): a bug evaluating one repo

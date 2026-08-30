@@ -210,6 +210,23 @@ export interface ShieldInspection {
   policyPresent: boolean;
   policyValid: boolean;
   policyProfileLabel?: string;
+  /**
+   * Display-only facts read straight off the valid, parsed policy —
+   * `undefined` whenever `policyValid` is `false` (there is nothing
+   * trustworthy to show). Added for the Shield UI's "Active" screen
+   * (approved repository/destination, trusted route, expected account),
+   * which needs data `inspect()` already parses internally but never
+   * returned. Never a private key, password, or token — only the same
+   * non-secret facts `ShieldPolicy` itself carries.
+   */
+  policySnapshot?: {
+    approvedRepositoryKey?: string;
+    approvedPushDestination?: { host?: string; owner?: string; repo?: string };
+    trustedSshHostAliases: string[];
+    expectedGitHubLogin?: string;
+    strictPushSetup: boolean;
+    enabledActions: string[];
+  };
   evaluatorPath?: string;
   evaluatorPresent: boolean;
   evaluatorOwned: boolean;
@@ -804,6 +821,16 @@ export class ShieldManager {
       policyPresent: policyRaw !== null,
       policyValid: policyResult?.ok ?? false,
       policyProfileLabel: policyResult?.ok ? policyResult.policy.profileLabel : undefined,
+      policySnapshot: policyResult?.ok
+        ? {
+            approvedRepositoryKey: policyResult.policy.approvedRepositoryKey,
+            approvedPushDestination: policyResult.policy.approvedPushDestination,
+            trustedSshHostAliases: policyResult.policy.trustedSshHostAliases,
+            expectedGitHubLogin: policyResult.policy.expectedGitHubLogin,
+            strictPushSetup: policyResult.policy.strictPushSetup,
+            enabledActions: policyResult.policy.enabledActions,
+          }
+        : undefined,
       evaluatorPath,
       evaluatorPresent: evaluatorRaw !== null,
       evaluatorOwned,
