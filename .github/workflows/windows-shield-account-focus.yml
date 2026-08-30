@@ -1,0 +1,20 @@
+name: Windows Shield Account Focus
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  shield-account-verification:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run compile
+      - run: node --test out/test/shieldAccountVerificationCrossPlatform.test.js
