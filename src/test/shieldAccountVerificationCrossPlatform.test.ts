@@ -178,7 +178,10 @@ function runInEvaluatorShell(fixture: Fixture, shellCommand: string, args: strin
   return execFileAsync(
     "sh",
     ["-c", `PATH="$FAKE_SSH_POSIX_DIR:$PATH"; export PATH; ${shellCommand}`, "shield-test-shell", ...args],
-    { cwd: fixture.repoDir, encoding: "utf8", env },
+    // Shield reads pre-push ref lines from stdin. `execFile` used to close
+    // that stream explicitly; with the promise API, ignore it so the
+    // evaluator receives the same immediate EOF instead of waiting forever.
+    { cwd: fixture.repoDir, encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] },
   );
 }
 
