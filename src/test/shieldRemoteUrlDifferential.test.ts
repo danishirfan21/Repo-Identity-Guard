@@ -182,7 +182,16 @@ const ROUTE_MUST_DIFFER: Array<[string, string, string]> = [
 
 // ==================== policies that make a decision reveal the parse ====================
 
-function destinationPolicy(owner: string, repo: string): ShieldPolicy {
+// `host` defaults to "github.com" for callers that don't care about it
+// (e.g. `routePolicy()` overrides `approvedPushDestination` itself). A
+// caller probing DESTINATION agreement for a specific URL must pass that
+// URL's own parsed host — the release-blocker fix requires the approved
+// and actual hosts to match too (literally, or canonically via "ssh -G",
+// which this differential suite never sets up), so leaving it fixed at
+// "github.com" would make every non-"github.com" URL in the corpus
+// disagree on HOST even when it agrees on owner/repo, which is not what
+// these tests are probing.
+function destinationPolicy(owner: string, repo: string, host = "github.com"): ShieldPolicy {
   return {
     policyVersion: 1,
     generatedAt: 1_700_000_000_000,
@@ -191,11 +200,12 @@ function destinationPolicy(owner: string, repo: string): ShieldPolicy {
     expectedGitName: undefined,
     expectedGitEmail: "work@example.com",
     approvedRepositoryKey: undefined,
-    approvedPushDestination: { host: "github.com", owner, repo },
+    approvedPushDestination: { host, owner, repo },
     trustedSshHostAliases: ["github-work"],
     expectedGitHubLogin: undefined,
     // Non-strict: the route is not a blocking factor here, so the ONLY
-    // thing that can block is the destination, i.e. the parsed owner/repo.
+    // thing that can block is the destination, i.e. the parsed owner/repo
+    // (and, as of the release-blocker fix, host).
     strictPushSetup: false,
     protectedBranches: [],
     expectedBranchPatterns: [],
@@ -214,11 +224,25 @@ function routePolicy(): ShieldPolicy {
   };
 }
 
-/** What the TypeScript reference says the decision should be, for the destination probe. */
-function referenceDestinationAllows(url: string, owner: string, repo: string): boolean {
+/**
+ * What the TypeScript reference says the decision should be, for the
+ * destination probe. `host` defaults to "github.com" to match
+ * `destinationPolicy`'s default; a caller that built its policy with a
+ * different host must pass the same one here, since (release-blocker fix)
+ * the approved and actual hosts must now match too — literally here, since
+ * this differential suite never sets up "ssh -G" resolution.
+ */
+function referenceDestinationAllows(url: string, owner: string, repo: string, host = "github.com"): boolean {
   const parsed = parseRemoteUrl(url);
   const norm = (v: string | undefined) => (v ?? "").trim().toLowerCase();
-  return norm(parsed.owner) === norm(owner) && !!parsed.owner && norm(parsed.repo) === norm(repo) && !!parsed.repo;
+  return (
+    norm(parsed.owner) === norm(owner) &&
+    !!parsed.owner &&
+    norm(parsed.repo) === norm(repo) &&
+    !!parsed.repo &&
+    norm(parsed.host) === norm(host) &&
+    !!parsed.host
+  );
 }
 
 /** What the TypeScript reference says the strict route reason should be. */
@@ -234,11 +258,15 @@ test("PART 9 — the shell evaluator and parseRemoteUrl() extract the same owner
   const repos = await createRepoPool(fuzzPoolSize());
   try {
     const failures = await mapWithRepos(repos, CORPUS, async (repo, testCase) => {
-      // Probe with the owner/repo the URL is BUILT from, so "allowed"
-      // means "both parsers extracted exactly acme/repo".
-      await writeRawPolicy(repo, serializeShieldPolicy(destinationPolicy("acme", "repo")));
+      // Probe with the owner/repo/host the URL is BUILT from, so "allowed"
+      // means "both parsers extracted exactly acme/repo" at that host —
+      // approving the URL's OWN host keeps this test isolated to
+      // owner/repo parsing agreement, independent of the release-blocker
+      // host-identity requirement (covered separately below).
+      const ownHost = parseRemoteUrl(testCase.url).host || "github.com";
+      await writeRawPolicy(repo, serializeShieldPolicy(destinationPolicy("acme", "repo", ownHost)));
       const shell = await runEvaluator(repo, ["push", "origin", testCase.url]);
-      const expected = referenceDestinationAllows(testCase.url, "acme", "repo");
+      const expected = referenceDestinationAllows(testCase.url, "acme", "repo", ownHost);
       if (shell.allowed !== expected) {
         return {
           url: testCase.url,
@@ -305,15 +333,20 @@ test("PART 9 — deliberately confusable URL pairs never resolve to the same app
       // would pass vacuously whenever neither matched.)
       const parsed = parseRemoteUrl(a);
       assert.ok(parsed.owner && parsed.repo, `fixture "${a}" must resolve to an owner and a repo`);
-      await writeRawPolicy(repo, serializeShieldPolicy(destinationPolicy(parsed.owner as string, parsed.repo as string)));
+      // Approve "a"'s own host too, so a merely different HOST (which the
+      // release-blocker fix also now enforces) can never be the reason "a"
+      // itself is refused — the pairs here are specifically about
+      // owner/repo confusability, not host.
+      const ownHost = parsed.host || "github.com";
+      await writeRawPolicy(repo, serializeShieldPolicy(destinationPolicy(parsed.owner as string, parsed.repo as string, ownHost)));
       return {
         a,
         b,
         why,
         first: await runEvaluator(repo, ["push", "origin", a]),
         second: await runEvaluator(repo, ["push", "origin", b]),
-        referenceFirst: referenceDestinationAllows(a, parsed.owner as string, parsed.repo as string),
-        referenceSecond: referenceDestinationAllows(b, parsed.owner as string, parsed.repo as string),
+        referenceFirst: referenceDestinationAllows(a, parsed.owner as string, parsed.repo as string, ownHost),
+        referenceSecond: referenceDestinationAllows(b, parsed.owner as string, parsed.repo as string, ownHost),
       };
     });
     for (const { a, b, why, first, second, referenceFirst, referenceSecond } of results) {
@@ -428,13 +461,15 @@ test("PART 9 — randomized URL sweep: shell and TypeScript agree on owner/repo 
   try {
     const failures = await mapWithRepos(repos, cases, async (repo, url) => {
       const parsed = parseRemoteUrl(url);
-      // Probe with exactly what TypeScript extracted; if the shell parser
-      // agrees the push is allowed, if it disagrees anywhere it blocks.
+      // Probe with exactly what TypeScript extracted (owner, repo, AND —
+      // release-blocker fix — host); if the shell parser agrees the push is
+      // allowed, if it disagrees anywhere it blocks.
       const owner = parsed.owner ?? "__none__";
       const repoName = parsed.repo ?? "__none__";
-      await writeRawPolicy(repo, serializeShieldPolicy(destinationPolicy(owner, repoName)));
+      const host = parsed.host || "github.com";
+      await writeRawPolicy(repo, serializeShieldPolicy(destinationPolicy(owner, repoName, host)));
       const shell = await runEvaluator(repo, ["push", "origin", url]);
-      const expected = !!parsed.owner && !!parsed.repo;
+      const expected = !!parsed.owner && !!parsed.repo && !!parsed.host;
       if (shell.allowed !== expected) {
         return { url, parsed, shellAllowed: shell.allowed, expected, stderr: shell.stderr.slice(0, 300) };
       }

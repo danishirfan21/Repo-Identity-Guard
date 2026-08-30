@@ -182,11 +182,19 @@ test("evaluateCommit reports every applicable reason at once, not just the first
 
 // ---------------- push ----------------
 
+// The default remote URL routes through the "github-work" alias, which the
+// real `ssh -G` (resources/shield/shield-evaluate.sh's
+// resolve_canonical_ssh_host) resolves to "github.com" in every scenario
+// these tests simulate — hence the default `resolvedHost`. A test that
+// wants to exercise an UNRESOLVABLE route (the release-blocker fix) passes
+// `resolvedHost: undefined` explicitly; see the "destination" section
+// below.
 function pushFacts(overrides: Partial<PushEvalFacts> = {}): PushEvalFacts {
   return {
     remoteName: "origin",
     remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git",
     sshCommandOverrides: [],
+    resolvedHost: "github.com",
     ...overrides,
   };
 }
@@ -250,6 +258,58 @@ test("evaluatePush fails closed with push-destination-mismatch when the policy n
   const decision = evaluatePush(policy({ approvedPushDestination: undefined }), pushFacts());
   assert.equal(decision.allowed, false);
   assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+});
+
+// ---------------- push: destination HOST identity (release-blocker regression) ----------------
+//
+// Reproduced against real main before this fix: owner/repo text matching
+// ALONE let a push to a completely different physical host through as
+// "destination confirmed" — with only the (non-blocking under
+// strictPushSetup: false) push_account check standing in the way. These
+// tests pin the fix: destination host identity is required regardless of
+// strictness, and is judged on a CANONICAL host, never a naive alias-string
+// comparison.
+
+test("evaluatePush: an unrelated host sharing the approved owner/repo text is a destination mismatch even when strictPushSetup is false", () => {
+  const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
+  const decision = evaluatePush(
+    policy({ profile: relaxedProfile }),
+    pushFacts({ remoteUrl: "git@evil.example:AcmeSoftware/acme-frontend.git", resolvedHost: undefined }),
+  );
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+});
+
+test("evaluatePush: the same unrelated-host attack is blocked over HTTPS too, where the host is unambiguous and needs no resolution", () => {
+  const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
+  const decision = evaluatePush(
+    policy({ profile: relaxedProfile }),
+    pushFacts({ remoteUrl: "https://evil.example/AcmeSoftware/acme-frontend.git", resolvedHost: undefined }),
+  );
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+});
+
+test("evaluatePush: an SSH alias whose route could not be canonically resolved is NOT assumed to match, even with matching owner/repo text", () => {
+  // No resolvedHost supplied at all -- simulates "ssh -G" being
+  // unavailable or unable to resolve the alias. Missing evidence must
+  // never be read as a match.
+  const decision = evaluatePush(policy({ profile: { ...workProfile, strictPushSetup: false } }), pushFacts({ resolvedHost: undefined }));
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+});
+
+test("evaluatePush: a trusted SSH alias that canonically resolves to the approved host matches the destination, regardless of the alias's literal name", () => {
+  const decision = evaluatePush(policy(), pushFacts({ remoteUrl: "git@some-other-alias-name:AcmeSoftware/acme-frontend.git", resolvedHost: "github.com" }));
+  assert.ok(!decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+});
+
+test("evaluatePush: a literal host match needs no resolution at all — an HTTPS push to the exact approved host is never a destination mismatch", () => {
+  const decision = evaluatePush(
+    policy({ profile: { ...workProfile, strictPushSetup: false } }),
+    pushFacts({ remoteUrl: "https://github.com/AcmeSoftware/acme-frontend.git", resolvedHost: undefined }),
+  );
+  assert.ok(!decision.reasons.some((r) => r.id === "push-destination-mismatch"));
 });
 
 test("evaluatePush never claims cryptographic account verification in any reason message", () => {

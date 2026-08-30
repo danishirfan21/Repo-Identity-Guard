@@ -9,6 +9,7 @@ import { evaluatePush, resolveSshCommandOverrides } from "../shield/evaluator";
 import { ShieldPolicy, buildShieldPolicy, serializeShieldPolicy } from "../shield/policy";
 import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
 import { Profile } from "../types";
+import { makeFakeSshBin, withFakeSshOnPath } from "./testUtil/fakeSsh";
 
 /**
  * PART 3 — does Shield verify the SAME SSH route `git push` will use?
@@ -117,10 +118,22 @@ function runPush(cwd: string, env: NodeJS.ProcessEnv, configArgs: string[] = [])
   });
 }
 
-const baseEnv = (): NodeJS.ProcessEnv => {
+// Memoized: the release-blocker destination-host-canonicalization fix
+// (resolve_canonical_ssh_host in resources/shield/shield-evaluate.sh) now
+// calls "ssh -G" unconditionally for every ssh-protocol push (not only
+// Phase 5 account verification), so these tests need a real `ssh` on PATH
+// to resolve TRUSTED_URL's "github-work" alias to the approved
+// "github.com" host — a fake shim stands in for a real ~/.ssh/config alias.
+let fakeSshBinPromise: Promise<string> | undefined;
+function fakeSshBin(): Promise<string> {
+  if (!fakeSshBinPromise) fakeSshBinPromise = makeFakeSshBin();
+  return fakeSshBinPromise;
+}
+
+const baseEnv = async (): Promise<NodeJS.ProcessEnv> => {
   const env = { ...process.env };
   for (const key of ["GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_CONFIG_PARAMETERS"]) delete env[key];
-  return env;
+  return withFakeSshOnPath(env, await fakeSshBin());
 };
 
 async function cleanup(dir: string): Promise<void> {
@@ -135,20 +148,27 @@ for (const variant of ["plink", "tortoiseplink", "putty", "simple"]) {
     try {
       // Without the variant, this exact push is allowed: the alias is
       // trusted and there is no expectedGitHubLogin to verify.
-      const allowed = await runPush(repo, baseEnv());
+      const allowed = await runPush(repo, (await baseEnv()));
       assert.equal(allowed.code, 0, allowed.stderr);
 
-      const blocked = await runPush(repo, baseEnv(), [`ssh.variant=${variant}`]);
+      const blocked = await runPush(repo, (await baseEnv()), [`ssh.variant=${variant}`]);
       assert.notEqual(blocked.code, 0);
       assert.match(blocked.stderr, /push-route-override/);
       assert.match(blocked.stderr, new RegExp(`ssh\\.variant=${variant}`));
+      // Release-blocker fix: the override also makes the aliased route's
+      // destination unprovable (canonicalizing "github-work" -> "github.com"
+      // via "ssh -G" can no longer be trusted), so a destination-mismatch
+      // reason now accompanies push-route-override — proven independently
+      // in the dedicated release-blocker test below.
+      assert.match(blocked.stderr, /push-destination-mismatch/);
 
       // The TypeScript reference reaches the same decision from the same facts.
       const overrides = resolveSshCommandOverrides({ sshVariantConfig: variant });
       assert.deepEqual(overrides, [`ssh.variant=${variant}`]);
       const decision = evaluatePush(policy(), { remoteName: "origin", remoteUrl: TRUSTED_URL, sshCommandOverrides: overrides });
       assert.equal(decision.allowed, false);
-      assert.equal(decision.reasons[0].id, "push-route-override");
+      assert.ok(decision.reasons.some((r) => r.id === "push-route-override"));
+      assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
     } finally {
       await cleanup(repo);
     }
@@ -158,7 +178,7 @@ for (const variant of ["plink", "tortoiseplink", "putty", "simple"]) {
 test("PART 3 — GIT_SSH_VARIANT (environment form) is detected too, and is what the hook actually inherits", async () => {
   const repo = await makeRepo();
   try {
-    const env = { ...baseEnv(), GIT_SSH_VARIANT: "tortoiseplink" };
+    const env = { ...(await baseEnv()), GIT_SSH_VARIANT: "tortoiseplink" };
     const result = await runPush(repo, env);
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /push-route-override/);
@@ -177,7 +197,7 @@ for (const variant of ["auto", "ssh", "AUTO", "SSH"]) {
   test(`PART 3 — ssh.variant=${variant} asserts OpenSSH semantics and must NOT block (no over-blocking)`, async () => {
     const repo = await makeRepo();
     try {
-      const result = await runPush(repo, baseEnv(), [`ssh.variant=${variant}`]);
+      const result = await runPush(repo, (await baseEnv()), [`ssh.variant=${variant}`]);
       assert.equal(result.code, 0, result.stderr);
       assert.deepEqual(resolveSshCommandOverrides({ sshVariantConfig: variant }), []);
     } finally {
@@ -189,7 +209,7 @@ for (const variant of ["auto", "ssh", "AUTO", "SSH"]) {
 test("PART 3 — GIT_SSH_VARIANT takes precedence over ssh.variant, so an env value of 'ssh' cancels a plink config", async () => {
   const repo = await makeRepo();
   try {
-    const env = { ...baseEnv(), GIT_SSH_VARIANT: "ssh" };
+    const env = { ...(await baseEnv()), GIT_SSH_VARIANT: "ssh" };
     const result = await runPush(repo, env, ["ssh.variant=plink"]);
     assert.equal(result.code, 0, result.stderr);
     assert.deepEqual(resolveSshCommandOverrides({ gitSshVariant: "ssh", sshVariantConfig: "plink" }), []);
@@ -201,7 +221,7 @@ test("PART 3 — GIT_SSH_VARIANT takes precedence over ssh.variant, so an env va
 test("PART 3 — the reverse also holds: GIT_SSH_VARIANT=plink is a divergence even when ssh.variant=ssh in config", async () => {
   const repo = await makeRepo();
   try {
-    const env = { ...baseEnv(), GIT_SSH_VARIANT: "plink" };
+    const env = { ...(await baseEnv()), GIT_SSH_VARIANT: "plink" };
     const result = await runPush(repo, env, ["ssh.variant=ssh"]);
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /GIT_SSH_VARIANT=plink/);
@@ -222,11 +242,11 @@ test("PART 3 — the three command overrides still block, and the variant check 
       ["GIT_SSH", "/usr/bin/ssh"],
       ["GIT_SSH_COMMAND", "ssh -v"],
     ] as const) {
-      const result = await runPush(repo, { ...baseEnv(), [key]: value });
+      const result = await runPush(repo, { ...(await baseEnv()), [key]: value });
       assert.notEqual(result.code, 0, `${key} did not block`);
       assert.match(result.stderr, new RegExp(key));
     }
-    const viaConfig = await runPush(repo, baseEnv(), ["core.sshCommand=ssh -v"]);
+    const viaConfig = await runPush(repo, (await baseEnv()), ["core.sshCommand=ssh -v"]);
     assert.notEqual(viaConfig.code, 0);
     assert.match(viaConfig.stderr, /core\.sshCommand/);
   } finally {
@@ -237,7 +257,7 @@ test("PART 3 — the three command overrides still block, and the variant check 
 test("PART 3 — all four override families at once are reported together, in the same order as the TypeScript reference", async () => {
   const repo = await makeRepo();
   try {
-    const env = { ...baseEnv(), GIT_SSH: "/usr/bin/ssh", GIT_SSH_COMMAND: "ssh -v", GIT_SSH_VARIANT: "plink" };
+    const env = { ...(await baseEnv()), GIT_SSH: "/usr/bin/ssh", GIT_SSH_COMMAND: "ssh -v", GIT_SSH_VARIANT: "plink" };
     const result = await runPush(repo, env, ["core.sshCommand=ssh -q"]);
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /GIT_SSH, GIT_SSH_COMMAND, core\.sshCommand, GIT_SSH_VARIANT=plink/);
@@ -256,8 +276,49 @@ test("PART 3 — all four override families at once are reported together, in th
   }
 });
 
-test("PART 3 — a non-strict profile is unaffected by any transport override (strictness gating is unchanged)", async () => {
+test("PART 3 — a non-strict profile is unaffected by any transport override, for ROUTE/ACCOUNT trust specifically (strictness gating is unchanged)", async () => {
   const repo = await fs.mkdtemp(path.join(os.tmpdir(), "shield-ssh-variant-lax-"));
+  try {
+    await execFileAsync("git", ["init", "-q"], { cwd: repo });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo });
+    const commonDir = stdout.trim();
+    await fs.mkdir(shieldStorageDir(commonDir), { recursive: true });
+    await fs.writeFile(
+      shieldPolicyFilePath(commonDir),
+      serializeShieldPolicy(
+        buildShieldPolicy({
+          profile: { ...strictProfile, strictPushSetup: false },
+          // A LITERAL host match ("github-work", the alias TRUSTED_URL
+          // itself uses) so this test isolates strictness gating for
+          // ROUTE/ACCOUNT trust from the separate (and correctly
+          // strictness-INDEPENDENT — see the release-blocker fix)
+          // destination-host-canonicalization question: with a transport
+          // override in effect, the alias's host can no longer be
+          // canonicalized at all, which must fail closed on destination
+          // regardless of strictness. That is proven by the next test.
+          approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend" },
+          protectedBranches: ["main"],
+          enabledActions: ["commit", "push"],
+          now: 1,
+        }),
+      ),
+    );
+    const result = await runPush(repo, { ...(await baseEnv()), GIT_SSH_VARIANT: "plink" });
+    assert.equal(result.code, 0, result.stderr);
+  } finally {
+    await cleanup(repo);
+  }
+});
+
+test("PART 3 — release-blocker fix: a transport override makes an ALIASED route's destination unprovable too, and blocks regardless of strictPushSetup", async () => {
+  // Same TRUSTED_URL/repo as the rest of this file: approvedPushDestination
+  // names "github.com", but TRUSTED_URL's literal host is the "github-work"
+  // alias -- ordinarily reconciled by canonicalizing the alias via "ssh -G"
+  // (see resolve_canonical_ssh_host). A transport override makes that
+  // resolution untrustworthy (a different program may actually speak SSH),
+  // so the destination itself becomes unprovable -- and per this fix, that
+  // fails closed independent of strictPushSetup, unlike route/account trust.
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), "shield-ssh-variant-lax-dest-"));
   try {
     await execFileAsync("git", ["init", "-q"], { cwd: repo });
     const { stdout } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo });
@@ -275,8 +336,9 @@ test("PART 3 — a non-strict profile is unaffected by any transport override (s
         }),
       ),
     );
-    const result = await runPush(repo, { ...baseEnv(), GIT_SSH_VARIANT: "plink" });
-    assert.equal(result.code, 0, result.stderr);
+    const result = await runPush(repo, { ...(await baseEnv()), GIT_SSH_VARIANT: "plink" });
+    assert.notEqual(result.code, 0, "a transport override must make an unresolved alias's destination fail closed");
+    assert.match(result.stderr, /push-destination-mismatch/);
   } finally {
     await cleanup(repo);
   }
@@ -288,7 +350,7 @@ test("PART 3 — Shield never executes the VALUE of a transport override to insp
   try {
     // If anything ever tried to run GIT_SSH_COMMAND to "see what it does",
     // this file would appear. Detection is presence-only, forever.
-    const result = await runPush(repo, { ...baseEnv(), GIT_SSH_COMMAND: `touch ${marker}` });
+    const result = await runPush(repo, { ...(await baseEnv()), GIT_SSH_COMMAND: `touch ${marker}` });
     assert.notEqual(result.code, 0);
     assert.equal(await fs.readFile(marker).catch(() => null), null);
   } finally {

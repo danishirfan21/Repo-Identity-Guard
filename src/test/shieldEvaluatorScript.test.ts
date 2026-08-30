@@ -9,6 +9,7 @@ import { evaluateCommit, evaluatePush } from "../shield/evaluator";
 import { ShieldPolicy, buildShieldPolicy, serializeShieldPolicy } from "../shield/policy";
 import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
 import { Profile } from "../types";
+import { makeFakeSshBin, withFakeSshOnPath } from "./testUtil/fakeSsh";
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
@@ -299,9 +300,16 @@ test("Shield's policy is found identically from a linked worktree, end-to-end th
 
 test("push through the trusted SSH alias to the approved owner -> exit 0", async () => {
   const repo = await makeTempRepo();
+  const fakeSshBin = await makeFakeSshBin();
   try {
     await writePolicy(repo, defaultPolicy());
-    const result = await runScript(repo, ["push", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"], "");
+    // The destination check now canonicalizes the alias's route via a real
+    // "ssh -G" call (see resources/shield/shield-evaluate.sh's
+    // resolve_canonical_ssh_host) — a fake ssh answering "github.com" for
+    // any "-G" query (the shim's default) stands in for a real
+    // ~/.ssh/config "Host github-work \ HostName github.com" alias.
+    const env = withFakeSshOnPath(process.env, fakeSshBin);
+    const result = await runScript(repo, ["push", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"], "", env);
     assert.equal(result.code, 0, result.stderr);
   } finally {
     await cleanup(repo);
@@ -310,9 +318,11 @@ test("push through the trusted SSH alias to the approved owner -> exit 0", async
 
 test("push to a different owner than approved -> blocked with push-destination-mismatch, matching the TS evaluator", async () => {
   const repo = await makeTempRepo();
+  const fakeSshBin = await makeFakeSshBin();
   try {
     await writePolicy(repo, defaultPolicy());
-    const result = await runScript(repo, ["push", "origin", "git@github-work:SomeoneElse/other-repo.git"], "");
+    const env = withFakeSshOnPath(process.env, fakeSshBin);
+    const result = await runScript(repo, ["push", "origin", "git@github-work:SomeoneElse/other-repo.git"], "", env);
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /push-destination-mismatch/);
 

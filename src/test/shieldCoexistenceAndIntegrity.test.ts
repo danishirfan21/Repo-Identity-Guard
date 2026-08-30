@@ -344,7 +344,18 @@ test("a chained pre-push hook receives the same argv AND the same stdin ref line
     // route/destination enforcement, already covered elsewhere).
     await enableShield(manager, repo, {
       chainForeignHooks: true,
-      facts: { remoteHost: "github-work", remoteOwner: "AcmeSoftware", remoteRepo: "acme-frontend" },
+      // pushRemoteHost matches the literal alias the push below uses, so
+      // the destination check's host equality is satisfied literally and
+      // never needs to canonicalize via "ssh -G" -- this fixture's fake
+      // ssh only implements the git-transport passthrough, not "-G"/"-T".
+      facts: {
+        remoteHost: "github-work",
+        remoteOwner: "AcmeSoftware",
+        remoteRepo: "acme-frontend",
+        pushRemoteHost: "github-work",
+        pushRemoteOwner: "AcmeSoftware",
+        pushRemoteRepo: "acme-frontend",
+      },
     });
 
     await git(repo, ["remote", "add", "origin", `git@github-work:${bareDir}`]);

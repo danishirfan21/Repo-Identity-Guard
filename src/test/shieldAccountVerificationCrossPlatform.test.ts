@@ -259,7 +259,7 @@ test("PART 3/xplat — the login match is case-insensitive, exactly as the TypeS
   }
 });
 
-const UNVERIFIABLE: Array<[string, NodeJS.ProcessEnv, RegExp]> = [
+const UNVERIFIABLE: Array<[string, NodeJS.ProcessEnv, RegExp, string[]?]> = [
   [
     "a deploy-key-style identity can never be confirmed against a personal login",
     { FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED("AcmeSoftware/acme-frontend") },
@@ -304,16 +304,22 @@ const UNVERIFIABLE: Array<[string, NodeJS.ProcessEnv, RegExp]> = [
     "`ssh -G` reports no hostname at all — never assumed to be fine",
     { FAKE_SSH_G_FAIL: "1", FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED("danish-work") },
     /could not resolve this SSH route/,
+    // Release-blocker fix: an unresolvable "ssh -G" also makes the
+    // DESTINATION's canonical host unprovable (the same alias, the same
+    // "ssh -G" call), so push-destination-mismatch now accompanies
+    // push-account-unverified — proven independently in
+    // shieldEvaluator.test.ts's "canonically resolved" tests.
+    ["push-destination-mismatch", "push-account-unverified"],
   ],
 ];
 
-for (const [label, env, expectedMessage] of UNVERIFIABLE) {
+for (const [label, env, expectedMessage, expectedReasonIds] of UNVERIFIABLE) {
   test(`PART 3/xplat — UNVERIFIED and blocked: ${label}`, async () => {
     const fixture = await setUp();
     try {
       const result = await evaluatePush(fixture, env);
       assert.notEqual(result.code, 0, result.stderr);
-      assert.deepEqual(result.reasonIds, ["push-account-unverified"]);
+      assert.deepEqual(result.reasonIds, expectedReasonIds ?? ["push-account-unverified"]);
       assert.match(result.stderr, expectedMessage);
     } finally {
       await cleanup(fixture);
@@ -393,7 +399,12 @@ test("PART 3/xplat — an SSH transport override short-circuits verification ent
         FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED("danish-work"),
       });
       assert.notEqual(result.code, 0, JSON.stringify(override));
-      assert.deepEqual(result.reasonIds, ["push-route-override"], JSON.stringify(override));
+      // Release-blocker fix: the override also makes the aliased route's
+      // canonical destination host unprovable (see
+      // shieldSshTransportEquivalence.test.ts's dedicated release-blocker
+      // test), so push-destination-mismatch now accompanies
+      // push-route-override.
+      assert.deepEqual(result.reasonIds, ["push-destination-mismatch", "push-route-override"], JSON.stringify(override));
       assert.equal(
         await fs.readFile(probeLog, "utf8").catch(() => null),
         null,

@@ -243,6 +243,29 @@ export interface PushEvalFacts {
    * at hook time; this module only decides what a given outcome means.
    */
   githubAccountCheck?: GitHubAccountVerificationOutcome;
+
+  /**
+   * The CURRENT push route's CANONICAL host, when it could be safely
+   * resolved outside this pure module — mirrors
+   * `resources/shield/shield-evaluate.sh`'s `resolve_canonical_ssh_host`:
+   * `ssh -G` only (purely local: reads `~/.ssh/config`, makes no network
+   * connection, never executes `GIT_SSH_COMMAND`/`core.sshCommand`). Only
+   * needed when the push URL's literal host does not already equal the
+   * approved destination's host — a literal match needs no resolution at
+   * all (see `destinationReasons`).
+   *
+   * `undefined` means resolution was not attempted or was not possible
+   * (no `ssh` available, an SSH transport override was in effect, or the
+   * protocol isn't ssh) — and is treated as "destination host unprovable",
+   * which fails closed exactly like every other missing-evidence case in
+   * this module. This is the release-blocker fix (see docs/SHIELD_MODE.md):
+   * before it, `destinationReasons` matched on owner/repo ALONE, so a push
+   * to an entirely different host (`evil.example`) sharing the approved
+   * owner/repo text by coincidence — or by attacker choice — was reported
+   * "destination confirmed," with only the (non-blocking under a relaxed
+   * profile) push_account check standing between it and an allowed push.
+   */
+  resolvedHost?: string;
 }
 
 /**
@@ -298,17 +321,36 @@ export function resolveSshCommandOverrides(env: SshTransportEnvironment): string
 }
 
 /**
- * Destination matching is deliberately OWNER-based, not host-based —
- * mirroring checkPushDestination in statusEngine.ts exactly. A push
- * through a trusted SSH alias (e.g. "github-work") has a literally
- * different hostname than the repo's canonical remote host ("github.com")
- * despite going to the exact same account; comparing hosts here would
- * falsely flag every alias-based push as a destination mismatch, which is
- * precisely the case `trustedSshHostAliases` exists to allow. `host` is
- * still recorded on the policy (useful context, and future exact-repo-key
- * matching), but is never part of this equality check.
+ * Owner/repo matching is deliberately kept — a push through a trusted SSH
+ * alias (e.g. "github-work") has a literally different hostname than the
+ * repo's canonical remote host ("github.com") despite going to the exact
+ * same account, and requiring a LITERAL host match here would falsely flag
+ * every alias-based push as a destination mismatch, which is precisely the
+ * case `trustedSshHostAliases` exists to allow.
+ *
+ * But owner/repo text alone is never sufficient (this was the release
+ * blocker fixed here — see `PushEvalFacts.resolvedHost`'s doc comment):
+ * `evil.example/acme/backend` must never be treated as the same
+ * destination as an approved `github.com/acme/backend` merely because the
+ * owner/repo path happens to match. So host identity is ALSO required,
+ * judged on a CANONICAL host — a literal match needs no resolution, and an
+ * alias is accepted only once it has actually been resolved (via `ssh -G`,
+ * never by trusting the alias's NAME) to the same host the approved
+ * destination names. Missing/unprovable host evidence is never treated as
+ * a match — it fails closed, exactly like the owner/repo rules below.
+ *
+ * This canonical-host requirement holds regardless of `strictPushSetup`:
+ * it answers "is this the physical place Shield approved?", not "can the
+ * authenticating account be trusted?" (that's `routeReasons`/`accountReasons`,
+ * which strictness legitimately gates).
  */
-function destinationReasons(policy: ShieldPolicy, owner: string | undefined, repo: string | undefined): ShieldReason[] {
+function destinationReasons(
+  policy: ShieldPolicy,
+  owner: string | undefined,
+  repo: string | undefined,
+  host: string | undefined,
+  resolvedHost: string | undefined,
+): ShieldReason[] {
   const approved = policy.approvedPushDestination;
   // Fail closed, per docs/SHIELD_MODE.md "Phase 4": if Shield never
   // resolved an approved destination for this repository (e.g. no remote
@@ -340,13 +382,25 @@ function destinationReasons(policy: ShieldPolicy, owner: string | undefined, rep
   // at push time.
   const ownerMatches = !!owner && normalize(approved.owner) === normalize(owner);
   const repoMatches = !approved.repo || (!!repo && normalize(approved.repo) === normalize(repo));
-  if (ownerMatches && repoMatches) {
+
+  // Host identity — the release-blocker fix. A literal match never needs
+  // resolution (covers the common unchanged-remote case, and every HTTPS
+  // push, whose host is unambiguous). Otherwise the CURRENT route's host
+  // must have been independently resolved (by the caller, outside this
+  // pure module) to the SAME host the approval names — never assumed from
+  // an alias's name alone.
+  const normalizedApprovedHost = approved.host ? normalize(approved.host) : undefined;
+  const literalHostMatches = !!normalizedApprovedHost && !!host && normalize(host) === normalizedApprovedHost;
+  const canonicalHostMatches = !!normalizedApprovedHost && !!resolvedHost && normalize(resolvedHost) === normalizedApprovedHost;
+  const hostMatches = literalHostMatches || canonicalHostMatches;
+
+  if (ownerMatches && repoMatches && hostMatches) {
     return [];
   }
   return [
     {
       id: "push-destination-mismatch",
-      message: `Profile: ${policy.profileLabel}\nExpected approved destination: ${approved.host ?? "(unknown host)"}:${approved.owner}${approved.repo ? `/${approved.repo}` : ""}\nReason: Push destination changed since Shield approval (this push would go to ${owner ?? "an unknown owner"}${repo ? `/${repo}` : ""}).`,
+      message: `Profile: ${policy.profileLabel}\nExpected approved destination: ${approved.host ?? "(unknown host)"}:${approved.owner}${approved.repo ? `/${approved.repo}` : ""}\nReason: Push destination changed since Shield approval (this push would go to ${host ?? "an unknown host"}:${owner ?? "an unknown owner"}${repo ? `/${repo}` : ""}).`,
       capability: "push_destination",
     },
   ];
@@ -477,7 +531,7 @@ export function evaluatePush(policy: ShieldPolicy, facts: PushEvalFacts, now: nu
   }
 
   const parsed = parseRemoteUrl(facts.remoteUrl);
-  const reasons = destinationReasons(policy, parsed.owner, parsed.repo);
+  const reasons = destinationReasons(policy, parsed.owner, parsed.repo, parsed.host, facts.resolvedHost);
   const route = routeReasons(policy, parsed.protocol, parsed.host, facts.sshCommandOverrides);
   // routeReasons returns [] in exactly one case: an ssh protocol, no
   // overrides, host matched against a trusted alias — i.e. an empty

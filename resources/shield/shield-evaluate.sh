@@ -457,7 +457,7 @@ EXPECTED_NAME=$(policy_scalar .expectedGitName)
 PROFILE_LABEL=$(policy_scalar .profileLabel)
 STRICT_PUSH=$(policy_scalar .strictPushSetup)
 
-if ! policy_array .enabledActions | grep -qx "$ACTION"; then
+if ! policy_array .enabledActions | grep -qxF "$ACTION"; then
   # This policy does not govern this action at all -- never block it.
   # Reaching here now means enabledActions was verified to be a
   # well-formed array of strings that genuinely does not list this action,
@@ -532,7 +532,7 @@ Found: $WHO"
     add_reason detached-head "HEAD is detached. Commits made here aren't tracked by any branch and are easy to lose."
   else
     LOWER_BRANCH=$(lower "$BRANCH")
-    if policy_array .protectedBranches | while IFS= read -r b; do lower "$b"; done | grep -qx "$LOWER_BRANCH"; then
+    if policy_array .protectedBranches | while IFS= read -r b; do lower "$b"; done | grep -qxF "$LOWER_BRANCH"; then
       add_reason protected-branch "\"$BRANCH\" is locally protected. Committing directly on it is not allowed by this policy."
     fi
     # Branch-pattern mismatch (expectedBranchPatterns) is intentionally NOT
@@ -563,6 +563,35 @@ Found: $WHO"
   fi
   # Ordinary uncommitted changes alone (no conflicts, no in-progress
   # operation) are deliberately never checked here — must never block.
+}
+
+# ==================== push: canonical SSH host resolution (release-blocker fix) ====================
+#
+# Resolves the EFFECTIVE hostname `ssh -G <user>@<host>` reports for a given
+# host/alias -- purely local (reads the effective client SSH configuration,
+# makes no network connection, reads no key material, writes nothing).
+# Never falls back to trusting the input string itself as evidence: when
+# `ssh` isn't available, or produces no answer, the caller gets an empty
+# result and must treat that as "unresolved" (fail closed), exactly like
+# `verify_github_account`'s identical resolution below.
+#
+# Used by `evaluate_push`'s destination check to decide whether a push
+# through an SSH alias genuinely reaches the approved host, rather than
+# merely sharing its owner/repo path text by coincidence (or by an
+# attacker's design) -- see that function for the full writeup.
+resolve_canonical_ssh_host() {
+  RCSH_HOST="$1"
+  RCSH_USER="$2"
+  RCSH_PORT="${3:-}"
+  if [ -z "$RCSH_HOST" ]; then
+    return 0
+  fi
+  if [ -n "$RCSH_PORT" ]; then
+    RCSH_CONFIG=$(ssh -G -p "$RCSH_PORT" "${RCSH_USER}@${RCSH_HOST}" 2>/dev/null) || RCSH_CONFIG=""
+  else
+    RCSH_CONFIG=$(ssh -G "${RCSH_USER}@${RCSH_HOST}" 2>/dev/null) || RCSH_CONFIG=""
+  fi
+  printf '%s\n' "$RCSH_CONFIG" | tr '[:upper:]' '[:lower:]' | awk '$1 == "hostname" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }'
 }
 
 # ==================== push: GitHub SSH account verification (Phase 5) ====================
@@ -801,7 +830,22 @@ evaluate_push() {
         REPO_PATH="$rest"
         ;;
       *)
-        HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
+        # A bracketed IPv6 literal ("[2001:db8::1]") contains colons itself,
+        # so the ordinary "[^/:]+" host pattern below stops at the FIRST
+        # one -- e.g. it read "[2001" as the entire host of
+        # "ssh://git@[2001:db8::1]/acme/repo.git". Found by the PART 9
+        # differential corpus once the release-blocker fix made host
+        # identity part of the destination check. `new URL(...).hostname`
+        # (the TypeScript side) keeps the brackets, so this matches that
+        # exactly, brackets included.
+        case "$rest" in
+          '['*|*@'['*)
+            HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?(\[[^]]*\]).*#\2#')
+            ;;
+          *)
+            HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
+            ;;
+        esac
         REPO_PATH=$(printf '%s' "$rest" | sed -E 's#^[^/]*/##')
         ;;
     esac
@@ -873,50 +917,21 @@ evaluate_push() {
     URL_PORT=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^[sS][sS][hH]://([^/@]*@)?[^/:]+:([0-9]+)(/.*)?$#\2#p')
   fi
 
-  # ---- destination: OWNER-based, never host-based (see evaluator.ts's
-  # destinationReasons for why a host comparison would falsely flag every
-  # trusted-SSH-alias push as a mismatch). Fails CLOSED: if Shield never
-  # recorded an approved destination for this repo (no remote resolvable
-  # the last time it was enabled/repaired), that is treated as a mismatch,
-  # not silently allowed — this also covers a direct `git push <url>` to
-  # an ad hoc destination Shield never had visibility into. ----
-  APPROVED_HOST=$(policy_scalar .approvedPushDestination.host)
-  APPROVED_OWNER=$(policy_scalar .approvedPushDestination.owner)
-  APPROVED_REPO=$(policy_scalar .approvedPushDestination.repo)
-  EXPECTED_DESTINATION_DISPLAY="${APPROVED_HOST:-(unknown host)}:${APPROVED_OWNER:-?}${APPROVED_REPO:+/$APPROVED_REPO}"
-
-  if [ -z "$APPROVED_OWNER" ]; then
-    add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
-Shield has no approved push destination on file for this repository (none was resolved the last time Shield was enabled or repaired).
-Reason: Refresh Shield after confirming the intended remote before pushing."
-  # MISSING EVIDENCE IS NOT A MATCH (Phase 8, kept 1:1 with
-  # destinationReasons() in src/shield/evaluator.ts). The `[ -n
-  # "$PARSED_REPO" ]` guard used to sit on the repo comparison, so a push
-  # URL that yielded an owner but NO repository name satisfied a policy
-  # that names a specific repository -- it matched purely because the
-  # owner happened to parse. An unparseable owner was likewise compared as
-  # the empty string. Both now require the push URL to actually produce
-  # the evidence the policy asks for.
-  elif [ -z "$PARSED_OWNER" ] \
-    || [ "$(lower "$PARSED_OWNER")" != "$(lower "$APPROVED_OWNER")" ] \
-    || { [ -n "$APPROVED_REPO" ] && { [ -z "$PARSED_REPO" ] || [ "$(lower "$PARSED_REPO")" != "$(lower "$APPROVED_REPO")" ]; }; }; then
-    add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
-Expected approved destination: $EXPECTED_DESTINATION_DISPLAY
-Reason: Push destination changed since Shield approval (this push would go to ${PARSED_OWNER:-an unknown owner}${PARSED_REPO:+/$PARSED_REPO})."
-  fi
-
-  # ---- route trust ----
   IS_GENERIC=0
   case "$(lower "$HOST")" in
     github.com|gitlab.com|bitbucket.org) IS_GENERIC=1 ;;
   esac
 
-  # An SSH command override can redirect the connection regardless of what
+  # ---- SSH transport overrides, computed BEFORE the destination check
+  # below (moved up from "route trust"): host canonicalization must know
+  # whether the resolution it's about to trust is itself trustworthy. An
+  # SSH command override can redirect the connection regardless of what
   # the URL's host claims -- check this BEFORE trusting any alias, since a
-  # "trusted" alias proves nothing once the program that actually speaks
-  # SSH for this push might not be the one ~/.ssh/config implies. None of
-  # these inspect key material, touch SSH config, or make a network call --
-  # they only check whether an override is present.
+  # "trusted" alias (and a canonicalized host) prove nothing once the
+  # program that actually speaks SSH for this push might not be the one
+  # ~/.ssh/config implies. None of these inspect key material, touch SSH
+  # config, or make a network call -- they only check whether an override
+  # is present.
   SSH_OVERRIDES=""
   [ -n "${GIT_SSH:-}" ] && SSH_OVERRIDES="GIT_SSH"
   [ -n "${GIT_SSH_COMMAND:-}" ] && SSH_OVERRIDES="${SSH_OVERRIDES:+$SSH_OVERRIDES, }GIT_SSH_COMMAND"
@@ -967,6 +982,73 @@ Reason: Push destination changed since Shield approval (this push would go to ${
     *) SSH_OVERRIDES="${SSH_OVERRIDES:+$SSH_OVERRIDES, }$SSH_VARIANT_SOURCE=$EFFECTIVE_SSH_VARIANT" ;;
   esac
 
+  # ---- destination: owner/repo AND canonical host (release-blocker fix)
+  # -- see destinationReasons() in src/shield/evaluator.ts for the full
+  # writeup. Owner/repo matching alone used to be the entire check, which
+  # let a push to an entirely different host (e.g. "evil.example") sharing
+  # the approved owner/repo path text be reported "destination confirmed",
+  # with only the (non-blocking under a relaxed profile) push_account
+  # check standing in the way. Fails CLOSED throughout: if Shield never
+  # recorded an approved destination for this repo (no remote resolvable
+  # the last time it was enabled/repaired), or the current route's host
+  # cannot be proven to be the same one, that is treated as a mismatch,
+  # not silently allowed. ----
+  APPROVED_HOST=$(policy_scalar .approvedPushDestination.host)
+  APPROVED_OWNER=$(policy_scalar .approvedPushDestination.owner)
+  APPROVED_REPO=$(policy_scalar .approvedPushDestination.repo)
+  EXPECTED_DESTINATION_DISPLAY="${APPROVED_HOST:-(unknown host)}:${APPROVED_OWNER:-?}${APPROVED_REPO:+/$APPROVED_REPO}"
+
+  if [ -z "$APPROVED_OWNER" ]; then
+    add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
+Shield has no approved push destination on file for this repository (none was resolved the last time Shield was enabled or repaired).
+Reason: Refresh Shield after confirming the intended remote before pushing."
+  else
+    OWNER_REPO_MISMATCH=0
+    # MISSING EVIDENCE IS NOT A MATCH (Phase 8, kept 1:1 with
+    # destinationReasons() in src/shield/evaluator.ts). The `[ -n
+    # "$PARSED_REPO" ]` guard used to sit on the repo comparison, so a push
+    # URL that yielded an owner but NO repository name satisfied a policy
+    # that names a specific repository -- it matched purely because the
+    # owner happened to parse. An unparseable owner was likewise compared
+    # as the empty string. Both now require the push URL to actually
+    # produce the evidence the policy asks for.
+    if [ -z "$PARSED_OWNER" ] \
+      || [ "$(lower "$PARSED_OWNER")" != "$(lower "$APPROVED_OWNER")" ] \
+      || { [ -n "$APPROVED_REPO" ] && { [ -z "$PARSED_REPO" ] || [ "$(lower "$PARSED_REPO")" != "$(lower "$APPROVED_REPO")" ]; }; }; then
+      OWNER_REPO_MISMATCH=1
+    fi
+
+    # Host identity: a LITERAL match never needs resolution (the common
+    # unchanged-remote case, and every HTTPS push, whose host is
+    # unambiguous). Otherwise the current route's host is canonicalized
+    # via "ssh -G" (never by trusting an alias's NAME, and never by
+    # running GIT_SSH_COMMAND/core.sshCommand to "discover" what it does)
+    # and compared against the SAME canonicalization of the approved
+    # host -- so a legitimate alias ("github-work" -> "github.com")
+    # matches, but an unrelated host sharing the approved owner/repo text
+    # does not, and an unresolvable route (no "ssh" available, an SSH
+    # transport override in effect, or a non-ssh/https protocol) is never
+    # silently accepted.
+    HOST_MATCH=0
+    LOWER_APPROVED_HOST=$(lower "$APPROVED_HOST")
+    LOWER_CURRENT_HOST=$(lower "$HOST")
+    if [ -n "$LOWER_APPROVED_HOST" ] && [ -n "$LOWER_CURRENT_HOST" ] && [ "$LOWER_APPROVED_HOST" = "$LOWER_CURRENT_HOST" ]; then
+      HOST_MATCH=1
+    elif [ -n "$APPROVED_HOST" ] && [ -n "$HOST" ] && [ "$PROTOCOL" = "ssh" ] && [ -z "$SSH_OVERRIDES" ]; then
+      CANONICAL_APPROVED_HOST=$(resolve_canonical_ssh_host "$APPROVED_HOST" "$SSH_USER" "$URL_PORT")
+      CANONICAL_CURRENT_HOST=$(resolve_canonical_ssh_host "$HOST" "$SSH_USER" "$URL_PORT")
+      if [ -n "$CANONICAL_APPROVED_HOST" ] && [ -n "$CANONICAL_CURRENT_HOST" ] && [ "$CANONICAL_APPROVED_HOST" = "$CANONICAL_CURRENT_HOST" ]; then
+        HOST_MATCH=1
+      fi
+    fi
+
+    if [ "$OWNER_REPO_MISMATCH" = 1 ] || [ "$HOST_MATCH" != 1 ]; then
+      add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
+Expected approved destination: $EXPECTED_DESTINATION_DISPLAY
+Reason: Push destination changed since Shield approval (this push would go to ${HOST:-an unknown host}:${PARSED_OWNER:-an unknown owner}${PARSED_REPO:+/$PARSED_REPO})."
+    fi
+  fi
+
   ROUTE_UNVERIFIED=1
   ROUTE_REASON_ID=push-route-unverified
   ROUTE_MESSAGE="This push's protocol could not be determined, so the account that would authenticate it cannot be verified locally."
@@ -979,7 +1061,7 @@ Reason: Push destination changed since Shield approval (this push would go to ${
     ROUTE_MESSAGE="This push uses the generic SSH host \"$HOST\", which authenticates with whichever key is used by default."
   elif [ "$PROTOCOL" = "ssh" ]; then
     LOWER_HOST=$(lower "$HOST")
-    if policy_array .trustedSshHostAliases | while IFS= read -r a; do lower "$a"; done | grep -qx "$LOWER_HOST"; then
+    if policy_array .trustedSshHostAliases | while IFS= read -r a; do lower "$a"; done | grep -qxF "$LOWER_HOST"; then
       ROUTE_UNVERIFIED=0
     else
       ROUTE_MESSAGE="This push uses SSH host alias \"$HOST\", which is not listed as trusted by the $PROFILE_LABEL profile."
