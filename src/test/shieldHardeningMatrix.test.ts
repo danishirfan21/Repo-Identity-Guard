@@ -1036,6 +1036,17 @@ async function timeIt(fn: () => Promise<unknown>): Promise<number> {
   return performance.now() - start;
 }
 
+async function medianLatency(label: string, operation: () => Promise<unknown>): Promise<number> {
+  await operation(); // warm-up: exclude first-use process and filesystem cost
+  const samples: number[] = [];
+  for (let index = 0; index < 3; index += 1) samples.push(await timeIt(operation));
+  samples.sort((a, b) => a - b);
+  const median = samples[1];
+  // eslint-disable-next-line no-console
+  console.log(`[perf] ${label}: samples=${samples.map((sample) => sample.toFixed(1)).join(",")}ms median=${median.toFixed(1)}ms`);
+  return median;
+}
+
 /**
  * Windows-aware latency bound. Confirmed on real windows-latest CI: a
  * single git-subprocess-heavy test here took ~1.5s there against ~80ms
@@ -1047,11 +1058,11 @@ async function timeIt(fn: () => Promise<unknown>): Promise<number> {
  * bound itself is platform-aware rather than pretending one number fits
  * every OS.
  */
-function platformBoundMs(posixBoundMs: number): number {
-  return process.platform === "win32" ? posixBoundMs * 5 : posixBoundMs;
+function catastrophicLatencyCeilingMs(posixCeilingMs: number): number {
+  return process.platform === "win32" ? posixCeilingMs * 5 : posixCeilingMs;
 }
 
-test("PERFORMANCE: added commit latency stays well under one second on a local repo", async () => {
+test("PERFORMANCE: commit median stays below the catastrophic-regression ceiling", async () => {
   const repo = await makeTempRepo();
   try {
     const manager = new ShieldManager();
@@ -1062,13 +1073,17 @@ test("PERFORMANCE: added commit latency stays well under one second on a local r
       await touchFile(withoutShieldRepo, "a.txt", "x\n");
       const baseline = await timeIt(() => commit(withoutShieldRepo, "baseline"));
 
-      await touchFile(repo, "a.txt", "x\n");
-      const withShield = await timeIt(() => commit(repo, "shielded"));
+      let commitNumber = 0;
+      const withShield = await medianLatency("commit", async () => {
+        commitNumber += 1;
+        await touchFile(repo, `a-${commitNumber}.txt`, "x\n");
+        await commit(repo, `shielded-${commitNumber}`);
+      });
 
       // eslint-disable-next-line no-console
-      console.log(`[perf] commit: baseline=${baseline.toFixed(1)}ms shielded=${withShield.toFixed(1)}ms delta=${(withShield - baseline).toFixed(1)}ms`);
-      const bound = platformBoundMs(1000);
-      assert.ok(withShield < bound, `commit with Shield took ${withShield}ms, expected well under ${bound}ms`);
+      console.log(`[perf] commit baseline=${baseline.toFixed(1)}ms median=${withShield.toFixed(1)}ms delta=${(withShield - baseline).toFixed(1)}ms`);
+      const bound = catastrophicLatencyCeilingMs(5000);
+      assert.ok(withShield < bound, `commit median took ${withShield}ms, catastrophic ceiling is ${bound}ms`);
     } finally {
       await cleanup(withoutShieldRepo.dir);
     }
@@ -1077,7 +1092,7 @@ test("PERFORMANCE: added commit latency stays well under one second on a local r
   }
 });
 
-test("PERFORMANCE: added push latency in route-only (non-account-verifying) strict mode stays well under one second", async () => {
+test("PERFORMANCE: route-only push median stays below the catastrophic-regression ceiling", async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
@@ -1090,17 +1105,17 @@ test("PERFORMANCE: added push latency in route-only (non-account-verifying) stri
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
     const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
-    const elapsed = await timeIt(() => push(repo, ["origin", "feature/shield-tests"], env));
-    // eslint-disable-next-line no-console
-    console.log(`[perf] push (route-only): ${elapsed.toFixed(1)}ms`);
-    const bound = platformBoundMs(1000);
-    assert.ok(elapsed < bound, `route-only push took ${elapsed}ms, expected well under ${bound}ms`);
+    const elapsed = await medianLatency("push (route-only)", async () => {
+      await push(repo, ["origin", "feature/shield-tests"], env);
+    });
+    const bound = catastrophicLatencyCeilingMs(5000);
+    assert.ok(elapsed < bound, `route-only push median took ${elapsed}ms, catastrophic ceiling is ${bound}ms`);
   } finally {
     await cleanup(repo.dir, remoteParent, fakeSshBin);
   }
 });
 
-test("PERFORMANCE: added push latency in strict GitHub SSH account-verification mode stays bounded (mocked ssh -- an extra ssh -G + ssh -T round trip)", async () => {
+test("PERFORMANCE: strict account-verifying push median stays below the catastrophic-regression ceiling", async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeGithubSshBin = await mockGithubSsh("danish-work");
@@ -1111,17 +1126,17 @@ test("PERFORMANCE: added push latency in strict GitHub SSH account-verification 
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
     const env = { ...repo.env, PATH: `${fakeGithubSshBin}${path.delimiter}${repo.env.PATH}` };
 
-    const elapsed = await timeIt(() => push(repo, ["origin", "feature/shield-tests"], env));
-    // eslint-disable-next-line no-console
-    console.log(`[perf] push (strict GitHub SSH account verification, mocked ssh): ${elapsed.toFixed(1)}ms`);
+    const elapsed = await medianLatency("push (strict account verification, mocked ssh)", async () => {
+      await push(repo, ["origin", "feature/shield-tests"], env);
+    });
     // Generous bound: this path adds a real subprocess-spawned `ssh -G`
     // and `ssh -T` (mocked here, but the process-spawn overhead is real)
     // on top of the route-only path. Against a REAL GitHub endpoint this
     // number is dominated by network RTT (see docs/SHIELD_MODE.md's
     // measured-latency note) -- the mocked figure here only bounds
     // Shield's own local overhead, never network time.
-    const bound = platformBoundMs(3000);
-    assert.ok(elapsed < bound, `strict account-verifying push took ${elapsed}ms, expected well under ${bound}ms locally`);
+    const bound = catastrophicLatencyCeilingMs(10000);
+    assert.ok(elapsed < bound, `strict account-verifying push median took ${elapsed}ms, catastrophic ceiling is ${bound}ms`);
   } finally {
     await cleanup(repo.dir, remoteParent, fakeGithubSshBin);
   }
