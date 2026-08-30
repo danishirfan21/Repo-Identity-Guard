@@ -24,10 +24,9 @@ import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
  * That reason applies to GIT's transport. It does not apply to Shield's
  * verification probe, which is a different program on a different code
  * path: `resources/shield/shield-evaluate.sh` runs `ssh -G` and `ssh -T`
- * itself, from a POSIX shell, resolved through ordinary PATH search — and
- * on Windows that shell is Git's own bundled `sh`, which does use PATH.
- * (This is exactly the divergence Part 3 investigated: the hook's `ssh` and
- * Git's transport `ssh` are resolved by different mechanisms.)
+ * itself, from a POSIX shell. On Windows this harness must prepend its fake
+ * bin directory *inside that Git-for-Windows shell*, using a POSIX path and
+ * `:`-separated PATH. A Windows `PATH` assembled by Node is not sufficient.
  *
  * So driving the evaluator directly, rather than through `git push`,
  * genuinely moves the account-verification decision matrix from
@@ -127,7 +126,16 @@ function withPath(env: NodeJS.ProcessEnv, prepend: string): NodeJS.ProcessEnv {
 interface Fixture {
   repoDir: string;
   fakeSshBin: string;
+  fakeSshBinPosix: string;
   baseEnv: NodeJS.ProcessEnv;
+}
+
+async function toGitForWindowsPath(windowsPath: string, env: NodeJS.ProcessEnv): Promise<string> {
+  if (process.platform !== "win32") return windowsPath;
+  const { stdout } = await execFileAsync("sh", ["-c", 'cygpath -u -- "$1"', "cygpath", windowsPath], { env, encoding: "utf8" });
+  const converted = stdout.trim();
+  assert.notEqual(converted, "", `Git for Windows cygpath did not convert ${windowsPath}`);
+  return converted;
 }
 
 // `null` means "this profile sets no expectedGitHubLogin at all". Using
@@ -152,7 +160,7 @@ async function setUp(login: string | null = "danish-work"): Promise<Fixture> {
   await fs.writeFile(shieldPolicyFilePath(commonDir), serializeShieldPolicy(policyWithLogin(login ?? undefined)));
 
   const fakeSshBin = await makeFakeSsh();
-  return { repoDir, fakeSshBin, baseEnv: env };
+  return { repoDir, fakeSshBin, fakeSshBinPosix: await toGitForWindowsPath(fakeSshBin, env), baseEnv: env };
 }
 
 interface Result {
@@ -161,20 +169,33 @@ interface Result {
   reasonIds: string[];
 }
 
+function runInEvaluatorShell(fixture: Fixture, shellCommand: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<{ stdout: string; stderr: string }> {
+  const env = {
+    ...withPath(fixture.baseEnv, fixture.fakeSshBin),
+    ...extraEnv,
+    FAKE_SSH_POSIX_DIR: fixture.fakeSshBinPosix,
+  };
+  return execFileAsync(
+    "sh",
+    ["-c", `PATH="$FAKE_SSH_POSIX_DIR:$PATH"; export PATH; ${shellCommand}`, "shield-test-shell", ...args],
+    { cwd: fixture.repoDir, encoding: "utf8", env },
+  );
+}
+
 function evaluatePush(fixture: Fixture, extraEnv: NodeJS.ProcessEnv = {}, url = REMOTE_URL): Promise<Result> {
-  const env = { ...withPath(fixture.baseEnv, fixture.fakeSshBin), ...extraEnv };
+  const launch = async (): Promise<{ stdout: string; stderr: string }> => {
+    const scriptPath = await toGitForWindowsPath(SCRIPT_PATH, fixture.baseEnv);
+    return runInEvaluatorShell(fixture, 'exec "$SHIELD_SCRIPT" "$@"', ["push", "origin", url], { ...extraEnv, SHIELD_SCRIPT: scriptPath });
+  };
   return new Promise((resolve, reject) => {
-    const child = execFile(
-      "sh",
-      [SCRIPT_PATH, "push", "origin", url],
-      { cwd: fixture.repoDir, encoding: "utf8", env },
-      (error, _stdout, stderr) => {
-        if (error && typeof (error as { code?: unknown }).code !== "number") return reject(error);
-        const code = error ? ((error as { code?: number }).code ?? 1) : 0;
-        resolve({ code, stderr, reasonIds: [...stderr.matchAll(/^Shield: \[([a-z-]+)\]/gm)].map((m) => m[1]) });
-      },
-    );
-    child.stdin?.end("");
+    launch().then(({ stderr }) => {
+      resolve({ code: 0, stderr, reasonIds: [...stderr.matchAll(/^Shield: \[([a-z-]+)\]/gm)].map((m) => m[1]) });
+    }).catch((error: unknown) => {
+      const typedError = error as { code?: unknown; stderr?: unknown };
+      if (typeof typedError.code !== "number") return reject(error);
+      const stderr = typeof typedError.stderr === "string" ? typedError.stderr : "";
+      resolve({ code: typedError.code, stderr, reasonIds: [...stderr.matchAll(/^Shield: \[([a-z-]+)\]/gm)].map((m) => m[1]) });
+    });
   });
 }
 
@@ -186,6 +207,18 @@ async function cleanup(fixture: Fixture): Promise<void> {
 const AUTHENTICATED = (who: string) => `Hi ${who}! You've successfully authenticated, but GitHub does not provide shell access.\n`;
 
 // ==================== the outcome matrix, on every platform ====================
+
+test("PART 3/xplat — Windows preflight: the evaluator shell resolves the fake ssh", { skip: process.platform !== "win32" }, async () => {
+  const fixture = await setUp();
+  try {
+    const { stdout } = await runInEvaluatorShell(fixture, 'command -v ssh; ssh -G github-work', []);
+    const [resolved] = stdout.split(/\r?\n/, 1);
+    assert.equal(resolved, `${fixture.fakeSshBinPosix}/ssh`, `Git-for-Windows sh resolved ssh outside the fake bin:\n${stdout}`);
+    assert.match(stdout, /^hostname github\.com$/m, `fake ssh was not executed:\n${stdout}`);
+  } finally {
+    await cleanup(fixture);
+  }
+});
 
 test("PART 3/xplat — the expected GitHub login authenticates -> allowed", async () => {
   const fixture = await setUp();
