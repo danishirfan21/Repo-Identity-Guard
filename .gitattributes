@@ -1,0 +1,12 @@
+# Shell scripts must always check out with LF line endings, on every
+# platform including Windows. `resources/shield/shield-evaluate.sh` is a
+# POSIX sh script Shield's generated hooks invoke directly (never through
+# a shell that tolerates CRLF); a Windows checkout with the common
+# `core.autocrlf=true` default silently converts it to CRLF, which
+# breaks it in ways that are easy to misdiagnose as a logic bug rather
+# than a checkout artifact -- confirmed directly: its shebang line
+# checked out as `#!/bin/sh\r` on windows-latest CI, and Shield's own
+# GitHub SSH account-verification decisions differed as a downstream
+# effect of the same corruption. `eol=lf` forces LF on checkout
+# regardless of the checking-out platform's `core.autocrlf` setting.
+*.sh text eol=lf
