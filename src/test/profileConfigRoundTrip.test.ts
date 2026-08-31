@@ -8,6 +8,7 @@ import { MAIN_VIEW_JS } from "../webview/client/mainView";
 import { DETAILS_VIEW_JS } from "../webview/client/detailsView";
 import { MEMORY_VIEW_JS } from "../webview/client/memoryView";
 import { SETTINGS_VIEW_JS } from "../webview/client/settingsView";
+import { SHIELD_VIEW_JS } from "../webview/client/shieldView";
 import { NAVIGATION_JS } from "../webview/client/navigation";
 import { buildShieldPolicy } from "../shield/policy";
 import { Profile } from "../types";
@@ -139,6 +140,7 @@ function loadSettingsSandbox(profiles: Profile[], container: FakeElement): Sandb
       ICONS_JS,
       COMPONENTS_JS,
       MAIN_VIEW_JS,
+      SHIELD_VIEW_JS,
       DETAILS_VIEW_JS,
       MEMORY_VIEW_JS,
       ONBOARDING_VIEW_JS,
@@ -146,7 +148,14 @@ function loadSettingsSandbox(profiles: Profile[], container: FakeElement): Sandb
       NAVIGATION_JS,
       // Inject the state the real script would have received via a
       // postMessage, then re-render so `state.profiles` is populated.
-      `state = ${JSON.stringify({ profiles, protectedBranches: ["main"], preferences: {}, facts: {}, memory: { notes: [], commands: [] } })};`,
+      `state = ${JSON.stringify({
+        profiles,
+        protectedBranches: ["main"],
+        preferences: {},
+        facts: {},
+        memory: { notes: [], commands: [] },
+        shield: { lifecycle: "off", reasons: [], trustedSshHostAliases: [], commitProtection: false, mergeCommitProtection: false, pushProtection: false, policyProfileDrift: false, pushDestinationDrift: false },
+      })};`,
     ].join("\n"),
     sandbox,
   );

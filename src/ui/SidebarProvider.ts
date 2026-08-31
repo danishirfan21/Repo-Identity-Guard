@@ -6,6 +6,7 @@ import { COMPONENTS_JS } from "../webview/client/components";
 import { ONBOARDING_VIEW_JS } from "../webview/client/onboardingView";
 import { MAIN_VIEW_JS } from "../webview/client/mainView";
 import { DETAILS_VIEW_JS } from "../webview/client/detailsView";
+import { SHIELD_VIEW_JS } from "../webview/client/shieldView";
 import { MEMORY_VIEW_JS } from "../webview/client/memoryView";
 import { SETTINGS_VIEW_JS } from "../webview/client/settingsView";
 import { NAVIGATION_JS } from "../webview/client/navigation";
@@ -35,6 +36,11 @@ export interface SidebarActions {
   saveProtectedBranches(branches: string[]): Promise<void>;
   saveRequireLocalIdentity(value: boolean): Promise<void>;
   saveIncludeMemoryInAiContext(value: boolean): Promise<void>;
+
+  enableShield(chainForeignHooks: boolean): Promise<void>;
+  disableShield(): Promise<void>;
+  repairShield(): Promise<void>;
+  checkShieldHealth(): Promise<void>;
 }
 
 export type { SidebarModel } from "./wireState";
@@ -140,6 +146,18 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
       case "saveIncludeMemoryInAiContext":
         await a.saveIncludeMemoryInAiContext(!!message.value);
         break;
+      case "enableShield":
+        await a.enableShield(!!message.chainForeignHooks);
+        break;
+      case "disableShield":
+        await a.disableShield();
+        break;
+      case "repairShield":
+        await a.repairShield();
+        break;
+      case "checkShieldHealth":
+        await a.checkShieldHealth();
+        break;
     }
   }
 
@@ -184,6 +202,7 @@ ${ICONS_JS}
 ${COMPONENTS_JS}
 ${ONBOARDING_VIEW_JS}
 ${MAIN_VIEW_JS}
+${SHIELD_VIEW_JS}
 ${DETAILS_VIEW_JS}
 ${MEMORY_VIEW_JS}
 ${SETTINGS_VIEW_JS}

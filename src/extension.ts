@@ -165,6 +165,20 @@ export function activate(context: vscode.ExtensionContext): void {
       await saveIncludeMemoryInAiContext(value);
       await scan();
     },
+
+    enableShield: async (chainForeignHooks) => {
+      await enableShield(chainForeignHooks);
+      await scan();
+    },
+    disableShield: async () => {
+      await disableShield();
+      await scan();
+    },
+    repairShield: async () => {
+      await repairShield();
+      await scan();
+    },
+    checkShieldHealth: () => checkShieldHealth(),
   });
 
   context.subscriptions.push(statusBar);
@@ -687,7 +701,16 @@ export function activate(context: vscode.ExtensionContext): void {
     return { ok: true, facts, profiles: getProfiles(), protectedBranches: getProtectedBranches() };
   }
 
-  async function enableShield(): Promise<void> {
+  /**
+   * `chainForeignHooks` defaults false — reproducing the pre-sidebar
+   * command-palette behavior exactly for that entry point. The sidebar's
+   * Enable Shield confirmation screen (src/webview/client/shieldView.ts)
+   * shows the actual foreign-hook decision (leave unchanged / chain) up
+   * front, from the same `ShieldInspection` the last scan already
+   * computed, and passes the user's real choice here — never a silent
+   * default once a conflict is known.
+   */
+  async function enableShield(chainForeignHooks = false): Promise<void> {
     const startDir = latestSummary.facts.repoRoot;
     if (!startDir) {
       await vscode.window.showInformationMessage("Open a Git repository first.");
@@ -707,6 +730,7 @@ export function activate(context: vscode.ExtensionContext): void {
         facts,
         profiles: fresh.profiles,
         protectedBranches: fresh.protectedBranches,
+        chainForeignHooks,
       });
       if (result.ok) {
         await vscode.window.showInformationMessage(

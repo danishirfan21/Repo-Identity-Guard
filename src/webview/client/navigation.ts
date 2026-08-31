@@ -22,6 +22,8 @@ function headerFor(v) {
   if (v === "main") return ["Repo Identity Guard", "Safe to work, commit, push?"];
   if (v === "details") return ["Review Details", "Full issue list"];
   if (v === "memory") return ["Repo Memory", "Notes and saved commands"];
+  if (v === "shield") return ["Shield", "Local Git enforcement"];
+  if (v === "shieldEnable") return ["Enable Shield", "Confirm before enforcing"];
   return ["Settings", "Profiles and safety rules"];
 }
 
@@ -41,6 +43,8 @@ function render() {
   else if (view === "main") app.innerHTML = renderMain();
   else if (view === "details") app.innerHTML = renderDetails();
   else if (view === "memory") app.innerHTML = renderMemory();
+  else if (view === "shield") app.innerHTML = renderShield();
+  else if (view === "shieldEnable") app.innerHTML = renderShieldEnable();
   else app.innerHTML = renderSettings();
 }
 
@@ -178,6 +182,13 @@ document.addEventListener("click", (event) => {
   }
   if (target.closest("#openSettingsJsonButton")) { send("openSettingsJson"); return; }
 
+  // ---- Shield ----
+  if (target.closest("#shieldGoToEnableButton")) { navigate("shieldEnable"); return; }
+  if (target.closest("#shieldEnableConfirmButton")) { send("enableShield", { chainForeignHooks: shieldChainChoice === "chain" }); navigate("main"); return; }
+  if (target.closest("#shieldDisableButton")) { send("disableShield"); return; }
+  if (target.closest("#shieldRepairButton")) { send("repairShield"); return; }
+  if (target.closest("#shieldCheckHealthButton")) { send("checkShieldHealth"); return; }
+
   // ---- Onboarding ----
   const obLabelBtn = target.closest("[data-ob-label]");
   if (obLabelBtn) { obLabel = obLabelBtn.dataset.obLabel; render(); if (obLabel === "Other") document.getElementById("obCustomLabelInput").focus(); return; }
@@ -204,6 +215,7 @@ document.addEventListener("change", (event) => {
   if (target.id === "includeMemoryCheckbox") { send("saveIncludeMemoryInAiContext", { value: target.checked }); return; }
   if (target.id === "obCustomLabelInput") { obCustomLabel = target.value; return; }
   if (target.name === "obScope") { obScope = target.value; return; }
+  if (target.name === "shieldChain") { shieldChainChoice = target.value; render(); return; }
 });
 
 window.addEventListener("message", (event) => {

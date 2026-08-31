@@ -192,4 +192,30 @@
     background-color: var(--rig-surface-container-low);
     border: 1px solid var(--rig-border);
   }
+
+  /* Shield lifecycle badges (OFF / ACTIVE / DEGRADED / BROKEN / UNAVAILABLE) — a separate axis from repository safety above, never reusing its verdict-* classes so the two are never visually conflated. */
+  .badge-shield-active {
+    background-color: var(--rig-success-bg);
+    color: var(--rig-success);
+    border: 1px solid color-mix(in srgb, var(--rig-success) 40%, transparent);
+  }
+
+  .badge-shield-degraded {
+    background-color: var(--rig-warning-bg);
+    color: var(--rig-warning);
+    border: 1px solid color-mix(in srgb, var(--rig-warning) 40%, transparent);
+  }
+
+  .badge-shield-broken {
+    background-color: var(--rig-error-bg);
+    color: var(--rig-error);
+    border: 1px solid color-mix(in srgb, var(--rig-error) 40%, transparent);
+  }
+
+  .badge-shield-off,
+  .badge-shield-unavailable {
+    background-color: var(--rig-surface-container-high);
+    color: var(--rig-fg-muted);
+    border: 1px solid var(--rig-border);
+  }
 }

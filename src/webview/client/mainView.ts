@@ -23,6 +23,7 @@ function renderVerdictBanner(level, subtitle) {
 
 function renderRepoListRow(repo) {
   const meta = statusMeta(repo.level);
+  const shieldChip = shieldMeta(repo.shieldLifecycle);
   const fixLine = repo.level === "not_safe" && repo.nextFixTitle
     ? \`<span class="block truncate text-[10px] text-on-surface-variant">\${esc(repo.nextFixTitle)}</span>\`
     : "";
@@ -30,10 +31,11 @@ function renderRepoListRow(repo) {
   return \`
     <button class="vs-card flex w-full items-center gap-2 rounded p-2 text-left \${selectedCls}" data-select-repo="\${esc(repo.repoId)}">
       <span class="\${meta.cls} shrink-0">\${icon(meta.iconName, 13)}</span>
-      <div class="flex min-w-0 flex-col">
+      <div class="flex min-w-0 flex-1 flex-col">
         <span class="truncate text-[11px] font-semibold text-on-surface">\${esc(repo.name)}</span>
         \${fixLine}
       </div>
+      <span class="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide \${shieldChip.badgeCls}">\${shieldChip.label}</span>
     </button>\`;
 }
 
@@ -173,6 +175,7 @@ function renderMain() {
     \${renderNextAction()}
     \${renderPinnedMemory()}
     \${renderChecksGrid()}
+    \${renderShieldSummary()}
     \${renderSecondaryActions()}
     \${renderMultiRepoList()}
   \`;

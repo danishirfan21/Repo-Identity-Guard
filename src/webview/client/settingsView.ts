@@ -158,11 +158,13 @@ function renderSettings() {
       </label>
     </section>
 
-    <section class="vs-card flex flex-col gap-1 rounded p-2.5">
+    <section class="vs-card flex flex-col gap-1.5 rounded p-2.5">
       <div class="flex items-center justify-between">
-        <span class="flex items-center gap-1.5 text-[12px] font-semibold text-on-surface-variant">\${icon("lock", 13)}Shield Mode</span>
+        <span class="flex items-center gap-1.5 text-[12px] font-semibold text-on-surface-variant">\${icon("shield", 13)}Shield</span>
+        <span class="rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide \${shieldMeta(state.shield.lifecycle).badgeCls}">\${shieldMeta(state.shield.lifecycle).label}</span>
       </div>
-      <p class="m-0 text-[10.5px] leading-relaxed text-on-surface-variant">Shield Mode provides optional local Git-hook enforcement. Use the Repo Identity Guard Shield commands from the Command Palette. Full sidebar controls are not yet available.</p>
+      <p class="m-0 text-[10.5px] leading-relaxed text-on-surface-variant">Shield can block ordinary unsafe commits and pushes locally, for the currently selected repository.</p>
+      <button class="vs-button-secondary h-7 self-start rounded px-2.5 text-[11px] font-semibold" data-nav="\${state.shield.lifecycle === "off" ? "shieldEnable" : "shield"}">Open Shield</button>
     </section>
 
     <button class="vs-button-secondary h-7 rounded text-[12px]" id="openSettingsJsonButton">Open settings.json</button>

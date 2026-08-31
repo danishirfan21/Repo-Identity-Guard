@@ -8,6 +8,7 @@ import { COMPONENTS_JS } from "../webview/client/components";
 import { ONBOARDING_VIEW_JS } from "../webview/client/onboardingView";
 import { MAIN_VIEW_JS } from "../webview/client/mainView";
 import { DETAILS_VIEW_JS } from "../webview/client/detailsView";
+import { SHIELD_VIEW_JS } from "../webview/client/shieldView";
 
 /**
  * These tests load the actual client-script modules (the same strings
@@ -41,7 +42,7 @@ function loadClientSandbox(extraScript = ""): { sandbox: Record<string, unknown>
     window: { addEventListener: () => undefined },
   };
   vm.createContext(sandbox);
-  const script = [ICONS_JS, COMPONENTS_JS, MAIN_VIEW_JS, DETAILS_VIEW_JS, ONBOARDING_VIEW_JS, TEST_BRIDGE_JS, extraScript].join("\n");
+  const script = [ICONS_JS, COMPONENTS_JS, MAIN_VIEW_JS, SHIELD_VIEW_JS, DETAILS_VIEW_JS, ONBOARDING_VIEW_JS, TEST_BRIDGE_JS, extraScript].join("\n");
   vm.runInContext(script, sandbox);
   return { sandbox, sent };
 }
@@ -89,6 +90,7 @@ test("SAFE Main render shows the SAFE verdict and no blocking next-fix card", ()
     branch: "feature/login",
     capabilityResults: [],
     workspace: { level: "safe", repos: [{ repoId: "r1", name: "acme-frontend", level: "safe", selected: true }] },
+    shield: { lifecycle: "off", reasons: [], trustedSshHostAliases: [], commitProtection: false, mergeCommitProtection: false, pushProtection: false, policyProfileDrift: false, pushDestinationDrift: false },
   }) + "; var out = renderMain();");
   const out = sandbox.out as string;
   assert.match(out, /SAFE/);
@@ -114,6 +116,7 @@ test("NOT SAFE Main render surfaces the blocking next fix and its primary action
     capabilityResults: [nextFix],
     nextFix,
     workspace: { level: "not_safe", repos: [{ repoId: "r1", name: "acme-frontend", level: "not_safe", selected: true }] },
+    shield: { lifecycle: "active", reasons: [], trustedSshHostAliases: [], commitProtection: true, mergeCommitProtection: true, pushProtection: true, policyProfileDrift: false, pushDestinationDrift: false },
   }) + "; var out = renderMain();");
   const out = sandbox.out as string;
   assert.match(out, /NOT SAFE/);
@@ -188,6 +191,162 @@ test("onboarding scope maps 1:1 onto the existing Profile schema (exactRepos vs 
   const ownerScopedProfile = normalize(sent[1].extra?.profile);
   assert.deepEqual(ownerScopedProfile.expectedRemoteOwners, ["danishirfan21"]);
   assert.deepEqual(ownerScopedProfile.exactRepos, []);
+});
+
+// ==================== Shield view ====================
+
+function shieldState(overrides: Record<string, unknown> = {}) {
+  return {
+    lifecycle: "off",
+    reasons: [],
+    trustedSshHostAliases: [],
+    commitProtection: false,
+    mergeCommitProtection: false,
+    pushProtection: false,
+    policyProfileDrift: false,
+    pushDestinationDrift: false,
+    ...overrides,
+  };
+}
+
+test("Shield OFF renders no protection claims and offers Enable Shield", () => {
+  const { sandbox } = loadClientSandbox("state = " + JSON.stringify({ shield: shieldState({ lifecycle: "off" }) }) + "; var out = renderShield();");
+  const out = sandbox.out as string;
+  assert.match(out, /SHIELD — OFF/);
+  assert.match(out, /Enable Shield/);
+  assert.doesNotMatch(out, /Coming Soon/i);
+});
+
+test("Shield ACTIVE renders real available fields and hides missing optional ones — never a fabricated placeholder", () => {
+  const { sandbox } = loadClientSandbox(
+    "state = " +
+      JSON.stringify({
+        shield: shieldState({
+          lifecycle: "active",
+          profileLabel: "Work",
+          approvedRepositoryKey: "github.com/acmesoftware/acme-frontend",
+          approvedPushDestinationDisplay: "github.com:AcmeSoftware/acme-frontend",
+          commitProtection: true,
+          mergeCommitProtection: true,
+          pushProtection: true,
+          // expectedGitHubLogin and trustedSshHostAliases deliberately absent/empty.
+        }),
+      }) +
+      "; var out = renderShield();",
+  );
+  const out = sandbox.out as string;
+  assert.match(out, /SHIELD — ACTIVE/);
+  assert.match(out, /acme-frontend/);
+  assert.match(out, /Disable Shield/);
+  assert.match(out, /Check Health/);
+  assert.doesNotMatch(out, /Expected GitHub account.*<span/); // no row rendered for an absent value
+  assert.doesNotMatch(out, /Trusted SSH route/); // hidden when the alias list is empty
+});
+
+test("Shield DEGRADED renders the real inspection reasons, never invented ones, and offers Repair Shield", () => {
+  const { sandbox } = loadClientSandbox(
+    "state = " +
+      JSON.stringify({ shield: shieldState({ lifecycle: "degraded", reasons: ["Shield's pre-push hook is missing. Run Repair Shield to reinstall it."] }) }) +
+      "; var out = renderShield();",
+  );
+  const out = sandbox.out as string;
+  assert.match(out, /SHIELD — DEGRADED/);
+  assert.match(out, /pre-push hook is missing/);
+  assert.match(out, /Repair Shield/);
+});
+
+test("Shield BROKEN renders Repair and Disable actions only", () => {
+  const { sandbox } = loadClientSandbox(
+    "state = " + JSON.stringify({ shield: shieldState({ lifecycle: "broken", reasons: ["Shield's policy file is invalid."] }) }) + "; var out = renderShield();",
+  );
+  const out = sandbox.out as string;
+  assert.match(out, /SHIELD — BROKEN/);
+  assert.match(out, /Repair Shield/);
+  assert.match(out, /Disable Shield/);
+  assert.doesNotMatch(out, /Enable Shield/);
+});
+
+test("Shield UNAVAILABLE states the real Git version requirement and shows the detected version, never an action button", () => {
+  const { sandbox } = loadClientSandbox(
+    "state = " + JSON.stringify({ shield: shieldState({ lifecycle: "unavailable", gitVersionRaw: "git version 2.20.0" }) }) + "; var out = renderShield();",
+  );
+  const out = sandbox.out as string;
+  assert.match(out, /SHIELD — UNAVAILABLE/);
+  assert.match(out, /Git 2\.31 or newer/);
+  assert.match(out, /2\.20\.0/);
+  assert.doesNotMatch(out, /Enable Shield|Repair Shield|Disable Shield/);
+});
+
+test("Enable Shield confirmation explains what Shield can and cannot do, and never dominates with a modal-style warning", () => {
+  const { sandbox } = loadClientSandbox(
+    "state = " +
+      JSON.stringify({ repoName: "acme-frontend", profileLabel: "Work", shield: shieldState() }) +
+      "; var out = renderShieldEnable();",
+  );
+  const out = sandbox.out as string;
+  assert.match(out, /acme-frontend/);
+  assert.match(out, /wrong effective Git identity/);
+  assert.match(out, /does not\b|Shield does not/i);
+  assert.match(out, /no-verify/);
+  assert.match(out, /Enable Shield/);
+});
+
+test("a chainable foreign hook offers Leave/Chain as a real choice — never silent chaining, never silent overwrite", () => {
+  const { sandbox } = loadClientSandbox(
+    "state = " +
+      JSON.stringify({
+        repoName: "acme-frontend",
+        profileLabel: "Work",
+        shield: shieldState({ foreignHook: { fileName: "pre-push", path: "/repo/.git/hooks/pre-push", chainable: true } }),
+      }) +
+      "; var out = renderShieldEnable();",
+  );
+  const out = sandbox.out as string;
+  assert.match(out, /Existing Git Hook Detected/);
+  assert.match(out, /Leave existing hook unchanged/);
+  assert.match(out, /Chain Repo Identity Guard with the existing hook/);
+  assert.match(out, /pre-push/);
+});
+
+test("a non-chainable foreign hook never offers a Chain option and explains why Repo Identity Guard left it unchanged", () => {
+  const { sandbox } = loadClientSandbox(
+    "state = " +
+      JSON.stringify({
+        repoName: "acme-frontend",
+        profileLabel: "Work",
+        shield: shieldState({ foreignHook: { fileName: "pre-commit", path: "/repo/.git/hooks/pre-commit", chainable: false } }),
+      }) +
+      "; var out = renderShieldEnable();",
+  );
+  const out = sandbox.out as string;
+  assert.match(out, /cannot be safely chained/);
+  assert.doesNotMatch(out, /Chain Repo Identity Guard with the existing hook/);
+});
+
+test("multi-root repo rows show their own Shield lifecycle chip, independent of that repo's safety level", () => {
+  const { sandbox } = loadClientSandbox(
+    "state = " +
+      JSON.stringify({
+        level: "not_safe",
+        isGitRepo: true,
+        repoName: "repo-a",
+        capabilityResults: [],
+        shield: shieldState({ lifecycle: "active" }),
+        workspace: {
+          level: "not_safe",
+          repos: [
+            { repoId: "repo-a", name: "repo-a", level: "safe", selected: true, shieldLifecycle: "active" },
+            { repoId: "repo-b", name: "repo-b", level: "not_safe", selected: false, shieldLifecycle: "off" },
+          ],
+        },
+      }) +
+      "; var out = renderMain();",
+  );
+  const out = sandbox.out as string;
+  assert.match(out, /repo-a/);
+  assert.match(out, /repo-b/);
+  assert.match(out, />ACTIVE</);
+  assert.match(out, />OFF</);
 });
 
 test("sidebar.css never redefines a --vscode-* variable with a fixed color and derives its own tokens from them instead", async () => {

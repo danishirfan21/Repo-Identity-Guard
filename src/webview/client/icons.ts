@@ -41,6 +41,10 @@ const ICONS = {
   block: '<circle cx="8" cy="8" r="6.3"/><path d="m4.5 4.5 7 7"/>',
   compass: '<circle cx="8" cy="8" r="6.3"/><path d="m10.2 5.8-1.4 3-3 1.4 1.4-3z"/>',
   lock: '<rect x="3.5" y="7" width="9" height="6.5" rx="1"/><path d="M5.3 7V5a2.7 2.7 0 0 1 5.4 0v2"/>',
+  wrench: '<path d="M10.5 2.6a3 3 0 0 0-3.9 3.7L2.5 10.4a1.4 1.4 0 0 0 2 2l4.1-4.1a3 3 0 0 0 3.7-3.9l-1.9 1.9-1.6-.5-.5-1.6z"/>',
+  power: '<path d="M8 2v5"/><path d="M4.6 4.3a5.2 5.2 0 1 0 6.8 0"/>',
+  pulse: '<path d="M1.5 8.5h2.8l1.4-4 2.6 7 1.4-3h3.8"/>',
+  link: '<path d="M6.8 9.2 9.2 6.8"/><path d="M6.4 4.4 8 2.8a2.6 2.6 0 0 1 3.7 3.7L10 8.1"/><path d="M9.6 11.6 8 13.2a2.6 2.6 0 0 1-3.7-3.7L6 8"/>',
 };
 function icon(name, size) {
   const body = ICONS[name] || ICONS.shield;
