@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Fixed — Push Destination host bypass (release blocker)
+
+Shield's push-destination check matched a push's owner/repo text alone,
+never its host — so a push to an entirely different, attacker-chosen host
+(e.g. `evil.example`) sharing an approved destination's owner/repo string
+was reported "destination confirmed," with only the (non-blocking under
+`strictPushSetup: false`) push-account/route check standing in the way.
+Fixed by requiring canonical host identity too — a literal match needs no
+resolution, and an SSH alias is accepted only once `ssh -G` (never the
+alias's name) has actually resolved it to the approved host — independent
+of `strictPushSetup`, in both the TypeScript reference evaluator and the
+shipped shell evaluator. Also fixed in passing: a bracketed IPv6 host was
+truncated at its first internal colon by the shell evaluator's host
+parser, and three `grep -qx` membership checks treated their argument as a
+regex instead of a literal string.
+
+### Added — Shield sidebar UI
+
+Shield went from Command-Palette-only to a real, reachable sidebar
+feature: a live "Shield — <state>" summary on Main (View/Enable/Review/
+Repair depending on the real per-repository state), a dedicated Shield
+screen for OFF/ACTIVE/DEGRADED/BROKEN/UNAVAILABLE (Git too old), an
+Enable Shield confirmation explaining what it can block and what it does
+not do, and the foreign-hook coexistence decision (leave unchanged, or
+chain when it's safely chainable) surfaced up front instead of only being
+reachable as an internal parameter. Settings now shows the selected
+repo's real Shield state with an "Open Shield" link, replacing the old
+"Full sidebar controls are not yet available" placeholder. Every field
+shown comes directly from `ShieldManager`'s own inspection — nothing is
+inferred from repository safety, and multi-root workspaces show Shield
+state per repository, never one workspace-wide value.
+
 ### Fixed — Shield pre-manual-test hardening (Phase 9)
 
 Every item below was reproduced empirically before being fixed, and each

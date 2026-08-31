@@ -246,25 +246,25 @@ hooks that block unsafe commits and pushes — wrong identity, a protected
 branch, detached HEAD, an in-progress merge/rebase, a push to a
 destination or over a route that doesn't match what Shield approved for
 this repo, or — for a strict GitHub SSH profile with `expectedGitHubLogin`
-set — a route that authenticates live as the wrong GitHub account) exists
-behind
-command-palette commands only: `Repo Identity Guard: Enable/Disable/Repair
-Shield` and `...: Check Shield Health`. There is still no Settings/sidebar
-toggle for it — Settings carries only a one-line note saying Shield Mode
-provides optional local Git-hook enforcement and that its controls are in
-the Command Palette (see Limitations) — so this is opt-in and easy to
-miss unless you go looking for it, deliberately, until a dedicated UI
-phase. Enforcement itself runs standalone (a POSIX shell script Shield
-installs alongside both hooks) and works with VS Code completely closed.
-A repository that already runs Husky, `pre-commit`, or another hook
-manager is never silently overridden — by default Shield simply won't
-install into an occupied hook slot (reported degraded), and an explicit
-opt-in (`chainForeignHooks`, not yet exposed as a command prompt) chains
-the existing hook exactly, restoring it byte-for-byte on disable. Chaining
-is limited to executable regular files, which Shield preserves
-byte-for-byte; a symlinked or non-executable hook is left completely
-untouched and reported degraded with the reason, rather than being
-converted into something Shield can handle.
+set — a route that authenticates live as the wrong GitHub account) is
+opt-in — Shield checks safety either way, but only Shield actively blocks
+unsafe operations. It has a dedicated sidebar screen (Main's "Shield —
+<state>" summary, or Settings → Shield → "Open Shield") showing the real
+OFF / ACTIVE / DEGRADED / BROKEN state per repository, an explicit Enable
+Shield confirmation before anything is installed, and Check Health / Repair
+Shield / Disable Shield actions — as well as the same `Repo Identity Guard:
+Enable/Disable/Repair Shield` and `...: Check Shield Health` commands from
+the Command Palette. Enforcement itself runs standalone (a POSIX shell
+script Shield installs alongside both hooks) and works with VS Code
+completely closed. A repository that already runs Husky, `pre-commit`, or
+another hook manager is never silently overridden — by default Shield
+simply won't install into an occupied hook slot (reported degraded), and
+the Enable Shield screen shows the real choice up front: leave the
+existing hook unchanged, or chain it (only offered when it's an executable
+regular file Shield can preserve byte-for-byte and restore on disable — a
+symlinked or non-executable hook is left completely untouched and reported
+degraded with the reason, never converted into something Shield can
+handle).
 
 Shield's hooks **fail closed**: if a hook is installed but Shield's
 evaluator is missing or unreadable, the commit or push is blocked with a
@@ -426,13 +426,6 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
 
 ## Limitations in this build
 
-- **Shield Mode has no sidebar UI yet.** Its pre-commit, pre-merge-commit,
-  and pre-push hooks can be installed/removed/repaired/health-checked only
-  via command-palette commands (`Repo Identity Guard: Enable/Disable/Repair
-  Shield`, `...: Check Shield Health`). The sidebar's Settings card is a
-  plain one-line note pointing at those commands — there is no toggle
-  there that could be mistaken for a working one, and (since Phase 9) no
-  copy anywhere claiming Shield does not exist.
 - **Shield cannot see a clean cherry-pick or revert.** Git commits those
   (when there's no conflict to resolve) via an internal fast path that
   invokes no commit hook at all — not specific to Shield, and not fixable
