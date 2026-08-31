@@ -193,6 +193,24 @@ test("onboarding scope maps 1:1 onto the existing Profile schema (exactRepos vs 
   assert.deepEqual(ownerScopedProfile.exactRepos, []);
 });
 
+test("submitOnboarding hands off to Shield Discovery, never enabling Shield itself", () => {
+  const navigated: string[] = [];
+  const { sandbox } = loadClientSandbox("var navigate = function(v){ navigated.push(v); };");
+  (sandbox as { navigated?: string[] }).navigated = navigated;
+  (sandbox as { state?: unknown }).state = { facts: {} };
+  (sandbox.submitOnboarding as () => void)();
+  assert.deepEqual(navigated, ["shieldDiscovery"]);
+});
+
+test("Onboarding — Shield Discovery explains Shield is optional and offers a neutral Not Now, never enabling automatically", () => {
+  const { sandbox } = loadClientSandbox("var out = renderShieldDiscovery();");
+  const out = sandbox.out as string;
+  assert.match(out, /Protect this repository with Shield/);
+  assert.match(out, /optional/i);
+  assert.match(out, /Enable Shield/);
+  assert.match(out, /Not Now/);
+});
+
 // ==================== Shield view ====================
 
 function shieldState(overrides: Record<string, unknown> = {}) {

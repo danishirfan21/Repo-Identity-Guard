@@ -104,6 +104,29 @@ function submitOnboarding() {
     profile.exactRepos = [facts.canonicalRepo];
   }
   send("saveProfile", { profile });
-  navigate("main");
+  // Shield is optional and is asked about separately, once the resulting
+  // safety state (from the profile just created) is visible — see
+  // renderShieldDiscovery below. Never enabled automatically.
+  navigate("shieldDiscovery");
+}
+
+/**
+ * Onboarding — Shield Discovery. Shown once, immediately after profile
+ * creation, never gating it: Shield is optional, and "Not Now" is a
+ * perfectly normal, neutral choice — never presented as unsafe.
+ */
+function renderShieldDiscovery() {
+  return \`
+    <div class="flex flex-col gap-3">
+      <div class="flex flex-col items-center gap-2 rounded-lg border border-outline-variant bg-surface-container-low p-4 text-center">
+        <span class="text-primary">\${icon("shield", 26)}</span>
+        <span class="text-[13px] font-semibold text-on-surface">Protect this repository with Shield?</span>
+        <p class="m-0 text-[11px] leading-relaxed text-on-surface-variant">Shield can block ordinary unsafe commits and pushes locally, including commands run by AI coding agents. It's optional — Repo Identity Guard already checks safety either way.</p>
+      </div>
+      <div class="flex flex-col gap-1.5">
+        <button class="vs-button-primary flex h-8 items-center justify-center gap-1.5 rounded text-[12px] font-semibold" id="obEnableShieldButton">\${icon("power", 13)}Enable Shield</button>
+        <button class="vs-button-secondary flex h-8 items-center justify-center rounded text-[12px] font-semibold" id="obNotNowButton">Not Now</button>
+      </div>
+    </div>\`;
 }
 `;

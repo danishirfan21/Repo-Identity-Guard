@@ -19,6 +19,7 @@ let view = "main";
 
 function headerFor(v) {
   if (v === "onboarding") return ["Repo Identity Guard", "Quick setup"];
+  if (v === "shieldDiscovery") return ["Repo Identity Guard", "Quick setup"];
   if (v === "main") return ["Repo Identity Guard", "Safe to work, commit, push?"];
   if (v === "details") return ["Review Details", "Full issue list"];
   if (v === "memory") return ["Repo Memory", "Notes and saved commands"];
@@ -37,9 +38,10 @@ function render() {
   const [title, subtitle] = headerFor(view);
   headerTitle.textContent = title;
   headerSubtitle.textContent = subtitle;
-  backButton.classList.toggle("hidden", view === "main" || view === "onboarding");
+  backButton.classList.toggle("hidden", view === "main" || view === "onboarding" || view === "shieldDiscovery");
 
   if (view === "onboarding") app.innerHTML = renderOnboarding();
+  else if (view === "shieldDiscovery") app.innerHTML = renderShieldDiscovery();
   else if (view === "main") app.innerHTML = renderMain();
   else if (view === "details") app.innerHTML = renderDetails();
   else if (view === "memory") app.innerHTML = renderMemory();
@@ -193,6 +195,8 @@ document.addEventListener("click", (event) => {
   const obLabelBtn = target.closest("[data-ob-label]");
   if (obLabelBtn) { obLabel = obLabelBtn.dataset.obLabel; render(); if (obLabel === "Other") document.getElementById("obCustomLabelInput").focus(); return; }
   if (target.closest("#obCreateButton")) { submitOnboarding(); return; }
+  if (target.closest("#obEnableShieldButton")) { navigate("shieldEnable"); return; }
+  if (target.closest("#obNotNowButton")) { navigate("main"); return; }
 });
 
 document.addEventListener("keydown", (event) => {
