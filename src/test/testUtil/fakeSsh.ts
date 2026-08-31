@@ -79,7 +79,36 @@ if (joined.includes(" -G ")) {
   return binDir;
 }
 
-/** Prepends the fake ssh bin directory onto an existing PATH value. */
+/**
+ * Prepends the fake ssh bin directory onto an existing PATH value.
+ *
+ * Windows root-cause fix (found from a real windows-latest CI run's `spawn
+ * sh ENOENT`): Node's `process.env` is a case-insensitive proxy on Windows,
+ * but spreading it (`{ ...env }`) — which every caller here does before
+ * this function ever sees the object — flattens that proxy into a PLAIN
+ * object with whatever literal casing the OS actually used, typically
+ * `Path`, not `PATH`. The old version of this function then read
+ * `env.PATH` (a case-SENSITIVE property lookup on that plain object),
+ * got `undefined`, and wrote a NEW, separate `PATH` key containing only
+ * the fake ssh bin dir — leaving the original `Path` key (with the real
+ * PATH, including wherever `sh`/`git` actually live) untouched but shadowed.
+ * A child process spawned with both keys present gets undefined behavior on
+ * Windows, and empirically got the fake-ssh-only `PATH`, so `sh` itself
+ * could no longer be found. Same fix `shieldGitHubAccountBinding.test.ts`'s
+ * `normalizePathKey`/`shieldPrePush.test.ts` already apply for the same
+ * reason — collapse every differently-cased PATH key to one canonical
+ * `PATH` before prepending, rather than trusting `env.PATH` to exist.
+ */
 export function withFakeSshOnPath(env: NodeJS.ProcessEnv, fakeSshBin: string): NodeJS.ProcessEnv {
-  return { ...env, PATH: `${fakeSshBin}${path.delimiter}${env.PATH ?? ""}` };
+  const result: NodeJS.ProcessEnv = {};
+  let existingPath: string | undefined;
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === "PATH") {
+      existingPath = existingPath ?? value;
+      continue;
+    }
+    result[key] = value;
+  }
+  result.PATH = `${fakeSshBin}${path.delimiter}${existingPath ?? ""}`;
+  return result;
 }

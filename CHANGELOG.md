@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Fixed — Windows CI: test-harness PATH-casing bug (`spawn sh ENOENT`)
+
+A real windows-latest CI run of the Phase 1/B-E changes failed
+`shieldEvaluatorScript.test.ts` and `shieldSshTransportEquivalence.test.ts`
+with `spawn sh ENOENT`. Root cause: the shared test helper
+`withFakeSshOnPath` (added this session to exercise the new destination
+host canonicalization) read `env.PATH` directly, but Node's `process.env`
+is a case-insensitive proxy on Windows — spreading it into a plain object
+(`{ ...process.env }`, done by every caller) flattens that into whatever
+literal casing Windows used (typically `Path`, not `PATH`). Reading
+`env.PATH` on that plain object found nothing, so the fake-ssh bin
+directory was written into a brand-new `PATH` key that existed ALONGSIDE
+the untouched, differently-cased `Path` key — and the child process
+picked the new one, which contained only the fake ssh directory, not the
+real PATH `sh`/`git` live on. Fixed by collapsing every differently-cased
+PATH key into one canonical `PATH` before prepending (the same fix
+`shieldGitHubAccountBinding.test.ts`'s `normalizePathKey` and
+`shieldPrePush.test.ts` already apply, for the identical reason) —
+verified against a simulated Windows-shaped env object locally. This is a
+test-harness fix only; no Shield production semantics changed, and the
+release-blocker invariant (an unrelated host must never match an approved
+destination on owner/repo text alone) is untouched.
+
+### Changed — CI now builds with Node 22
+
+`@vscode/vsce`'s own Azure DevOps PAT-auth dependency chain
+(`@azure/*`) declares `"engines.node": ">=22.0.0"`; CI was pinned to
+Node 20, which `npm ci` accepts with a warning rather than a hard
+failure, but is exactly the "tooling needs a newer Node than CI
+provides" mismatch. Bumped `actions/setup-node`'s `node-version` to 22
+in `.github/workflows/ci.yml`. This does not raise the shipped
+extension's own minimum VS Code version (`engines.vscode`, untouched) —
+only what Node this workflow uses to build and test it.
+
 ### Fixed — Push Destination host bypass (release blocker)
 
 Shield's push-destination check matched a push's owner/repo text alone,

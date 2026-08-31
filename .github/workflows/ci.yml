@@ -26,9 +26,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Node 22, not 20: several of @vscode/vsce's own transitive
+      # dependencies (the @azure/* packages its Azure DevOps PAT auth path
+      # pulls in) declare "engines.node": ">=22.0.0" -- Node 20 npm-installs
+      # them anyway (npm warns, doesn't block), but that's exactly the
+      # "tooling wants a newer Node than CI provides" mismatch, and it's
+      # dev/build tooling only. This does NOT touch package.json's
+      # "engines.vscode" -- the shipped extension's own minimum VS Code
+      # version is unrelated to what Node this workflow builds it with.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm ci
