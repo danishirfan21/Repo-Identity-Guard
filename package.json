@@ -16,6 +16,18 @@
     "SCM Providers",
     "Other"
   ],
+  "keywords": [
+    "git",
+    "identity",
+    "safety",
+    "security",
+    "ssh",
+    "github",
+    "ai agent",
+    "pre-commit",
+    "pre-push",
+    "hooks"
+  ],
   "activationEvents": [
     "onStartupFinished"
   ],
