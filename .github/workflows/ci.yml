@@ -24,7 +24,7 @@ jobs:
     # for the overhead itself.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Node 22, not 20: several of @vscode/vsce's own transitive
       # dependencies (the @azure/* packages its Azure DevOps PAT auth path
@@ -34,7 +34,7 @@ jobs:
       # dev/build tooling only. This does NOT touch package.json's
       # "engines.vscode" -- the shipped extension's own minimum VS Code
       # version is unrelated to what Node this workflow builds it with.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
