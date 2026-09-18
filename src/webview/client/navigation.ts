@@ -51,6 +51,12 @@ function render() {
 }
 
 function navigate(next) {
+  // Reset the hook-chaining choice only when actually ENTERING the Enable
+  // Shield confirmation screen, not on every re-render of it: render() also
+  // runs on every backend state push (rescan, settings change, etc.) while
+  // already sitting on this screen, and resetting there silently discarded
+  // whatever the user had just selected before they could click Confirm.
+  if (next === "shieldEnable" && view !== "shieldEnable") { shieldChainChoice = "leave"; }
   view = next;
   render();
 }

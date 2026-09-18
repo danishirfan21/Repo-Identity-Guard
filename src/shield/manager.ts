@@ -256,6 +256,20 @@ export interface ShieldInspection {
    */
   gitVersionRaw?: string;
   gitVersionSupported: boolean;
+  /**
+   * True only when a Git version was actually PARSED and found to be below
+   * Shield's floor — i.e. Shield positively identified an incompatible
+   * Git, as opposed to merely failing to determine the version at all
+   * (`git --version` erroring, an unparseable line, or `inspect()` itself
+   * failing before it ever got that far). `gitVersionSupported` alone
+   * conflates those two very different cases: both make it `false`, but
+   * only the first one means the fixed "requires Git 2.31" UI messaging is
+   * actually true. `false` here (with `gitVersionSupported` also `false`)
+   * means "unknown," and the underlying `state` — degraded, broken,
+   * whatever it genuinely is — must be shown as-is, not papered over with
+   * an unrelated Git-version explanation.
+   */
+  gitVersionKnownUnsupported: boolean;
 }
 
 export interface ShieldOperationResult {
@@ -568,6 +582,10 @@ export class ShieldManager {
         pushDestinationDrift: false,
         orphanedHookPaths: [],
         gitVersionSupported: false,
+        // The Git version was never even read here — resolveGitContext
+        // failed before that, for an unrelated reason. Unknown, not
+        // positively unsupported.
+        gitVersionKnownUnsupported: false,
       };
     }
 
@@ -706,10 +724,27 @@ export class ShieldManager {
     if (policyResult?.ok && options.currentPushDestination) {
       const approved = policyResult.policy.approvedPushDestination;
       const current = options.currentPushDestination;
-      const ownerChanged = normalizeOwnerRepo(approved?.owner) !== normalizeOwnerRepo(current.owner);
-      const repoChanged =
-        !!approved?.repo && !!current.repo && normalizeOwnerRepo(approved.repo) !== normalizeOwnerRepo(current.repo);
-      pushDestinationDrift = ownerChanged || repoChanged;
+      if (!approved || !approved.owner) {
+        // No baseline destination was ever approved for this policy —
+        // pre-push evaluation already fails closed on every push in this
+        // case (see evaluator.ts's destinationReasons), so health must not
+        // silently report "active" while enforcement is effectively
+        // unconditional-block. Health and hook enforcement must agree.
+        pushDestinationDrift = true;
+      } else {
+        // Canonical destination model, same three fields and same
+        // fail-closed posture as the evaluator's destinationReasons: a
+        // field the approval recorded but the current push destination
+        // can't reproduce (missing host/repo evidence) is a change, never
+        // a silent match — comparing two empty strings is the only way
+        // "unchanged" is reached here, and that only happens when NEITHER
+        // side ever had that field (a pre-canonical-host policy with no
+        // current host either).
+        const hostChanged = normalizeOwnerRepo(approved.host) !== normalizeOwnerRepo(current.host);
+        const ownerChanged = normalizeOwnerRepo(approved.owner) !== normalizeOwnerRepo(current.owner);
+        const repoChanged = !!approved.repo && normalizeOwnerRepo(approved.repo) !== normalizeOwnerRepo(current.repo);
+        pushDestinationDrift = hostChanged || ownerChanged || repoChanged;
+      }
     }
 
     const hooksPathCustomized = !!coreHooksPath;
@@ -842,6 +877,7 @@ export class ShieldManager {
       orphanedHookPaths,
       gitVersionRaw: gitVersionRaw ?? undefined,
       gitVersionSupported: gitVersionSupport.supported,
+      gitVersionKnownUnsupported: !gitVersionSupport.supported && gitVersionSupport.version !== undefined,
     };
   }
 

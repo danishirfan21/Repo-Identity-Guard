@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+### Fixed — independent adversarial review: 7 correctness/security fixes
+
+An independent review of the release branch found seven issues, all now
+fixed with regression tests:
+
+1. **Sidebar Push Destination trusted owner text on arbitrary hosts.**
+   `checkPushDestination`'s owner-pattern branch (`expectedRemoteOwners`)
+   matched on owner/repo text alone, so
+   `git@evil.example:AcmeSoftware/backend.git` could read as a confirmed
+   destination for a profile expecting owner "AcmeSoftware" — with only
+   the (non-blocking under a relaxed profile) Push Account check standing
+   in the way of an overall SAFE verdict. Owner-pattern matching is now
+   host-aware: only a well-known generic host (github.com, gitlab.com,
+   bitbucket.org) or a host the matched profile explicitly lists in
+   `trustedSshHostAliases` is eligible. Exact-repository matching was
+   already host-aware (its key is `host/owner/repo`) and is unaffected.
+2. **Shield health/drift ignored host, and missing evidence compared
+   equal.** `pushDestinationDrift` compared owner/repo only, so a push
+   destination that moved to a different HOST while keeping the same
+   owner/repo text read as unchanged — Shield stayed ACTIVE instead of
+   DEGRADED. Also, a missing `currentPushDestination.repo` against an
+   approved `repo` silently compared as "unchanged" rather than as drift.
+   Both fixed: host is now part of the comparison, and missing evidence
+   is drift, never a silent match — matching the fail-closed model the
+   pre-push evaluator already uses.
+3. **Enable Shield's hook-chaining choice couldn't actually be selected.**
+   `renderShieldEnable()` reset the Chain/Leave radio choice to "leave" on
+   every render — including the re-render its own change handler
+   triggered immediately after selecting "chain". The UI displayed the
+   Chain option but clicking it had no visible effect. Fixed by resetting
+   the choice only when the confirmation screen is actually entered
+   (`navigate("shieldEnable")`), not on every re-render.
+4. **A generic Shield inspection failure could be mislabeled "requires Git
+   2.31."** `!gitVersionSupported ? "unavailable" : inspection.state`
+   conflated "Git version positively confirmed too old" with "Git version
+   never determined" (e.g. `resolveGitContext` erroring for an unrelated
+   reason) — both make `gitVersionSupported` false. A BROKEN inspection
+   failure could therefore render as "SHIELD — UNAVAILABLE / requires Git
+   2.31" even when Git's version was never the issue. Added
+   `gitVersionKnownUnsupported` (true only when a version was actually
+   parsed and found below the floor); the UI now only shows the fixed
+   "unavailable" screen in that case, otherwise showing the real state.
+5. **Webview messages and persisted settings were cast, not validated.**
+   `message.profile as Profile`, `message.branches as string[]`, and the
+   equivalent `.get<Profile[]>(...)` reads from `settings.json` assumed a
+   shape neither a webview message nor a hand-edited/synced settings file
+   is guaranteed to have. Added `src/validation.ts` (no external schema
+   dependency) with runtime validators for every `Profile` field and for
+   branch/string-array settings; malformed webview messages are now
+   dropped rather than partially actioned, and malformed persisted
+   settings are sanitized (bad array elements dropped, bad profiles
+   skipped without taking the rest of the list down) rather than reaching
+   a downstream `.map`/`.some` that would throw.
+6. **Workspace Trust gating was inconsistent.** Repo Memory mutation
+   (notes), saved-command mutation (add/remove), profile save/delete,
+   protected-branch/preference saves, "Add Profile for This Repo," and
+   "Assign This Repo to a Profile" (fork-conflict resolution) did not
+   check Workspace Trust, unlike Fix Commit Identity and Shield
+   enable/repair/disable, which already did. All mutating sidebar actions
+   now consistently require a trusted workspace; read-only actions (view,
+   copy-to-clipboard, rescan, select repo) remain available regardless.
+
 ### Fixed — Windows CI: test-harness PATH-casing bug (`spawn sh ENOENT`)
 
 A real windows-latest CI run of the Phase 1/B-E changes failed

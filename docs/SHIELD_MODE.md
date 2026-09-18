@@ -8,12 +8,17 @@ hooks plus a standalone POSIX-shell evaluator under
 `<git-common-dir>/repo-identity-guard/`, and they block unsafe commits and
 pushes with VS Code completely closed. Requires **Git 2.31 or newer**.
 
-Controls are Command Palette only (`Enable`/`Disable`/`Repair Shield`,
-`Check Shield Health`). Settings carries a one-line note pointing at those
-commands — there is no sidebar dashboard and no toggle. Nothing in the
-product says Shield "is not built yet" or "coming soon" any more; where
-this document still contains such a sentence it is inside a **historical,
-superseded** phase section and is labelled as such.
+Shield has a dedicated sidebar screen (OFF / ACTIVE / DEGRADED / BROKEN /
+UNAVAILABLE, reached from Main's Shield summary card or Settings) that
+surfaces the same enable/disable/repair/health-check actions, including the
+Enable Shield confirmation flow and its foreign-hook chaining decision when
+another tool already occupies a hook slot Shield wants. The equivalent
+Command Palette commands (`Enable`/`Disable`/`Repair Shield`, `Check Shield
+Health`) still exist and call the exact same code paths — the sidebar is
+not a separate implementation. Nothing in the product says Shield "is not
+built yet" or "coming soon" any more; where this document still contains
+such a sentence it is inside a **historical, superseded** phase section and
+is labelled as such.
 
 The threat boundary below is **not** historical and has not moved:
 `--no-verify`, a deliberate `core.hooksPath` override, and arbitrary local
@@ -1972,6 +1977,38 @@ the converse does not hold. When they diverge — the repository moved
 within a trusted owner — Shield reports `pushDestinationDrift` and asks
 for an explicit Repair rather than either side silently overruling the
 other.
+
+### Phase 8 addendum: owner-pattern matching must be host-aware
+
+**Defect (independent review).** Rule 2 above ("owner-level matching is
+kept on purpose") checked `expectedRemoteOwners` against `pushRemoteOwner`
+**text alone**, with no host check. `expectedRemoteOwners` documents
+itself as "GitHub owners/orgs," but nothing enforced that the push
+destination was actually on GitHub (or any host the profile has a reason
+to trust) — `git@evil.example:AcmeSoftware/backend.git` satisfied an
+owner pattern of `AcmeSoftware` exactly as readily as
+`git@github.com:AcmeSoftware/backend.git` did. Under a relaxed
+(`strictPushSetup: false`) profile, Push Account for that same route reads
+as merely `push_account:unverified_untrusted_alias` (non-blocking), so the
+combination read as an overall **SAFE** verdict for a push to a host that
+shares nothing with the intended destination but the owner/repo text.
+
+**Fix.** Owner-pattern matching now additionally requires the push
+destination's host to be *eligible*: either one of the well-known generic
+hosts (`github.com`, `gitlab.com`, `bitbucket.org` — the same
+`GENERIC_REMOTE_HOSTS` set Push Account already reasons about) or a host
+the matched profile explicitly lists in `trustedSshHostAliases`. A host
+that is neither — an arbitrary domain, or a plausible-looking-but-
+undeclared SSH alias — is never eligible for owner-pattern matching,
+regardless of how well the owner/repo text matches. Exact-repository
+matching (`exactRepos`) was never affected: its key is already
+`host/owner/repo`, so it was always host-aware.
+
+This mirrors, at the sidebar layer, the exact model the release-blocker
+fix (`resolvedHost`, above) already applies to Shield's hook-time
+`destinationReasons` — a canonical host has to be established through
+something the profile actually trusts, never assumed from matching
+owner/repo text on an arbitrary host.
 
 ### Phase 8: no durable policy from stale UI facts
 

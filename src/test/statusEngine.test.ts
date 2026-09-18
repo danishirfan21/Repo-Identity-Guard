@@ -307,6 +307,55 @@ test("push destination matching a profile's exact-repo override is confirmed eve
   assert.equal(result?.state, "confirmed");
 });
 
+// Release-blocker regression: owner/org trust must be host-aware. A push
+// destination on an arbitrary, untrusted host must never inherit trust from
+// a profile's expectedRemoteOwners pattern just because the owner/repo TEXT
+// happens to match — that would let `git@evil.example:AcmeSoftware/backend.git`
+// read as a confirmed destination for a profile expecting owner
+// "AcmeSoftware", with only the (non-blocking under a relaxed profile)
+// push_account check standing between it and an overall SAFE verdict.
+test("push destination on an arbitrary host is NOT SAFE even when the owner/repo text matches an expectedRemoteOwners pattern (relaxed strictPushSetup)", () => {
+  const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
+  const summary = computeStatus({
+    facts: safeFacts({
+      pushRemoteName: "origin",
+      pushRemoteUrl: "git@evil.example:AcmeSoftware/backend.git",
+      pushRemoteProtocol: "ssh",
+      pushRemoteHost: "evil.example",
+      pushRemoteOwner: "AcmeSoftware",
+      pushRemoteRepo: "backend",
+    }),
+    profiles: [relaxedProfile],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+  });
+  assert.equal(summary.level, "not_safe");
+  const destination = summary.capabilityResults.find((r) => r.capability === "push_destination");
+  assert.equal(destination?.state, "contradicted");
+  assert.equal(destination?.blocksOverallSafety, true);
+  assert.equal(destination?.title, "Push destination does not match Work");
+});
+
+test("push destination on a profile's own trusted SSH alias still confirms via owner pattern (legitimate alias unaffected by the host-aware fix)", () => {
+  // github-work is listed in workProfile.trustedSshHostAliases — this must
+  // keep working exactly as before: a trusted alias host is eligible for
+  // owner-pattern matching, only an arbitrary/untrusted host is not.
+  const summary = run(safeFacts());
+  const destination = summary.capabilityResults.find((r) => r.capability === "push_destination");
+  assert.equal(destination?.state, "confirmed");
+});
+
+test("push destination on a well-known generic host (github.com) still confirms via owner pattern", () => {
+  const summary = run(
+    safeFacts({
+      pushRemoteUrl: "git@github.com:AcmeSoftware/acme-frontend.git",
+      pushRemoteHost: "github.com",
+    }),
+  );
+  const destination = summary.capabilityResults.find((r) => r.capability === "push_destination");
+  assert.equal(destination?.state, "confirmed");
+});
+
 test("push account is unverified over HTTPS; blocksOverallSafety follows strict push setup, state does not", () => {
   const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
   const strictProfile: Profile = { ...workProfile, strictPushSetup: true };
@@ -428,17 +477,28 @@ test("an untrusted push route blocks overall safety under a strict profile", () 
 });
 
 test("an untrusted push route stays non-blocking under a relaxed (non-strict) profile", () => {
+  // A well-known GENERIC host (github.com), not a bespoke SSH alias: this
+  // is the case where destination and account are genuinely independent —
+  // the owner-pattern destination match is host-eligible (github.com is a
+  // recognized generic host), while the *account* authenticating a generic
+  // host is still unverifiable regardless. (A bespoke, undeclared alias
+  // like "github-work" is deliberately NOT host-eligible for owner-pattern
+  // destination matching post-fix — see the host-aware destination tests
+  // above — so it no longer doubles as a stand-in for "untrusted but still
+  // a confirmed destination" the way it did before that fix.)
   const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false, trustedSshHostAliases: [] };
   const summary = computeStatus({
-    facts: safeFacts({ pushRemoteHost: "github-work" }),
+    facts: safeFacts({ pushRemoteHost: "github.com", pushRemoteUrl: "git@github.com:AcmeSoftware/acme-frontend.git" }),
     profiles: [relaxedProfile],
     protectedBranches: ["main"],
     preferences: defaultPreferences,
   });
-  assert.equal(summary.level, "safe");
+  const destination = summary.capabilityResults.find((r) => r.capability === "push_destination");
+  assert.equal(destination?.state, "confirmed");
   const result = summary.capabilityResults.find((r) => r.capability === "push_account");
   assert.equal(result?.state, "unverified");
   assert.equal(result?.blocksOverallSafety, false);
+  assert.equal(summary.level, "safe");
 });
 
 test("no push_account result, trusted or unverified, ever claims cryptographic account verification", () => {

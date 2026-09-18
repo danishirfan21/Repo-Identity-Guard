@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { Profile } from "../types";
+import { isNonEmptyString, sanitizeProfile, sanitizeStringArray } from "../validation";
 import { SidebarModel, toWireState } from "./wireState";
 import { ICONS_JS } from "../webview/client/icons";
 import { COMPONENTS_JS } from "../webview/client/components";
@@ -77,6 +78,16 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
     this.view.webview.postMessage({ type: "state", payload: toWireState(this.model) });
   }
 
+  /**
+   * The webview is a trust boundary (see `../validation`): even though its
+   * only content today is this extension's own script, nothing here may
+   * assume a message has the shape a TypeScript cast claims. A message that
+   * fails validation for the field an action actually needs is dropped
+   * entirely — never coerced (`String(anObject)` silently becomes
+   * `"[object Object]"`, which is a worse failure mode than a no-op) and
+   * never partially actioned with a guessed default in place of the
+   * missing/malformed field.
+   */
   private async handleMessage(message: { type?: string; [key: string]: unknown }): Promise<void> {
     const a = this.actions;
     switch (message.type) {
@@ -108,46 +119,50 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
         await a.resolveProfileConflict();
         break;
       case "selectRepo":
-        await a.selectRepo(String(message.id ?? ""));
+        if (isNonEmptyString(message.id)) await a.selectRepo(message.id);
         break;
       case "addMemoryNote":
-        await a.addMemoryNote(String(message.text ?? ""), !!message.pinned);
+        if (isNonEmptyString(message.text)) await a.addMemoryNote(message.text, message.pinned === true);
         break;
       case "removeMemoryNote":
-        await a.removeMemoryNote(String(message.id ?? ""));
+        if (isNonEmptyString(message.id)) await a.removeMemoryNote(message.id);
         break;
       case "togglePinMemoryNote":
-        await a.togglePinMemoryNote(String(message.id ?? ""));
+        if (isNonEmptyString(message.id)) await a.togglePinMemoryNote(message.id);
         break;
       case "addSavedCommand":
-        await a.addSavedCommand(String(message.label ?? ""), String(message.command ?? ""));
+        if (isNonEmptyString(message.label) && isNonEmptyString(message.command)) {
+          await a.addSavedCommand(message.label, message.command);
+        }
         break;
       case "removeSavedCommand":
-        await a.removeSavedCommand(String(message.id ?? ""));
+        if (isNonEmptyString(message.id)) await a.removeSavedCommand(message.id);
         break;
       case "runSavedCommand":
-        await a.runSavedCommand(String(message.id ?? ""));
+        if (isNonEmptyString(message.id)) await a.runSavedCommand(message.id);
         break;
       case "copySavedCommand":
-        await a.copySavedCommand(String(message.id ?? ""));
+        if (isNonEmptyString(message.id)) await a.copySavedCommand(message.id);
         break;
-      case "saveProfile":
-        await a.saveProfile(message.profile as Profile);
+      case "saveProfile": {
+        const profile = sanitizeProfile(message.profile);
+        if (profile) await a.saveProfile(profile);
         break;
+      }
       case "deleteProfile":
-        await a.deleteProfile(String(message.id ?? ""));
+        if (isNonEmptyString(message.id)) await a.deleteProfile(message.id);
         break;
       case "saveProtectedBranches":
-        await a.saveProtectedBranches((message.branches as string[]) ?? []);
+        await a.saveProtectedBranches(sanitizeStringArray(message.branches));
         break;
       case "saveRequireLocalIdentity":
-        await a.saveRequireLocalIdentity(!!message.value);
+        if (typeof message.value === "boolean") await a.saveRequireLocalIdentity(message.value);
         break;
       case "saveIncludeMemoryInAiContext":
-        await a.saveIncludeMemoryInAiContext(!!message.value);
+        if (typeof message.value === "boolean") await a.saveIncludeMemoryInAiContext(message.value);
         break;
       case "enableShield":
-        await a.enableShield(!!message.chainForeignHooks);
+        await a.enableShield(message.chainForeignHooks === true);
         break;
       case "disableShield":
         await a.disableShield();

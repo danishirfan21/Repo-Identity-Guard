@@ -157,6 +157,7 @@ function inspection(overrides: Partial<ShieldInspection> = {}): ShieldInspection
     orphanedHookPaths: [],
     gitVersionRaw: "git version 2.43.0",
     gitVersionSupported: true,
+    gitVersionKnownUnsupported: false,
     ...overrides,
   };
 }
@@ -184,9 +185,47 @@ test("toWireShieldState maps every ShieldLifecycleState through unchanged when G
 });
 
 test("a Git too old to run Shield reports 'unavailable', even when Shield reports itself 'off' because it was never enabled", () => {
-  const wire = toWireShieldState(inspection({ state: "off", gitVersionSupported: false, gitVersionRaw: "git version 2.20.0", hooks: [], policyPresent: false, policyValid: false, policySnapshot: undefined, evaluatorPresent: false, evaluatorOwned: false }));
+  const wire = toWireShieldState(inspection({ state: "off", gitVersionSupported: false, gitVersionKnownUnsupported: true, gitVersionRaw: "git version 2.20.0", hooks: [], policyPresent: false, policyValid: false, policySnapshot: undefined, evaluatorPresent: false, evaluatorOwned: false }));
   assert.equal(wire.lifecycle, "unavailable");
   assert.equal(wire.gitVersionRaw, "git version 2.20.0");
+});
+
+// Review finding: `!gitVersionSupported ? "unavailable" : inspection.state`
+// used to map ANY inspection failure that never determined the Git version
+// (e.g. `resolveGitContext` erroring before `git --version` was even read)
+// to "unavailable / requires Git 2.31", regardless of the real reason. A
+// generic BROKEN inspection failure must stay BROKEN unless Git was
+// positively identified as unsupported.
+test("a generic inspection failure (Git version never determined) stays BROKEN, not mislabeled 'unavailable'", () => {
+  const wire = toWireShieldState(
+    inspection({
+      state: "broken",
+      reasons: ["Could not inspect this repository's Git state: some unrelated error"],
+      gitVersionSupported: false,
+      gitVersionKnownUnsupported: false,
+      gitVersionRaw: undefined,
+      hooks: [],
+      policyPresent: false,
+      policyValid: false,
+      policySnapshot: undefined,
+      evaluatorPresent: false,
+      evaluatorOwned: false,
+    }),
+  );
+  assert.equal(wire.lifecycle, "broken");
+});
+
+test("a generic degraded state with an unreadable Git version also stays as reported, not 'unavailable'", () => {
+  const wire = toWireShieldState(
+    inspection({
+      state: "degraded",
+      reasons: ["Shield's evaluator copy is missing or was modified outside Repo Identity Guard."],
+      gitVersionSupported: false,
+      gitVersionKnownUnsupported: false,
+      gitVersionRaw: undefined,
+    }),
+  );
+  assert.equal(wire.lifecycle, "degraded");
 });
 
 test("Active Shield exposes real available fields — approved destination, trusted alias, expected GitHub login — never fabricated", () => {

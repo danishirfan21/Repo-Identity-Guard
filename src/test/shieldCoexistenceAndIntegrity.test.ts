@@ -698,6 +698,52 @@ test("integrity: approved push destination drift is detected only when the calle
   }
 });
 
+// Review finding: `pushDestinationDrift` used to compare owner/repo ONLY,
+// ignoring host entirely -- so a push destination that moved to a different
+// HOST while keeping the same owner/repo text read as unchanged, and Shield
+// stayed "active" rather than "degraded". Health status and hook
+// enforcement (which DOES require host identity, independent of
+// strictPushSetup -- see the release-blocker fix in evaluator.ts) must
+// agree about whether the approved destination changed.
+test("integrity: a host-only change in the push destination IS drift, even with the same owner/repo (health must agree with hook enforcement)", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const manager = new ShieldManager();
+    // approvedPushDestination is built from pushRemoteHost/Owner/Repo — see
+    // baseFacts(), host "github.com".
+    await enableShield(manager, repo);
+    assert.equal((await manager.inspect(repo.dir)).state, "active");
+
+    const withHostDrift = await manager.inspect(repo.dir, {
+      currentPushDestination: { host: "evil.example", owner: "AcmeSoftware", repo: "acme-frontend" },
+    });
+    assert.equal(withHostDrift.pushDestinationDrift, true, "same owner/repo, different host, must still be drift");
+    assert.equal(withHostDrift.state, "degraded");
+  } finally {
+    await cleanup(repo.dir);
+  }
+});
+
+test("integrity: missing repo evidence in the current push destination is drift, never silently treated as unchanged", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const manager = new ShieldManager();
+    await enableShield(manager, repo);
+    assert.equal((await manager.inspect(repo.dir)).state, "active");
+
+    // approved.repo is set ("acme-frontend") but current.repo is missing —
+    // the old `!!current.repo &&` guard treated this as "can't compare, so
+    // not changed"; missing evidence must never be silently equal.
+    const withMissingRepo = await manager.inspect(repo.dir, {
+      currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: undefined },
+    });
+    assert.equal(withMissingRepo.pushDestinationDrift, true);
+    assert.equal(withMissingRepo.state, "degraded");
+  } finally {
+    await cleanup(repo.dir);
+  }
+});
+
 test("integrity: account verification configuration drift (expectedGitHubLogin changed) is detected via currentProfiles, and repair() re-syncs it", async () => {
   const repo = await makeTempRepo();
   try {

@@ -90,30 +90,35 @@ export function activate(context: vscode.ExtensionContext): void {
     addMemoryNote: async (text, pinned) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot || !text.trim()) return;
+      if (!(await requireWorkspaceTrust())) return;
       await memoryStore.addNote(repoRoot, text, pinned);
       refreshSidebar();
     },
     removeMemoryNote: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
+      if (!(await requireWorkspaceTrust())) return;
       await memoryStore.removeNote(repoRoot, id);
       refreshSidebar();
     },
     togglePinMemoryNote: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
+      if (!(await requireWorkspaceTrust())) return;
       await memoryStore.togglePin(repoRoot, id);
       await scan();
     },
     addSavedCommand: async (label, command) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot || !label.trim() || !command.trim()) return;
+      if (!(await requireWorkspaceTrust())) return;
       await memoryStore.addCommand(repoRoot, label, command);
       refreshSidebar();
     },
     removeSavedCommand: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
+      if (!(await requireWorkspaceTrust())) return;
       await memoryStore.removeCommand(repoRoot, id);
       refreshSidebar();
     },
@@ -135,6 +140,7 @@ export function activate(context: vscode.ExtensionContext): void {
     },
 
     saveProfile: async (profile: Profile) => {
+      if (!(await requireWorkspaceTrust())) return;
       const profiles = getProfiles();
       const index = profiles.findIndex((p) => p.id === profile.id);
       const next = index >= 0 ? profiles.map((p, i) => (i === index ? profile : p)) : [...profiles, profile];
@@ -150,18 +156,22 @@ export function activate(context: vscode.ExtensionContext): void {
       await scan();
     },
     deleteProfile: async (id) => {
+      if (!(await requireWorkspaceTrust())) return;
       await saveProfiles(getProfiles().filter((p) => p.id !== id));
       await scan();
     },
     saveProtectedBranches: async (branches) => {
+      if (!(await requireWorkspaceTrust())) return;
       await saveProtectedBranches(branches);
       await scan();
     },
     saveRequireLocalIdentity: async (value) => {
+      if (!(await requireWorkspaceTrust())) return;
       await saveRequireLocalIdentity(value);
       await scan();
     },
     saveIncludeMemoryInAiContext: async (value) => {
+      if (!(await requireWorkspaceTrust())) return;
       await saveIncludeMemoryInAiContext(value);
       await scan();
     },
@@ -528,6 +538,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   async function addProfileForRepo(): Promise<void> {
+    if (!(await requireWorkspaceTrust())) return;
     const { facts } = latestSummary;
 
     const label = await vscode.window.showInputBox({
@@ -582,6 +593,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   async function resolveProfileConflict(): Promise<void> {
+    if (!(await requireWorkspaceTrust())) return;
     const { facts } = latestSummary;
     const resolution = resolveProfiles(facts, getProfiles());
     const conflict = resolution.forkConflict;
@@ -649,13 +661,14 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   /**
-   * Minimal command-palette-only entry points for Phase 3 (Shield's
-   * install/repair/disable/health-check lifecycle) — deliberately not
-   * wired into the sidebar yet; that's a later, dedicated UI phase. Every
-   * write goes through `requireWorkspaceTrust()` first, same as Fix
-   * Commit Identity, since installing a Git hook is exactly the kind of
-   * mutating action Workspace Trust exists to gate; a plain health check
-   * is read-only and works regardless.
+   * Shield's install/repair/disable/health-check lifecycle. These are the
+   * same functions both the Command Palette commands (registered below)
+   * and the sidebar's dedicated Shield screen call — the sidebar is not a
+   * separate implementation. Every write goes through
+   * `requireWorkspaceTrust()` first, same as Fix Commit Identity, since
+   * installing a Git hook is exactly the kind of mutating action Workspace
+   * Trust exists to gate; a plain health check is read-only and works
+   * regardless.
    */
   /**
    * Re-collects everything a durable Shield policy is built from, right

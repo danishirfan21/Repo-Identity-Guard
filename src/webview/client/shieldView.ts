@@ -201,7 +201,6 @@ function renderHookConflictSection() {
 }
 
 function renderShieldEnable() {
-  shieldChainChoice = "leave";
   const s = state.shield;
   return \`
     <div class="vs-card flex flex-col gap-1 rounded p-2.5 font-code-mono text-code-mono">

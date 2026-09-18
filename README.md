@@ -456,11 +456,17 @@ See [TESTING.md](TESTING.md) for the manual scenario matrix.
   doesn't recursively crawl nested directories looking for `.git` folders
   that aren't themselves workspace folders (e.g. repos several levels deep
   inside one open folder, never added as their own workspace folder).
-- **No cryptographic account verification.** "Push account is unverified"
-  never upgrades to "verified" — Repo Identity Guard doesn't make network
-  calls (e.g. an SSH test connection) to confirm which account a key or
-  credential belongs to. SSH host aliases are trusted from your own profile
-  configuration, not cryptographically checked.
+- **No cryptographic account verification, anywhere.** The ordinary
+  sidebar safety check never makes a network call — "Push account is
+  unverified" never upgrades to "verified" there, and SSH host aliases are
+  trusted from your own profile configuration, not checked. Shield Mode's
+  optional strict `expectedGitHubLogin` setting is the one exception that
+  makes a real network call (`ssh -T` against the resolved host, at push
+  time) to read back GitHub's own SSH login banner — but that is GitHub's
+  self-reported username, not a cryptographic proof of identity; a
+  malicious or compromised host could in principle answer with fabricated
+  output. See docs/SHIELD_MODE.md's Phase 5 section for the exact
+  boundary.
 - **Worktree config isn't fully modeled.** Fixing identity on a linked
   worktree shows a warning about scope (this worktree vs. every worktree)
   based on `extensions.worktreeConfig`, but doesn't manage per-worktree

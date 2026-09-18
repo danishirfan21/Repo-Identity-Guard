@@ -237,10 +237,27 @@ function checkPushDestination(facts: RepoFacts, profile: Profile | undefined): C
   // true, and when they diverge (the repo moved within a trusted owner)
   // Shield reports `pushDestinationDrift` and asks for an explicit
   // Repair. Neither ever calls a destination the other rejects "safe".
+  // Owner/org trust is host-aware: `expectedRemoteOwners` names a GitHub
+  // (or other well-known) owner, never a promise about an arbitrary host.
+  // `git@evil.example:AcmeSoftware/backend.git` must not inherit trust from
+  // a profile expecting owner "AcmeSoftware" just because the path text
+  // matches — the host has to be one Shield/the sidebar can actually reason
+  // about: a well-known generic remote host (github.com, gitlab.com,
+  // bitbucket.org), or a host alias THIS profile explicitly trusts. Exact
+  // repo matching is unaffected — its `host/owner/repo` key already binds
+  // the pattern to a specific host (`canonicalRepoKey`), so it was never
+  // host-unaware.
+  const trustedHostAliases = (profile.trustedSshHostAliases ?? []).map((alias) => alias.toLocaleLowerCase());
+  const pushHost = facts.pushRemoteHost?.toLocaleLowerCase();
+  const ownerPatternHostEligible =
+    !!pushHost && (GENERIC_REMOTE_HOSTS.has(pushHost) || trustedHostAliases.includes(pushHost));
+
   const declaresConstraint = exactRepoPatterns.length > 0 || expectedOwners.length > 0;
   const matchesExactRepo = !!pushKey && exactRepoPatterns.some((pattern) => wildcardMatch(pushKey, pattern));
   const matchesOwnerPattern =
-    !!facts.pushRemoteOwner && expectedOwners.some((pattern) => wildcardMatch(facts.pushRemoteOwner as string, pattern));
+    ownerPatternHostEligible &&
+    !!facts.pushRemoteOwner &&
+    expectedOwners.some((pattern) => wildcardMatch(facts.pushRemoteOwner as string, pattern));
 
   const destinationMatches = !declaresConstraint || matchesExactRepo || matchesOwnerPattern;
   if (!destinationMatches) {

@@ -77,7 +77,13 @@ export function toWireShieldState(inspection: ShieldInspection | undefined): Wir
     };
   }
 
-  const lifecycle: ShieldUiLifecycle = !inspection.gitVersionSupported ? "unavailable" : inspection.state;
+  // Only a POSITIVELY identified unsupported Git overrides the underlying
+  // state with the fixed "requires Git 2.31" screen — an unrelated
+  // inspection failure (e.g. `resolveGitContext` erroring before Git's
+  // version was ever read) must surface as whatever it actually is
+  // (broken, degraded, ...), never mislabeled as a Git-version problem it
+  // has nothing to do with. See `ShieldInspection.gitVersionKnownUnsupported`.
+  const lifecycle: ShieldUiLifecycle = inspection.gitVersionKnownUnsupported ? "unavailable" : inspection.state;
   const snapshot = inspection.policySnapshot;
   const enabledActions = snapshot?.enabledActions ?? [];
   const shieldOwnedActive = (fileName: string) =>

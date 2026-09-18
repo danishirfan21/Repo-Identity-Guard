@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { Profile, SafetyPreferences } from "../types";
+import { sanitizeBranchList, sanitizeProfileList } from "../validation";
 
 const SECTION = "repoIdentityGuard";
 const DEFAULT_PROTECTED_BRANCHES = ["main", "master"];
@@ -8,14 +9,20 @@ function config(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration(SECTION);
 }
 
+/**
+ * Persisted settings are a trust boundary, not just a typed getter: nothing
+ * stops `settings.json` (hand-edited, synced from another machine, written
+ * by another extension) from holding a value that doesn't match the
+ * `configuration` schema at all — a string instead of an array, an object
+ * instead of a string, a missing required field. `.get<Profile[]>` only
+ * asserts the TypeScript type; it performs no runtime check. Every array
+ * field on every profile is sanitized here so a single malformed entry
+ * can't make a downstream `.map`/`.some`/`.filter` throw and take scanning
+ * down with it — see `../validation`.
+ */
 export function getProfiles(): Profile[] {
-  const configured = config().get<Profile[]>("profiles", []);
-  return configured.filter(
-    (profile) =>
-      typeof profile?.id === "string" &&
-      typeof profile?.label === "string" &&
-      typeof profile?.gitEmail === "string",
-  );
+  const configured = config().get("profiles", []);
+  return sanitizeProfileList(configured);
 }
 
 export async function saveProfiles(profiles: Profile[]): Promise<void> {
@@ -23,18 +30,22 @@ export async function saveProfiles(profiles: Profile[]): Promise<void> {
 }
 
 export function getProtectedBranches(): string[] {
-  const configured = config().get<string[]>("protectedBranches", DEFAULT_PROTECTED_BRANCHES);
-  return configured.length > 0 ? configured : DEFAULT_PROTECTED_BRANCHES;
+  const configured = config().get("protectedBranches", DEFAULT_PROTECTED_BRANCHES);
+  return sanitizeBranchList(configured, DEFAULT_PROTECTED_BRANCHES);
 }
 
 export async function saveProtectedBranches(branches: string[]): Promise<void> {
   await config().update("protectedBranches", branches, vscode.ConfigurationTarget.Global);
 }
 
+function sanitizeBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
 export function getSafetyPreferences(): SafetyPreferences {
   return {
-    requireLocalIdentity: config().get<boolean>("requireLocalIdentity", false),
-    includeMemoryInAiContext: config().get<boolean>("includeMemoryInAiContext", false),
+    requireLocalIdentity: sanitizeBoolean(config().get("requireLocalIdentity", false), false),
+    includeMemoryInAiContext: sanitizeBoolean(config().get("includeMemoryInAiContext", false), false),
   };
 }
 
