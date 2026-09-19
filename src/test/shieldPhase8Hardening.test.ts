@@ -109,6 +109,61 @@ async function exists(p: string): Promise<boolean> {
 }
 
 /**
+ * A fake `ssh -G` that echoes back whatever host/alias it was asked
+ * about, matching real unconfigured-OpenSSH passthrough behavior. Used so
+ * that `approvedPushDestination.canonicalHost/canonicalPort` resolve to a
+ * deterministic value regardless of whether the machine running these
+ * tests has a real `ssh` binary on PATH at all (CI images do; this
+ * sandbox does not).
+ */
+let identityFakeSshBinPromise: Promise<string> | undefined;
+async function identityFakeSshBin(): Promise<string> {
+  if (!identityFakeSshBinPromise) {
+    identityFakeSshBinPromise = (async () => {
+      const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p8-identity-ssh-"));
+      const implPath = path.join(binDir, "impl.js");
+      await fs.writeFile(
+        implPath,
+        `"use strict";
+const args = process.argv.slice(2);
+const joined = " " + args.join(" ") + " ";
+if (joined.includes(" -G ")) {
+  const target = args[args.length - 1] || "";
+  const at = target.lastIndexOf("@");
+  const host = at !== -1 ? target.slice(at + 1) : target;
+  let port = "22";
+  const pIdx = args.indexOf("-p");
+  if (pIdx !== -1 && args[pIdx + 1]) port = args[pIdx + 1];
+  process.stdout.write("user git\\nhostname " + host.toLowerCase() + "\\nport " + port + "\\n");
+  process.exit(0);
+}
+process.stderr.write("fake-ssh-identity: unexpected invocation: " + joined + "\\n");
+process.exit(1);
+`,
+      );
+      await fs.writeFile(path.join(binDir, "ssh"), `#!/usr/bin/env node\nrequire(${JSON.stringify(implPath)});\n`, { mode: 0o755 });
+      await fs.writeFile(path.join(binDir, "ssh.cmd"), `@echo off\r\nnode "${implPath}" %*\r\n`);
+      return binDir;
+    })();
+  }
+  return identityFakeSshBinPromise;
+}
+
+function withIdentityFakeSshPath(env: NodeJS.ProcessEnv, fakeSshBin: string): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  let existingPath: string | undefined;
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === "PATH") {
+      existingPath = existingPath ?? value;
+      continue;
+    }
+    result[key] = value;
+  }
+  result.PATH = `${fakeSshBin}${path.delimiter}${existingPath ?? ""}`;
+  return result;
+}
+
+/**
  * Enables Shield from facts collected FRESH off the real repository, the
  * way the extension command now does — so what these tests assert about
  * `approvedPushDestination` reflects the real `git config` arrangement
@@ -119,9 +174,10 @@ async function enableFromRealRepo(
   manager: ShieldManager,
   repo: Repo,
   profiles: Profile[] = [workProfile],
+  env?: NodeJS.ProcessEnv,
 ): Promise<{ facts: RepoFacts; result: Awaited<ReturnType<ShieldManager["enable"]>> }> {
   const facts = await collectRepoFacts(repo.dir);
-  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles, protectedBranches: [] });
+  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles, protectedBranches: [], env });
   return { facts, result };
 }
 
@@ -150,7 +206,8 @@ test("push destination: an ordinary repo whose only remote is origin approves or
   try {
     await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
     const manager = new ShieldManager();
-    const { result } = await enableFromRealRepo(manager, repo);
+    const env = withIdentityFakeSshPath(repo.env, await identityFakeSshBin());
+    const { result } = await enableFromRealRepo(manager, repo, [workProfile], env);
     assert.equal(result.ok, true, result.inspection.reasons.join("; "));
 
     const policy = await readPolicy(repo);
@@ -158,6 +215,8 @@ test("push destination: an ordinary repo whose only remote is origin approves or
       host: "github-work",
       owner: "AcmeSoftware",
       repo: "acme-frontend",
+      canonicalHost: "github-work",
+      canonicalPort: "22",
     });
   } finally {
     await cleanup(repo.dir);
