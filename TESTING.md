@@ -129,17 +129,49 @@ A separate "Other Notes" section below the checklist shows info notes
 
 ### Repo Memory
 
-1. Add a note, pin it, confirm it shows as the Main view's pinned memory
-   preview.
+1. Add a multiline note (composer is a small textarea — confirm plain
+   Enter inserts a newline rather than submitting; confirm Ctrl/Cmd+Enter
+   submits, and that the explicit Add button also works). Pin it; confirm
+   it shows as the Main view's pinned memory preview with its line breaks
+   intact.
 2. Add a second note; confirm pinning it un-pins the first (only one pinned
    note at a time).
-3. Add a saved command (e.g. label "Start dev server", command `pnpm dev`).
-4. Click **Run** — confirm it opens a visible integrated terminal and runs
+3. Click **Edit** on a note, change its text, click **Cancel** — confirm
+   the stored text is unchanged. Edit again, change the text, click
+   **Save** (or Ctrl/Cmd+Enter) — confirm the new text is stored, the note
+   keeps its original created date/pinned state, and an "Edited" date now
+   appears alongside the original "Added" date.
+4. With several notes, confirm a search box appears; type a substring —
+   confirm matching notes remain (case-insensitively) and non-matching
+   ones are hidden, with pinned status still visually distinguishable
+   among the filtered results; clear the search — confirm all notes
+   return.
+5. Click **Delete** on a note or saved command — confirm a confirmation
+   prompt appears before anything is removed, and that pin/unpin never
+   prompts.
+6. Add a saved command (e.g. label "Start dev server", command `pnpm dev`).
+7. Click **Run** — confirm it opens a visible integrated terminal and runs
    the command (never silently).
-5. Click **Copy** — confirm the command text is on the clipboard.
-6. Remove a note and a command; confirm they disappear.
-7. Confirm notes/commands are **not** written into any file inside the repo
+8. Click **Copy** — confirm the command text is on the clipboard.
+9. Confirm notes/commands are **not** written into any file inside the repo
    (check `git status` stays clean).
+10. In a repo with a linked worktree (`git worktree add ../wt-branch
+    branch-name`), open both the main checkout and the worktree as
+    separate windows/folders. Confirm a note added in one is visible from
+    the other (notes are per-repository, shared across worktrees), while a
+    saved command added in one does NOT appear in the other (saved
+    commands are per-checkout).
+11. Try adding a note far past a few thousand characters, or adding well
+    over a hundred notes to one repository — confirm the over-limit
+    attempt is rejected with a readable message and nothing is silently
+    truncated.
+12. **Export/Import**: click Export — confirm a native save dialog appears
+    and the resulting JSON file contains the current repo's notes/commands
+    plus a schema version. Click Export all — confirm it includes every
+    detected repository. Click Import and pick that file — confirm a
+    preview/confirmation appears (counts, duplicate handling) BEFORE
+    anything changes, that re-importing the same file doesn't duplicate
+    entries, and that an imported saved command never runs on its own.
 
 ### Copy Context for AI
 

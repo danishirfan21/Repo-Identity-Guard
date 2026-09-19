@@ -25,12 +25,16 @@ export interface SidebarActions {
   selectRepo(repoId: string): Promise<void>;
 
   addMemoryNote(text: string, pinned: boolean): Promise<void>;
+  updateMemoryNote(id: string, text: string): Promise<void>;
   removeMemoryNote(id: string): Promise<void>;
   togglePinMemoryNote(id: string): Promise<void>;
   addSavedCommand(label: string, command: string): Promise<void>;
   removeSavedCommand(id: string): Promise<void>;
   runSavedCommand(id: string): Promise<void>;
   copySavedCommand(id: string): Promise<void>;
+  exportMemory(): Promise<void>;
+  exportAllMemory(): Promise<void>;
+  importMemory(): Promise<void>;
 
   saveProfile(profile: Profile): Promise<void>;
   deleteProfile(id: string): Promise<void>;
@@ -124,6 +128,9 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
       case "addMemoryNote":
         if (isNonEmptyString(message.text)) await a.addMemoryNote(message.text, message.pinned === true);
         break;
+      case "updateMemoryNote":
+        if (isNonEmptyString(message.id) && typeof message.text === "string") await a.updateMemoryNote(message.id, message.text);
+        break;
       case "removeMemoryNote":
         if (isNonEmptyString(message.id)) await a.removeMemoryNote(message.id);
         break;
@@ -143,6 +150,15 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
         break;
       case "copySavedCommand":
         if (isNonEmptyString(message.id)) await a.copySavedCommand(message.id);
+        break;
+      case "exportMemory":
+        await a.exportMemory();
+        break;
+      case "exportAllMemory":
+        await a.exportAllMemory();
+        break;
+      case "importMemory":
+        await a.importMemory();
         break;
       case "saveProfile": {
         const profile = sanitizeProfile(message.profile);

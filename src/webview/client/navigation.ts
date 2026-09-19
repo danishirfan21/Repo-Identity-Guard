@@ -89,10 +89,25 @@ document.addEventListener("click", (event) => {
     if (text) { send("addMemoryNote", { text, pinned: false }); input.value = ""; }
     return;
   }
+  const editBtn = target.closest("[data-edit-note]");
+  if (editBtn) { memoryEditingNoteId = editBtn.dataset.editNote; render(); return; }
+  if (target.closest("#editNoteCancel")) { memoryEditingNoteId = null; render(); return; }
+  const saveBtn = target.closest("[data-save-note]");
+  if (saveBtn) {
+    const text = document.getElementById("editNoteText").value;
+    send("updateMemoryNote", { id: saveBtn.dataset.saveNote, text });
+    memoryEditingNoteId = null;
+    render();
+    return;
+  }
   const pinBtn = target.closest("[data-pin-note]");
   if (pinBtn) { send("togglePinMemoryNote", { id: pinBtn.dataset.pinNote }); return; }
   const removeNoteBtn = target.closest("[data-remove-note]");
   if (removeNoteBtn) { send("removeMemoryNote", { id: removeNoteBtn.dataset.removeNote }); return; }
+
+  if (target.closest("#exportMemoryButton")) { send("exportMemory"); return; }
+  if (target.closest("#exportAllMemoryButton")) { send("exportAllMemory"); return; }
+  if (target.closest("#importMemoryButton")) { send("importMemory"); return; }
 
   if (target.closest("#addCommandToggle")) { document.getElementById("newCommandLabel").focus(); return; }
   if (target.closest("#addCommandButton")) {
@@ -209,7 +224,11 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Enter") return;
   const target = event.target;
   if (!(target instanceof Element)) return;
-  if (target.id === "newNoteText") { document.getElementById("addNoteSubmit").click(); return; }
+  // Ordinary Enter in these multiline textareas inserts a newline, like any
+  // other text editor — only Ctrl/Cmd+Enter submits, so a multiline note
+  // never gets cut short by an unexpectedly "helpful" Enter-to-save.
+  if (target.id === "newNoteText" && (event.metaKey || event.ctrlKey)) { document.getElementById("addNoteSubmit").click(); return; }
+  if (target.id === "editNoteText" && (event.metaKey || event.ctrlKey)) { document.getElementById("editNoteSave").click(); return; }
   const chipInput = target.closest("[data-add-chip]");
   if (chipInput) {
     const profile = currentProfile();
@@ -226,6 +245,20 @@ document.addEventListener("change", (event) => {
   if (target.id === "obCustomLabelInput") { obCustomLabel = target.value; return; }
   if (target.name === "obScope") { obScope = target.value; return; }
   if (target.name === "shieldChain") { shieldChainChoice = target.value; render(); return; }
+});
+
+document.addEventListener("input", (event) => {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  if (target.id === "memorySearchInput") {
+    // Refreshes ONLY the notes list container, not the whole Memory
+    // screen (a full render() would replace this very input element and
+    // lose focus/cursor position on every keystroke) — entirely local,
+    // client-side filtering; nothing is sent to the extension and nothing
+    // is persisted.
+    memorySearchQuery = target.value;
+    document.getElementById("notesListContainer").innerHTML = renderNotesList();
+  }
 });
 
 window.addEventListener("message", (event) => {

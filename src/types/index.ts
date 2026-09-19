@@ -221,6 +221,8 @@ export interface MemoryNote {
   text: string;
   pinned: boolean;
   createdAt: number;
+  /** Set only once the note's text has actually been edited via `updateNote` — never set by a plain add, and never touched by pin/unpin. */
+  updatedAt?: number;
 }
 
 export interface SavedCommand {

@@ -170,6 +170,56 @@ test("pinned memory is omitted by default and included only when explicitly opte
   assert.ok(renderedWith.includes("Secret internal URL"));
 });
 
+test("a multiline pinned note's line breaks survive into the AI context preview unmangled, once opted in", () => {
+  const summary = computeStatus({
+    facts: safeFacts(),
+    profiles: [workProfile],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+    pinnedMemoryNote: "line one\nline two",
+  });
+  const memory: RepoMemory = {
+    notes: [{ id: "n1", text: "line one\nline two", pinned: true, createdAt: 1 }],
+    commands: [],
+  };
+  const model = buildAiContextModel(summary, memory, { includeMemory: true });
+  assert.equal(model.pinnedMemoryText, "line one\nline two");
+  const rendered = renderAiContext(model);
+  assert.ok(rendered.includes("line one\nline two"));
+});
+
+test("only the pinned note enters the AI context — an unpinned note never does, even when includeMemory is on", () => {
+  const summary = computeStatus({
+    facts: safeFacts(),
+    profiles: [workProfile],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+  });
+  const memory: RepoMemory = {
+    notes: [{ id: "n1", text: "unpinned, should never appear", pinned: false, createdAt: 1 }],
+    commands: [],
+  };
+  const model = buildAiContextModel(summary, memory, { includeMemory: true });
+  assert.equal(model.pinnedMemoryIncluded, false);
+  const rendered = renderAiContext(model);
+  assert.ok(!rendered.includes("unpinned, should never appear"));
+});
+
+test("saved commands never enter the AI context, regardless of includeMemory", () => {
+  const summary = computeStatus({
+    facts: safeFacts(),
+    profiles: [workProfile],
+    protectedBranches: ["main"],
+    preferences: defaultPreferences,
+  });
+  const memory: RepoMemory = {
+    notes: [],
+    commands: [{ id: "c1", label: "Deploy", command: "npm run deploy --prod --force", createdAt: 1 }],
+  };
+  const rendered = renderAiContext(buildAiContextModel(summary, memory, { includeMemory: true }));
+  assert.ok(!rendered.includes("npm run deploy"));
+});
+
 test("baseline restrictions always appear regardless of findings", () => {
   const summary = computeStatus({
     facts: safeFacts(),

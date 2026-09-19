@@ -178,8 +178,10 @@ the selected repo while the badge itself reads Not Safe.
   "Blocks safety" indicator when applicable, Expected/Found, any agent
   restrictions, a suggested action, and raw Git facts tucked behind a
   collapsed "Technical Details" section.
-- **Repo Memory** — pinned notes, general notes, and saved commands (label +
-  command + Run/Copy), stored locally and privately.
+- **Repo Memory** — pinned notes, general (multiline) notes, and saved
+  commands (label + command + Run/Copy), stored locally and privately. See
+  "Repo Memory" below for the full picture (editing, search, export/import,
+  and exactly which repository a note belongs to).
 - **Settings** — profiles as chip-based tabs with an owners/exact-repos/
   branch-pattern chip editor, a "Detect from current repo" prefill button,
   branch rules, safety preferences, and a Shield card showing the current
@@ -355,6 +357,68 @@ Your pinned Repo Memory note is **not** included by default — it's free
 text you wrote for yourself and may contain sensitive info. Turn on
 "Include pinned memory note in Copy Context for AI" in Settings if you want
 it included.
+
+## Repo Memory
+
+A small, deliberately simple local notebook per repository — not Notion, not
+a Markdown knowledge base, not a task manager, and not synced anywhere.
+
+- **Where it lives.** Entirely in this VS Code install's own local, private
+  extension storage (`ExtensionContext.globalState`) — never a file inside
+  the repository, so a note can never be accidentally committed, pushed, or
+  seen by anyone you share the repo with. It is **local to this machine and
+  this VS Code profile/install**: notes don't follow you to another machine,
+  another VS Code profile, or Settings Sync, unless you explicitly export
+  and import them (see below).
+- **Notes vs. saved commands — different scope.** A note is about the
+  *repository*: every linked worktree of the same repo (`git worktree add`)
+  shares the same notes, because they're the same repository regardless of
+  which checkout happens to be open. A saved command is about the
+  *checkout*: each worktree keeps its own saved commands, since the working
+  directory layout and what actually makes sense to run can genuinely
+  differ between worktrees of the same repo.
+- **If a repository moves or is re-cloned.** Repo Memory keys off the
+  repository's real, canonicalized location (resolving symlinks, and
+  normalizing Windows path casing, the same way multi-root repository
+  detection does) — a symlinked or differently-cased path to the SAME
+  on-disk repo still finds its notes. Moving a repo to a genuinely
+  different path, or cloning it fresh elsewhere, does **not** automatically
+  carry notes over (there is no reliable way to prove two folders are "the
+  same repository" from a remote URL alone without risking silently merging
+  two unrelated clones that happen to share one) — use Export from the old
+  location and Import into the new one instead.
+- **Editing.** Every note supports Edit → change the text → Save, or
+  Cancel to leave the stored note untouched. Editing preserves the note's
+  id, its original created date, and its pinned state; it records an edited
+  date only once the text has actually changed.
+- **Multiline.** The note composer is a small multiline text box — line
+  breaks are preserved everywhere a note appears (list, edit box, export,
+  and the pinned note's Copy Context for AI preview). Plain text only, by
+  design: no Markdown/HTML rendering.
+- **Pinning.** At most one note per repository can be pinned at a time —
+  pinning a different note automatically unpins the previous one. A pinned
+  note is the only one ever eligible for Copy Context for AI, and even then
+  only once you opt in (see above) — every other note, and every saved
+  command, is never included there.
+- **Search.** Once a repository has more than a couple of notes, a search
+  box filters them by a case-insensitive substring match — entirely local
+  to the webview (nothing is sent anywhere, and nothing is remembered
+  between sessions).
+- **Deleting.** Removing a note or saved command asks for a one-click
+  confirmation first; pinning/unpinning never does, since it's harmless and
+  instantly reversible.
+- **Limits.** Notes and saved commands have generous but real size/count
+  ceilings meant for genuine development notes, not unlimited free-form
+  storage — an over-limit add or edit is rejected with a clear message,
+  never silently truncated.
+- **Export / Import.** Export writes the current repository's memory (or,
+  from the same menu, every detected repository's memory) to a JSON file
+  you choose the location for. Import reads a JSON file back in: it always
+  validates the file and shows what it's about to do (how many notes/
+  commands, from how many repositories) before touching anything, and it
+  never overwrites an existing note or command with the same id unless you
+  explicitly choose to. A saved command coming from an import is inert data
+  like any other field — it is never executed automatically.
 
 ## Workspace Trust
 

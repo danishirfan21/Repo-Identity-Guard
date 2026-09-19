@@ -1,4 +1,3 @@
-import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -6,7 +5,7 @@ import { buildAiContext, buildWorkspaceSafetySummary } from "./core/aiContext";
 import { canonicalRepoKey, findOverlappingProfiles, resolveProfiles } from "./core/profileResolver";
 import { computeStatus } from "./core/statusEngine";
 import { computeWorkspaceSafetyState, workspaceProblemCount } from "./core/workspaceAggregate";
-import { collectRepoFacts, resolveIdentityConfigScope } from "./services/gitService";
+import { canonicalizeRepoPath, collectRepoFacts, resolveIdentityConfigScope } from "./services/gitService";
 import { copyToClipboard, runSavedCommand } from "./services/commandRunner";
 import { SafeActionRunner } from "./services/safeActionRunner";
 import { ShieldManager } from "./shield";
@@ -20,10 +19,10 @@ import {
   saveProtectedBranches,
   saveRequireLocalIdentity,
 } from "./storage/configStore";
-import { MemoryStore } from "./storage/memoryStore";
+import { MemoryExport, MemoryLimitError, MemoryStore } from "./storage/memoryStore";
 import { RepoIdentitySidebarProvider, SidebarModel } from "./ui/SidebarProvider";
 import { IdentityStatusBar } from "./statusBar";
-import { Profile, RepoFacts, RepositorySafetyState, StatusSummary, WorkspaceSafetyState } from "./types";
+import { Profile, RepoFacts, RepositorySafetyState, StatusSummary, WorkspaceSafetyState, emptyRepoMemory } from "./types";
 
 function emptyNotCheckedSummary(gitError?: string): StatusSummary {
   return {
@@ -48,6 +47,31 @@ let scanSequence = 0;
 /** One or more watchers per repo (its gitDir and, for linked worktrees, gitCommonDir too), reconciled by repoId after every scan — see `reconcileRepoWatchers`. */
 let repoWatchers = new Map<string, vscode.Disposable[]>();
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+/**
+ * Repo Memory's canonical repository-identity keys, keyed by the RAW
+ * `facts.repoRoot` string (what every synchronous call site already has
+ * on hand — `latestSummary.facts.repoRoot`, `requireRepoRoot()`) and
+ * refreshed every scan. Notes use `notesKey` (the canonicalized
+ * `gitCommonDir` when resolvable — see `canonicalizeRepoPath` — shared by
+ * every linked worktree of the same repository, since notes are about the
+ * REPOSITORY, not which checkout happens to be open); saved commands use
+ * `checkoutKey` (the canonicalized `repoRoot` itself, i.e. `repoId`),
+ * since cwd/layout can legitimately differ per worktree. `buildModel()`
+ * and the message handlers below read this map synchronously; it's
+ * populated by the (already async) `buildRepositoryStates()` so no UI
+ * code needs to await a filesystem call just to render the Memory tab.
+ * `getMemoryKeys()` falls back to the raw repoRoot for both keys when a
+ * repo hasn't been through a scan yet (there is always at least one scan
+ * on activation before the UI can be interacted with) — briefly keying
+ * notes off the checkout instead of the repository, never a data-loss
+ * risk, since mutations always use whatever key is resolved AT THE TIME,
+ * consistently.
+ */
+const repoMemoryKeys = new Map<string, { notesKey: string; checkoutKey: string }>();
+
+function getMemoryKeys(repoRoot: string): { notesKey: string; checkoutKey: string } {
+  return repoMemoryKeys.get(repoRoot) ?? { notesKey: repoRoot, checkoutKey: repoRoot };
+}
 let globalGitConfigWatchers: vscode.FileSystemWatcher[] = [];
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -61,7 +85,7 @@ export function activate(context: vscode.ExtensionContext): void {
     summary: latestSummary,
     workspace: workspaceState,
     selectedRepoId,
-    memory: latestSummary.facts.repoRoot ? memoryStore.getMemory(latestSummary.facts.repoRoot) : { notes: [], commands: [] },
+    memory: latestSummary.facts.repoRoot ? memoryStore.getMemory(getMemoryKeys(latestSummary.facts.repoRoot)) : emptyRepoMemory(),
     profiles: getProfiles(),
     protectedBranches: getProtectedBranches(),
     preferences: getSafetyPreferences(),
@@ -89,54 +113,153 @@ export function activate(context: vscode.ExtensionContext): void {
 
     addMemoryNote: async (text, pinned) => {
       const repoRoot = requireRepoRoot();
-      if (!repoRoot || !text.trim()) return;
+      if (!repoRoot) return;
       if (!(await requireWorkspaceTrust())) return;
-      await memoryStore.addNote(repoRoot, text, pinned);
+      try {
+        await memoryStore.addNote(getMemoryKeys(repoRoot), text, pinned);
+      } catch (error) {
+        await showMemoryError(error);
+        return;
+      }
+      refreshSidebar();
+    },
+    updateMemoryNote: async (id, text) => {
+      const repoRoot = requireRepoRoot();
+      if (!repoRoot) return;
+      if (!(await requireWorkspaceTrust())) return;
+      try {
+        await memoryStore.updateNote(getMemoryKeys(repoRoot), id, text);
+      } catch (error) {
+        await showMemoryError(error);
+        return;
+      }
       refreshSidebar();
     },
     removeMemoryNote: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
       if (!(await requireWorkspaceTrust())) return;
-      await memoryStore.removeNote(repoRoot, id);
+      if (!(await confirmDelete("note"))) return;
+      await memoryStore.removeNote(getMemoryKeys(repoRoot), id);
       refreshSidebar();
     },
     togglePinMemoryNote: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
       if (!(await requireWorkspaceTrust())) return;
-      await memoryStore.togglePin(repoRoot, id);
+      await memoryStore.togglePin(getMemoryKeys(repoRoot), id);
       await scan();
     },
     addSavedCommand: async (label, command) => {
       const repoRoot = requireRepoRoot();
-      if (!repoRoot || !label.trim() || !command.trim()) return;
+      if (!repoRoot) return;
       if (!(await requireWorkspaceTrust())) return;
-      await memoryStore.addCommand(repoRoot, label, command);
+      try {
+        await memoryStore.addCommand(getMemoryKeys(repoRoot), label, command);
+      } catch (error) {
+        await showMemoryError(error);
+        return;
+      }
       refreshSidebar();
     },
     removeSavedCommand: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
       if (!(await requireWorkspaceTrust())) return;
-      await memoryStore.removeCommand(repoRoot, id);
+      if (!(await confirmDelete("saved command"))) return;
+      await memoryStore.removeCommand(getMemoryKeys(repoRoot), id);
       refreshSidebar();
     },
     runSavedCommand: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
       if (!(await requireWorkspaceTrust())) return;
-      const saved = memoryStore.getMemory(repoRoot).commands.find((c) => c.id === id);
+      const saved = memoryStore.getMemory(getMemoryKeys(repoRoot)).commands.find((c) => c.id === id);
       if (saved) runSavedCommand(repoRoot, saved.command);
     },
     copySavedCommand: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
-      const saved = memoryStore.getMemory(repoRoot).commands.find((c) => c.id === id);
+      const saved = memoryStore.getMemory(getMemoryKeys(repoRoot)).commands.find((c) => c.id === id);
       if (saved) {
         await copyToClipboard(saved.command);
         await vscode.window.showInformationMessage(`Copied: ${saved.command}`);
       }
+    },
+    exportMemory: async () => {
+      const repoRoot = requireRepoRoot();
+      if (!repoRoot) return;
+      const label = latestSummary.repoName ?? path.basename(repoRoot);
+      const data = memoryStore.exportMemory(getMemoryKeys(repoRoot), label);
+      await writeMemoryExportToDisk(data, `repo-memory-${sanitizeFileNamePart(label)}.json`);
+    },
+    exportAllMemory: async () => {
+      if (workspaceState.repos.length === 0) {
+        await vscode.window.showInformationMessage("No repositories detected to export.");
+        return;
+      }
+      const entries = workspaceState.repos.map((repo) => ({
+        // Deliberately never falls back to `repo.repoId` — that's a raw,
+        // canonicalized local FILESYSTEM PATH (may reveal the machine's
+        // username/directory layout), and an export is a file the user
+        // may go on to share or paste elsewhere. "(unnamed repository)" is
+        // the only safe fallback when neither a repo name nor a workspace
+        // folder name is available.
+        label: repo.summary.repoName ?? repo.workspaceFolderName ?? "(unnamed repository)",
+        keys: getMemoryKeys(repo.summary.facts.repoRoot ?? repo.repoId),
+      }));
+      const data = memoryStore.exportAllMemory(entries);
+      await writeMemoryExportToDisk(data, "repo-memory-all.json");
+    },
+    importMemory: async () => {
+      const repoRoot = requireRepoRoot();
+      if (!repoRoot) return;
+      if (!(await requireWorkspaceTrust())) return;
+
+      const uris = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        filters: { "Repo Memory export": ["json"] },
+        title: "Import Repo Memory",
+      });
+      if (!uris || uris.length === 0) return;
+
+      let raw: unknown;
+      try {
+        const bytes = await vscode.workspace.fs.readFile(uris[0]);
+        raw = JSON.parse(Buffer.from(bytes).toString("utf8"));
+      } catch {
+        await vscode.window.showErrorMessage("Could not read that file as JSON.");
+        return;
+      }
+
+      const keys = getMemoryKeys(repoRoot);
+      const preview = memoryStore.previewImport(keys, raw);
+      if (!preview.valid) {
+        await vscode.window.showErrorMessage(preview.error ?? "This file isn't a valid Repo Memory export.");
+        return;
+      }
+
+      const duplicateCount = preview.duplicateNoteIds.length + preview.duplicateCommandIds.length;
+      const summaryLines = [
+        `This will import ${preview.noteCount} note(s) and ${preview.commandCount} saved command(s) from ${preview.repositoryCount} repositor${preview.repositoryCount === 1 ? "y" : "ies"} in the file into the currently open repository.`,
+        "Saved commands are imported as inert data only and are never run automatically.",
+      ];
+      if (duplicateCount > 0) {
+        summaryLines.push(`${duplicateCount} item(s) already exist here (matching id) and will be skipped unless you choose to overwrite them.`);
+      }
+
+      const actions = duplicateCount > 0 ? ["Import (skip duplicates)", "Import and overwrite duplicates"] : ["Import"];
+      const choice = await vscode.window.showInformationMessage(summaryLines.join("\n\n"), { modal: true }, ...actions);
+      if (!choice) return;
+
+      try {
+        await memoryStore.importMemory(keys, raw, { overwriteDuplicates: choice === "Import and overwrite duplicates" });
+      } catch (error) {
+        await showMemoryError(error);
+        return;
+      }
+      await scan();
+      await vscode.window.showInformationMessage("Repo Memory import complete.");
     },
 
     saveProfile: async (profile: Profile) => {
@@ -211,6 +334,40 @@ export function activate(context: vscode.ExtensionContext): void {
       "This workspace isn't trusted, so Repo Identity Guard won't run commands or change Git identity here. Enable Workspace Trust first.",
     );
     return false;
+  }
+
+  /**
+   * The one lightweight confirmation gate for a destructive Repo Memory
+   * action — a non-modal native VS Code warning with an explicit action
+   * button, the least intrusive built-in mechanism that still requires a
+   * deliberate click (never a bare "OK" that muscle memory could dismiss
+   * without reading). Pin/unpin never calls this — it's reversible with
+   * one more click and isn't destructive.
+   */
+  async function confirmDelete(kind: string): Promise<boolean> {
+    const choice = await vscode.window.showWarningMessage(`Delete this ${kind}? This can't be undone.`, "Delete", "Cancel");
+    return choice === "Delete";
+  }
+
+  /** `MemoryLimitError` carries a message meant to be read as-is (empty text, over a length/count limit); anything else is an unexpected failure that shouldn't leak internals into a user-facing toast. */
+  async function showMemoryError(error: unknown): Promise<void> {
+    const message = error instanceof MemoryLimitError ? error.message : "Something went wrong saving to Repo Memory.";
+    await vscode.window.showWarningMessage(message);
+  }
+
+  async function writeMemoryExportToDisk(data: MemoryExport, defaultFileName: string): Promise<void> {
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(defaultFileName),
+      filters: { "Repo Memory export": ["json"] },
+      title: "Export Repo Memory",
+    });
+    if (!uri) return;
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(data, null, 2), "utf8"));
+    await vscode.window.showInformationMessage(`Exported Repo Memory to ${uri.fsPath}`);
+  }
+
+  function sanitizeFileNamePart(label: string): string {
+    return label.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 60) || "repo";
   }
 
   /**
@@ -358,10 +515,22 @@ export function activate(context: vscode.ExtensionContext): void {
         const { facts } = outcome.value;
         if (!facts.isGitRepo || !facts.repoRoot) continue;
 
-        const repoId = await canonicalizeRepoRoot(facts.repoRoot);
+        const repoId = await canonicalizeRepoPath(facts.repoRoot);
         if (byRepoId.has(repoId)) continue;
 
-        const pinnedNote = memoryStore.getPinnedNote(facts.repoRoot)?.text;
+        // Notes are about the REPOSITORY (shared across every linked
+        // worktree via the common git dir); saved commands stay
+        // checkout-local (repoId itself) since cwd/layout can legitimately
+        // differ per worktree. See the `repoMemoryKeys` doc comment above.
+        const notesKey = facts.gitCommonDir ? await canonicalizeRepoPath(facts.gitCommonDir) : repoId;
+        repoMemoryKeys.set(facts.repoRoot, { notesKey, checkoutKey: repoId });
+        // Opportunistic, lossless migration of any data still stored under
+        // the raw (pre-canonicalization) repoRoot from an older release —
+        // a no-op once this repo's data already lives under its canonical
+        // keys. See `MemoryStore.reconcileLegacyKeys`'s doc comment.
+        await memoryStore.reconcileLegacyKeys(facts.repoRoot, { notesKey, checkoutKey: repoId });
+
+        const pinnedNote = memoryStore.getPinnedNote(notesKey)?.text;
         const summary = computeStatus({
           facts,
           profiles: getProfiles(),
@@ -424,14 +593,6 @@ export function activate(context: vscode.ExtensionContext): void {
       isWorkspaceTrusted: vscode.workspace.isTrusted,
     });
     byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary });
-  }
-
-  async function canonicalizeRepoRoot(repoRoot: string): Promise<string> {
-    try {
-      return await fs.realpath(repoRoot);
-    } catch {
-      return repoRoot;
-    }
   }
 
   /** Prefers the repo the active editor's file lives in, then the first workspace folder's repo. */
@@ -519,7 +680,7 @@ export function activate(context: vscode.ExtensionContext): void {
         profiles: getProfiles(),
         protectedBranches: getProtectedBranches(),
         preferences: getSafetyPreferences(),
-        pinnedMemoryNote: freshFacts.repoRoot ? memoryStore.getPinnedNote(freshFacts.repoRoot)?.text : undefined,
+        pinnedMemoryNote: freshFacts.repoRoot ? memoryStore.getPinnedNote(getMemoryKeys(freshFacts.repoRoot).notesKey)?.text : undefined,
         isWorkspaceTrusted: vscode.workspace.isTrusted,
       });
       const commitIdentity = freshSummary.capabilityResults.find((r) => r.capability === "commit_identity");
@@ -645,7 +806,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   async function copyContextForAI(): Promise<void> {
     const repoRoot = latestSummary.facts.repoRoot;
-    const memory = repoRoot ? memoryStore.getMemory(repoRoot) : { notes: [], commands: [] };
+    const memory = repoRoot ? memoryStore.getMemory(getMemoryKeys(repoRoot)) : emptyRepoMemory();
     const { includeMemoryInAiContext } = getSafetyPreferences();
     const text = buildAiContext(latestSummary, memory, { includeMemory: includeMemoryInAiContext });
 

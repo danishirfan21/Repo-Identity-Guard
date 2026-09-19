@@ -45,6 +45,11 @@ const ICONS = {
   power: '<path d="M8 2v5"/><path d="M4.6 4.3a5.2 5.2 0 1 0 6.8 0"/>',
   pulse: '<path d="M1.5 8.5h2.8l1.4-4 2.6 7 1.4-3h3.8"/>',
   link: '<path d="M6.8 9.2 9.2 6.8"/><path d="M6.4 4.4 8 2.8a2.6 2.6 0 0 1 3.7 3.7L10 8.1"/><path d="M9.6 11.6 8 13.2a2.6 2.6 0 0 1-3.7-3.7L6 8"/>',
+  edit: '<path d="M11 2.5 13.5 5 5.8 12.7 2.8 13.2l.5-3Z"/><path d="M9.5 4 12 6.5"/>',
+  check: '<path d="m3.3 8.3 3.2 3.2 6.2-6.8"/>',
+  search: '<circle cx="7" cy="7" r="4.5"/><path d="m13 13-2.6-2.6"/>',
+  download: '<path d="M8 2v8"/><path d="m4.8 7.2 3.2 3.2 3.2-3.2"/><path d="M3 13h10"/>',
+  upload: '<path d="M8 10V2"/><path d="m4.8 4.8 3.2-3.2 3.2 3.2"/><path d="M3 13h10"/>',
 };
 function icon(name, size) {
   const body = ICONS[name] || ICONS.shield;

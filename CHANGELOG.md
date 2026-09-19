@@ -2,6 +2,67 @@
 
 ## Unreleased
 
+### Added — Repo Memory: editing, multiline notes, search, export/import, and storage hardening
+
+Repo Memory moves from a basic scratchpad to a finished local feature,
+while staying deliberately simple (still local-first, private, outside
+tracked files, separate from the SAFE/NOT SAFE verdict, and opt-in before
+entering Copy Context for AI):
+
+- **Editing.** A note can be edited in place (`updateNote`) — preserves
+  id, `createdAt`, and pinned state; sets `updatedAt` only when the text
+  actually changes.
+- **Multiline notes.** The composer is a small textarea; line breaks are
+  preserved through storage, display, editing, export/import, and the
+  pinned note's AI-context preview. Plain text only, no Markdown/HTML
+  rendering. Enter inserts a newline; Ctrl/Cmd+Enter or the explicit
+  Add/Save button submits.
+- **Delete confirmation.** Removing a note or saved command now asks for
+  a one-click native confirmation first; pin/unpin still requires none.
+- **Concurrency fix.** `MemoryStore` mutations are serialized through an
+  internal promise queue — overlapping webview messages (rapid add/edit/
+  pin/remove) can no longer produce a lost update, and one failed
+  mutation (e.g. an over-limit add) can no longer wedge every mutation
+  queued after it.
+- **Validated, versioned storage.** `globalState` is now treated as
+  untrusted, versioned data: a small schema (`policyVersion`-style
+  `MEMORY_SCHEMA_VERSION`) plus a runtime sanitizer discards or
+  conservatively repairs individually-corrupt entries instead of crashing
+  the sidebar, and the pre-versioning storage shape migrates
+  deterministically with no data loss.
+- **Storage limits.** Explicit, generous constants for maximum note
+  length, notes per repository, and saved-command label/command length/
+  count — an over-limit add or edit is rejected with a clear message,
+  never silently truncated.
+- **Repository/worktree identity.** Notes and saved commands are now
+  keyed by a canonicalized (realpath, Windows-casing-normalized)
+  identity, reusing the same normalization multi-root repository
+  detection already relies on, instead of a raw `repoRoot` string.
+  Notes key off the repository's common git dir (shared by every linked
+  worktree of the same repo — a note is about the repository, not which
+  checkout happens to be open); saved commands stay keyed per checkout
+  (worktree-local, since cwd/layout can legitimately differ). Data
+  stored under an older, pre-canonicalization key migrates onto the new
+  keys automatically and losslessly the next time that repository is
+  opened. A repository physically moved to an unrelated path is
+  deliberately NOT auto-merged with an old location (see Export/Import).
+- **Search.** A case-insensitive, entirely client-side substring filter
+  appears once a repository has notes — nothing is sent anywhere or
+  remembered between sessions.
+- **Export / Import.** Export a repository's memory (or every detected
+  repository's) to a schema-versioned JSON file; Import validates the
+  file, previews exactly what it will do (counts, duplicate handling)
+  before changing anything, and never overwrites an existing note/command
+  sharing an id unless explicitly told to. An imported saved command is
+  inert data — it is never executed automatically.
+- **UX.** Notes show a created (and, once edited, updated) timestamp;
+  every note/command control carries an accessible name.
+
+New dedicated test coverage across `memoryStoreCore.test.ts`,
+`memoryStore.test.ts`, and `webviewMemory.test.ts` (concurrency,
+migration, limits, canonical-key/worktree semantics, export/import,
+escaping, search, and the edit/save/cancel webview wiring).
+
 ### Fixed — release blocker, round 3: the canonical endpoint's PORT, and an IPv6 host-formatting bug
 
 Round 2 persisted a canonical **host** at enable/repair time so an SSH

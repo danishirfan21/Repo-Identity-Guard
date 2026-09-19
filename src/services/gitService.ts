@@ -51,6 +51,34 @@ export async function getRepoRoot(cwd: string): Promise<string | null> {
 }
 
 /**
+ * Canonicalizes a filesystem path for use as a stable repository-identity
+ * key — realpath (resolves symlinks; on Windows also normalizes a path to
+ * the casing NTFS actually stores, so two differently-cased references to
+ * the same folder produce the SAME output) plus an explicit lowercase pass
+ * on Windows as a defensive fallback for when realpath can't run at all
+ * (the path was deleted, or a permission error) — a raw string comparison
+ * must never treat two casings of an existing Windows path as different
+ * repositories. Falls back to the input path unchanged (case preserved)
+ * when even that fails, rather than throwing: an unresolvable path is
+ * still a valid (if less deduplicated) identity, never a hard error.
+ *
+ * Shared by multi-root repository deduplication (`extension.ts`) and Repo
+ * Memory's repository-identity keys (`src/storage/memoryStore.ts`) — both
+ * need the exact same notion of "is this the same repo/checkout as that
+ * one," and a Windows-casing or symlink difference must not silently split
+ * one repository's identity in either place.
+ */
+export async function canonicalizeRepoPath(pathToCanonicalize: string): Promise<string> {
+  let resolved: string;
+  try {
+    resolved = await fs.realpath(pathToCanonicalize);
+  } catch {
+    resolved = pathToCanonicalize;
+  }
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+/**
  * The raw `git --version` line (e.g. `git version 2.43.0`), or null when
  * `git` could not be run at all. Parsing/comparison lives in
  * `src/shield/gitVersion.ts` so it stays pure and testable; this function
