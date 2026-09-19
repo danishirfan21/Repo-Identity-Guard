@@ -36,12 +36,18 @@ a complete checklist, not just a list of problems:
 
 Repo Memory is shown too, but as a separate **info note** — it's context
 data, not a safety verdict, so it never affects the SAFE/NOT SAFE result.
-Shield Mode is deliberately *not* reported here at all: its state is
-per-repository and lives on disk (see `Repo Identity Guard: Check Shield
-Health`), and the safety engine has no way to know it. An earlier build
-shipped a hard-coded "Shield Mode is not built yet — nothing is enforcing
-this automatically" note that was shown even in repositories where Shield
-was installed and actively blocking pushes; it has been removed.
+Shield Mode is deliberately not one of these six capabilities and never
+alters the SAFE/NOT SAFE verdict — the safety engine that computes it has
+no way to know Shield's state, since Shield's lifecycle is per-repository
+and lives on disk, independent of this scan. Shield's own state IS shown
+separately, though: Main's "Shield — &lt;state&gt;" summary card, the
+dedicated Shield sidebar screen it links to, and the Settings → Shield
+card all reflect the real, current OFF / ACTIVE / DEGRADED / BROKEN /
+UNAVAILABLE state (see [docs/SHIELD_MODE.md](docs/SHIELD_MODE.md)). An
+earlier build instead shipped a hard-coded "Shield Mode is not built
+yet — nothing is enforcing this automatically" note that was shown even in
+repositories where Shield was installed and actively blocking pushes; it
+has been removed.
 
 Each capability result carries one of five states — **Confirmed**,
 **Contradicted**, **Unverified**, **Warning**, or **Not applicable** — plus
@@ -176,8 +182,8 @@ the selected repo while the badge itself reads Not Safe.
   command + Run/Copy), stored locally and privately.
 - **Settings** — profiles as chip-based tabs with an owners/exact-repos/
   branch-pattern chip editor, a "Detect from current repo" prefill button,
-  branch rules, safety preferences, and a short Shield Mode note pointing
-  at the Command Palette.
+  branch rules, safety preferences, and a Shield card showing the current
+  lifecycle state with an "Open Shield" button to its own sidebar screen.
 - **First-run onboarding** — shown automatically the first time you open
   Repo Identity Guard in a Git repository with no profiles configured yet.
   It shows the detected repository and your current effective Git
@@ -357,6 +363,21 @@ honest NOT SAFE with "Workspace is not trusted" rather than nothing at all.
 But **Fix Commit Identity** and running a saved command are both blocked
 until the workspace is trusted, since both execute something in that
 folder.
+
+## Privacy & Security
+
+Repo Identity Guard sends nothing anywhere on its own: no telemetry, no
+analytics, no "phone home" of any kind, and no network requests except the
+ones YOU already make — the ordinary `git`/`ssh` connections a real push
+makes, or Shield's local `ssh -G`/`ssh -T` route-verification probe (see
+[docs/SHIELD_MODE.md](docs/SHIELD_MODE.md)'s Phase 5 section) would make
+anyway. Everything it reads (Git config, remotes, SSH config, commit
+identity) and everything it can write (`user.name`/`user.email` at
+`--local`/`--worktree` scope, and Shield's own Git hooks when you enable
+it) stays on your machine, in the repositories you point it at. Profiles,
+protected branches, and preferences live in VS Code's own `settings.json`,
+not a separate account or cloud store. Nothing here has been audited by a
+third party — read the source, it's small enough to.
 
 ## Settings
 

@@ -709,9 +709,12 @@ way past a hook in this state.
   complexity. Still open.
 - A "Shield Mode" section in Settings/sidebar with an enable/disable
   toggle — Phase 3 added command-palette commands only, deliberately not a
-  sidebar redesign; still open. (Phase 9 replaced the disabled "Coming
-  Soon" panel with a plain note pointing at those commands. A real
-  dashboard remains deliberately unbuilt.)
+  sidebar redesign; open when this was written. (HISTORICAL: superseded —
+  Shield later gained its own dedicated sidebar screen, OFF / ACTIVE /
+  DEGRADED / BROKEN / UNAVAILABLE, reached from Main's Shield summary card
+  or a Settings → Shield card, alongside the same Command Palette commands
+  which still exist and call the same code. See the CURRENT STATUS note at
+  the top of this document.)
 
 ## Phase 3: installation lifecycle and pre-commit enforcement
 
@@ -2400,8 +2403,9 @@ unchanged remote would report a port MISMATCH.
 **The fix.** `ParsedRemote` (`src/services/gitService.ts`) gained `port`
 (set only when the URL itself carries one — the `ssh://` form only; the
 scp-like `host:path` form can never carry a port, since everything after
-the colon is the path) and `sshUser` (defaulting to `"git"`, mirroring
-`shield-evaluate.sh`'s own `SSH_USER` default). `RepoFacts` gained
+the colon is the path) and `sshUser` (set only when the URL/alias names
+one; see "Phase 8, round 4" below for why a missing user is never
+defaulted to `"git"`). `RepoFacts` gained
 `pushRemotePort`/`pushRemoteUser`. `resolveCanonicalSshEndpoint`
 (`src/shield/sshEndpoint.ts`) now takes `port`/`user` options and builds
 the identical `ssh -G [-p <port>] <user>@<host>` invocation
@@ -2553,6 +2557,80 @@ client a user has, since Shield has no reliable way to detect this
 automatically without executing configuration it does not control (the
 same reason `GIT_SSH_COMMAND`/`core.sshCommand` are never executed to
 "discover" what they do).
+
+---
+
+### Phase 8, round 4: SSH user must never be invented
+
+A further independent review found the same "does Shield's canonical
+`ssh -G` ask the IDENTICAL question the real push asks" bug class —
+already fixed for the host (round 2) and the port (round 3) — applied a
+third time, to the SSH **user**.
+
+**The bug.** `parseRemoteUrl` defaulted a missing URL user to `"git"`
+(`sshUser: parsed.username || "git"`), and `shield-evaluate.sh` did `[ -z
+"$SSH_USER" ] && SSH_USER=git`. This is not real Git/OpenSSH semantics:
+for `ssh://host/owner/repo.git` or `host:owner/repo.git` with NO user in
+the URL, the effective user is determined by OpenSSH itself — the local
+username, or a config-driven `User` directive, possibly `Match
+user`-sensitive — never universally `"git"`. Canonicalizing with an
+invented `"git@"` could resolve to a DIFFERENT effective host/port than
+the real transport uses whenever that resolution is user-sensitive,
+defeating the round 2/3 canonical-endpoint model with a bug in Shield's
+own canonicalization code, not an attacker's repoint.
+
+**The fix.** Never default the user at all, on either side:
+- `ParsedRemote.sshUser` (`src/services/gitService.ts`) is `undefined` —
+  never `"git"` — when the URL/alias names no user, for both the `ssh://`
+  form and the scp-like form.
+- `resolveCanonicalSshEndpoint` (`src/shield/sshEndpoint.ts`) builds the
+  `ssh -G` target as `user@host` only when a user was supplied, else the
+  bare `host` — letting OpenSSH itself determine the effective user, the
+  same question the real push transport asks.
+- `shield-evaluate.sh`'s `SSH_USER` extraction no longer defaults to
+  `"git"`. `resolve_canonical_ssh_route()` and `verify_github_account()`
+  (Phase 5's account-verification probe — both its `ssh -G` config
+  resolution and its `ssh -T` auth probe, plus the known-hosts-failure
+  user-facing hint) all build a `TARGET` that's `user@host` only when a
+  user is present, bare host otherwise.
+
+**Required regression coverage**
+(`src/test/shieldSshUserCanonicalization.test.ts`, cases A–G), all
+passing with no platform skip: explicit `git@`/`deploy@` users reach the
+resolver unchanged (A/B); an omitted user never reaches the resolver as
+an invented `git@`, on either the `ssh://` form (C) or the scp-like form
+(D); a simulated username-sensitive config where the omitted-user route
+and an explicit-user route resolve to DIFFERENT hostnames, with Shield
+correctly following the omitted-user route for an omitted-user URL (E);
+enable-time (dependency-injected resolver) and hook-time (the real
+shipped evaluator) agreeing on that same omitted-user route (F); and a
+destination change caused ONLY by username-sensitive routing blocking
+rather than falsely confirming (G).
+
+**Why no `policyVersion` bump.** This is a resolution-*behavior* fix, not
+a schema-shape change — `approvedPushDestination`'s fields are unchanged.
+An existing Shield install whose `canonicalHost`/`canonicalPort` was
+resolved under the old, incorrect `"git@"` assumption doesn't need a
+version-gated migration: `inspect()`'s existing byte-for-byte evaluator
+comparison already flags a repository running an older evaluator copy as
+degraded/outdated the first time it's inspected after the extension
+updates, prompting "Repair Shield" — which re-derives `canonicalHost`/
+`canonicalPort` from the (now-correct) `pushRemoteUser` at the same time
+it reinstalls the corrected hook script, atomically. There is no window
+where a stale `"git@"`-resolved `canonicalHost` sits next to an
+already-fixed hook.
+
+**Why not a fourth dimension of the same bug.** Host, port, and user are
+the only three inputs that construct the `ssh -G`/`ssh -T` target string
+in both the TypeScript and shell code paths. Every other host/user-
+adjacent OpenSSH directive (`ProxyJump`, `IdentityFile`, `HostKeyAlias`,
+`Match user`, `Include`) is automatically reflected in `ssh -G`'s own
+output as long as the target string it's asked about exactly matches what
+the real transport would use — which, after this round, it does along all
+three axes. A non-OpenSSH transport (`core.sshCommand`/`GIT_SSH_VARIANT`)
+is a separate, pre-existing, already-handled case (see the transport-
+override fail-closed behavior in round 2): out of scope here, not a gap
+in this fix.
 
 ---
 

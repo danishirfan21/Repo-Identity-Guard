@@ -628,10 +628,23 @@ resolve_canonical_ssh_route() {
   if [ -z "$RCSR_HOST" ]; then
     return 0
   fi
-  if [ -n "$RCSR_PORT" ]; then
-    RCSR_CONFIG=$(ssh -G -p "$RCSR_PORT" "${RCSR_USER}@${RCSR_HOST}" 2>/dev/null) || RCSR_CONFIG=""
+  # An EMPTY user means the URL never named one -- pass the bare host to
+  # `ssh -G`, exactly like the real push transport would, and let OpenSSH
+  # itself determine the effective user (its own default, or a
+  # config-driven `User` directive). Silently inventing "git" here would
+  # canonicalize a DIFFERENT target than the one Git will actually connect
+  # as whenever `Match user`/a per-user `Host` block makes the effective
+  # route user-sensitive -- see docs/SHIELD_MODE.md's "SSH user must never
+  # be invented" section for the full writeup.
+  if [ -n "$RCSR_USER" ]; then
+    RCSR_TARGET="${RCSR_USER}@${RCSR_HOST}"
   else
-    RCSR_CONFIG=$(ssh -G "${RCSR_USER}@${RCSR_HOST}" 2>/dev/null) || RCSR_CONFIG=""
+    RCSR_TARGET="$RCSR_HOST"
+  fi
+  if [ -n "$RCSR_PORT" ]; then
+    RCSR_CONFIG=$(ssh -G -p "$RCSR_PORT" "$RCSR_TARGET" 2>/dev/null) || RCSR_CONFIG=""
+  else
+    RCSR_CONFIG=$(ssh -G "$RCSR_TARGET" 2>/dev/null) || RCSR_CONFIG=""
   fi
   RCSR_LOWER=$(printf '%s\n' "$RCSR_CONFIG" | tr '[:upper:]' '[:lower:]')
   RCSR_HOSTNAME=$(printf '%s\n' "$RCSR_LOWER" | awk '$1 == "hostname" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }')
@@ -680,17 +693,27 @@ verify_github_account() {
   #   * the same port -- if the remote URL carried an explicit port, git
   #     would pass it, so `-p` is passed to BOTH `ssh -G` and `ssh -T`,
   #     making the resolved configuration and the probe agree;
-  #   * the same login user, taken from the URL when it names one.
+  #   * the same login user, taken from the URL when it names one --
+  #     and, when the URL named NONE, the bare alias, so OpenSSH itself
+  #     determines the effective user exactly as the real push transport
+  #     would. Inventing "git" here would ask a DIFFERENT question
+  #     whenever the effective user is config-sensitive (`Match user`, a
+  #     per-user `Host` block) and could authenticate the wrong login.
   #
   # If the effective HostName is not a GitHub SSH endpoint, no answer from
   # it can establish a github.com account, and verification fails closed.
+  if [ -n "$SSH_USER_LOCAL" ]; then
+    TARGET="${SSH_USER_LOCAL}@${ALIAS}"
+  else
+    TARGET="$ALIAS"
+  fi
   PORT_ARGS_SET=0
   if [ -n "$URL_PORT" ]; then PORT_ARGS_SET=1; fi
 
   if [ "$PORT_ARGS_SET" = 1 ]; then
-    CONFIG_OUTPUT=$(ssh -G -p "$URL_PORT" "${SSH_USER_LOCAL}@${ALIAS}" 2>/dev/null) || CONFIG_OUTPUT=""
+    CONFIG_OUTPUT=$(ssh -G -p "$URL_PORT" "$TARGET" 2>/dev/null) || CONFIG_OUTPUT=""
   else
-    CONFIG_OUTPUT=$(ssh -G "${SSH_USER_LOCAL}@${ALIAS}" 2>/dev/null) || CONFIG_OUTPUT=""
+    CONFIG_OUTPUT=$(ssh -G "$TARGET" 2>/dev/null) || CONFIG_OUTPUT=""
   fi
   LOWER_CONFIG=$(printf '%s\n' "$CONFIG_OUTPUT" | tr '[:upper:]' '[:lower:]')
 
@@ -758,9 +781,9 @@ Reason: This SSH route's effective configuration does not set \"IdentitiesOnly y
   TIMEOUT="${REPO_IDENTITY_GUARD_SHIELD_SSH_TIMEOUT:-5}"
   set +e
   if [ "$PORT_ARGS_SET" = 1 ]; then
-    AUTH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout="$TIMEOUT" -p "$URL_PORT" "${SSH_USER_LOCAL}@${ALIAS}" 2>&1)
+    AUTH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout="$TIMEOUT" -p "$URL_PORT" "$TARGET" 2>&1)
   else
-    AUTH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout="$TIMEOUT" "${SSH_USER_LOCAL}@${ALIAS}" 2>&1)
+    AUTH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout="$TIMEOUT" "$TARGET" 2>&1)
   fi
   set -e
 
@@ -799,7 +822,7 @@ Reason: SSH authentication to GitHub was refused (permission denied), so the acc
     *"Host key verification failed"*|*"know the"*"key fingerprint"*|*"host key is known"*)
       add_reason push-account-unverified "Profile: $PROFILE_LABEL
 Expected GitHub account: $EXPECTED
-Reason: This SSH host's key is not already trusted in known_hosts, so Shield refused to connect automatically. Verify the host key fingerprint yourself (e.g. run \"ssh -T ${SSH_USER_LOCAL}@${ALIAS}\" once interactively) and accept it before relying on strict account verification."
+Reason: This SSH host's key is not already trusted in known_hosts, so Shield refused to connect automatically. Verify the host key fingerprint yourself (e.g. run \"ssh -T $TARGET\" once interactively) and accept it before relying on strict account verification."
       ;;
     *"timed out"*)
       add_reason push-account-unverified "Profile: $PROFILE_LABEL
@@ -945,10 +968,17 @@ evaluate_push() {
   PARSED_OWNER=$(printf '%s' "$REPO_PATH" | awk -F/ '{ if (NF>=2) print $(NF-1) }')
 
   # SSH connection user, e.g. "git" in "git@github-work:owner/repo.git" --
-  # defaults to "git" (GitHub's own convention) when the URL/alias doesn't
-  # specify one, since an SSH alias commonly sets `User git` itself.
+  # left EMPTY when the URL/alias doesn't specify one. Never defaulted to
+  # "git" here: OpenSSH itself determines the effective user for a
+  # user-less target (its own default, or a config-driven `User`
+  # directive, possibly `Match user`-sensitive) exactly the way the real
+  # push transport would, and canonicalizing against an invented "git"
+  # would ask `ssh -G` a DIFFERENT question than the one the actual push
+  # answers whenever that resolution is user-sensitive. See
+  # resolve_canonical_ssh_route's and verify_github_account's own
+  # empty-user handling, and docs/SHIELD_MODE.md's "SSH user must never be
+  # invented" section.
   SSH_USER=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^(ssh://)?([^@/:]+)@.*#\2#p')
-  [ -z "$SSH_USER" ] && SSH_USER=git
 
   # Explicit port, e.g. `ssh://git@github-work:2222/owner/repo.git`. Only
   # the `ssh://` URL form can carry one -- in the scp-like `host:path`

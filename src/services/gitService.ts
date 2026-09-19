@@ -394,10 +394,15 @@ export interface ParsedRemote {
   port?: string;
   /**
    * The SSH connection user, e.g. "git" in `git@github-work:owner/repo.git`
-   * — defaults to "git" (GitHub's own convention) when the URL/alias
-   * doesn't specify one, since an SSH alias commonly sets `User git`
-   * itself. Only set for `protocol === "ssh"`. Mirrors shield-evaluate.sh's
-   * `SSH_USER`; kept 1:1 by shieldRemoteUrlDifferential.test.ts.
+   * — undefined when the URL/alias doesn't specify one. NEVER defaulted to
+   * "git" here: an absent user means OpenSSH itself determines the
+   * effective one (its own default, or a config-driven `User` directive,
+   * possibly `Match user`-sensitive) exactly the way the real push
+   * transport would — canonicalizing against an invented "git" would ask
+   * a DIFFERENT question than the one the actual push answers whenever
+   * that resolution is user-sensitive. Only set for `protocol === "ssh"`.
+   * Mirrors shield-evaluate.sh's `SSH_USER`; kept 1:1 by
+   * shieldRemoteUrlDifferential.test.ts.
    */
   sshUser?: string;
 }
@@ -431,7 +436,7 @@ export function parseRemoteUrl(remoteUrl: string): ParsedRemote {
         owner,
         repo,
         port: parsed.port || undefined,
-        sshUser: parsed.username || "git",
+        sshUser: parsed.username || undefined,
       };
     } catch {
       return { protocol: "unknown" };
@@ -444,7 +449,7 @@ export function parseRemoteUrl(remoteUrl: string): ParsedRemote {
     const segments = scpLike[3].replace(/^\/+|\/+$/g, "").split("/");
     const repo = segments.pop()?.replace(/\.git$/i, "");
     const owner = segments.pop();
-    return { protocol: "ssh", host, owner, repo, sshUser: scpLike[1] || "git" };
+    return { protocol: "ssh", host, owner, repo, sshUser: scpLike[1] || undefined };
   }
 
   return { protocol: "unknown" };

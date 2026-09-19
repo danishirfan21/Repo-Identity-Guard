@@ -54,8 +54,17 @@ export async function resolveCanonicalSshEndpoint(
   // DIFFERENT port semantics (one with an explicit `-p`, one without) is
   // exactly what let an unchanged approved SSH destination read as a port
   // mismatch — see docs/SHIELD_MODE.md's explicit-SSH-URL-port section.
-  const user = options.user?.trim() || "git";
-  const args = options.port ? ["-G", "-p", options.port, `${user}@${trimmed}`] : ["-G", `${user}@${trimmed}`];
+  //
+  // The SAME reasoning applies to the user: an absent `options.user` means
+  // the URL never named one, and the target passed to `ssh -G` must stay
+  // BARE (no invented "user@") so OpenSSH itself determines the effective
+  // user exactly as the real push transport would — never a hardcoded
+  // "git", which would ask a different question whenever the effective
+  // user is config-sensitive (`Match user`, a per-user `Host` block). See
+  // docs/SHIELD_MODE.md's "SSH user must never be invented" section.
+  const user = options.user?.trim();
+  const target = user ? `${user}@${trimmed}` : trimmed;
+  const args = options.port ? ["-G", "-p", options.port, target] : ["-G", target];
   try {
     const { stdout } = await execFileAsync("ssh", args, {
       encoding: "utf8",

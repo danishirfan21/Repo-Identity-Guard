@@ -4,6 +4,7 @@
   "description": "Know instantly whether it's safe to work, commit, push, or let an AI agent run commands in this repo.",
   "version": "0.2.0",
   "publisher": "local",
+  "icon": "resources/repo-id-marketplace.png",
   "license": "MIT",
   "repository": {
     "type": "git",
