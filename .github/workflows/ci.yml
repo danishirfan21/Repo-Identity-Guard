@@ -14,15 +14,21 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # Safety net, not a target: the differential/fuzz suites spawn a real
-    # `sh` (which itself spawns `git`/`awk`) per generated case, thousands
-    # of times across the fuzz files. On windows-latest that per-process
-    # overhead was observed to make the full suite run past 45 minutes
-    # with no other progress -- indistinguishable in the UI from a genuine
-    # hang. This timeout turns "silently burns the runner for hours" into
-    # a loud, bounded failure; SHIELD_FUZZ_CASES below is the actual fix
-    # for the overhead itself.
-    timeout-minutes: 40
+    # Safety net, not a target and not an expected duration: the
+    # differential/fuzz suites spawn a real `sh` (which itself spawns
+    # `git`/`awk`) per generated case, thousands of times across the fuzz
+    # files. On windows-latest that per-process overhead was observed to
+    # make the full suite run past 45 minutes with no other progress --
+    # indistinguishable in the UI from a genuine hang -- and, once the
+    # cross-platform evaluator-shell-driven Windows coverage added in
+    # later rounds is included, past the previous 40-minute ceiling even
+    # though every test was still genuinely progressing (compiled
+    # successfully and passed hundreds of tests before being cut off).
+    # 60 minutes is a hard safety CEILING against a silent runaway, not a
+    # target to shrink toward -- SHIELD_FUZZ_CASES below is the actual fix
+    # for the fuzz-suite overhead itself; this number exists only to turn
+    # "silently burns the runner for hours" into a loud, bounded failure.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
