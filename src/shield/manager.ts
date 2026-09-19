@@ -5,6 +5,7 @@ import { canonicalRepoKey, resolveProfiles } from "../core/profileResolver";
 import {
   getCoreHooksPathConfig,
   getGitCommonDir,
+  getGitConfigValue,
   getGitDir,
   getGitVersionRaw,
   getHooksDir,
@@ -19,7 +20,9 @@ import {
   extractShieldArtifactVersion,
   isShieldOwnedArtifact,
 } from "./artifacts";
+import { SshTransportEnvironment, resolveSshCommandOverrides } from "./evaluator";
 import { SHIELD_MIN_GIT_VERSION_DISPLAY, evaluateGitVersionSupport } from "./gitVersion";
+import { resolveCanonicalSshEndpoint } from "./sshEndpoint";
 import {
   normalizeHookDirs,
   readShieldInstallRecord,
@@ -221,7 +224,7 @@ export interface ShieldInspection {
    */
   policySnapshot?: {
     approvedRepositoryKey?: string;
-    approvedPushDestination?: { host?: string; owner?: string; repo?: string };
+    approvedPushDestination?: { host?: string; owner?: string; repo?: string; canonicalHost?: string; canonicalPort?: string };
     trustedSshHostAliases: string[];
     expectedGitHubLogin?: string;
     strictPushSetup: boolean;
@@ -291,6 +294,14 @@ export interface ShieldEnableInput {
    * touched.
    */
   chainForeignHooks?: boolean;
+  /**
+   * Process environment to use when resolving the approved push
+   * destination's canonical SSH endpoint (see
+   * `ShieldInspectOptions.env` — same purpose, same default of
+   * `process.env`). Exists for tests to inject a fake `ssh` via a
+   * PATH-shadowing directory; production callers should simply omit this.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface ShieldInspectOptions {
@@ -316,9 +327,45 @@ export interface ShieldInspectOptions {
    * The repository's current, freshly-resolved push destination (e.g.
    * from a fresh `RepoFacts` scan) — when supplied, compared against the
    * policy's `approvedPushDestination` to populate `pushDestinationDrift`.
-   * Omit to skip this check.
+   * Omit to skip this check. `protocol` (ssh/https/unknown) is needed only
+   * when `resolveCanonicalDestinationDrift` is also set.
    */
-  currentPushDestination?: { host?: string; owner?: string; repo?: string };
+  currentPushDestination?: { host?: string; owner?: string; repo?: string; protocol?: string };
+  /**
+   * Opt-in, expensive drift check: re-resolves the CURRENT push
+   * destination's REAL canonical SSH endpoint right now (a real `ssh -G`
+   * call, same as `enable()`/`repair()` use to establish the APPROVED
+   * endpoint) and compares it against the policy's persisted
+   * `approvedPushDestination.canonicalHost`/`canonicalPort` — the only way
+   * to detect an SSH alias silently repointed in `~/.ssh/config` since
+   * Shield was last enabled or repaired (its NAME never changes, so a
+   * literal host-string comparison cannot see it).
+   *
+   * Deliberately never implied by merely supplying `currentPushDestination`:
+   * `inspect()` runs on every routine background scan (file-watcher
+   * events, workspace-folder switches, ...), and spawning a real `ssh`
+   * process on every one of those would be a real, user-visible
+   * performance cost for an automatic check nobody asked for in the
+   * moment. Set this only for an explicit, on-demand check (the sidebar's
+   * "Check Shield Health" / `checkShieldHealth()`) — routine scans get a
+   * cheaper literal host/owner/repo comparison instead, which still
+   * catches a genuinely different remote, just not a same-named alias
+   * quietly repointed underneath it. Either way, what actually enforces
+   * at push time is `evaluator.ts`/`shield-evaluate.sh`, which ALWAYS
+   * canonicalizes the current route fresh, on every real push,
+   * unconditionally — this flag only affects how promptly the sidebar's
+   * diagnostic health/drift indicator notices, never what a push allows.
+   */
+  resolveCanonicalDestinationDrift?: boolean;
+  /**
+   * Process environment to use for the canonical SSH endpoint resolution
+   * above (both the `GIT_SSH`/`GIT_SSH_COMMAND`/`GIT_SSH_VARIANT`
+   * override check and the `ssh -G` spawn itself) — defaults to
+   * `process.env`. Exists so a test can inject a fake `ssh` via a
+   * PATH-shadowing directory without mutating the real test process's
+   * global environment; production callers should simply omit this.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 interface HookSpec {
@@ -732,18 +779,47 @@ export class ShieldManager {
         // unconditional-block. Health and hook enforcement must agree.
         pushDestinationDrift = true;
       } else {
-        // Canonical destination model, same three fields and same
-        // fail-closed posture as the evaluator's destinationReasons: a
+        // Same fail-closed posture as the evaluator's destinationReasons: a
         // field the approval recorded but the current push destination
-        // can't reproduce (missing host/repo evidence) is a change, never
-        // a silent match — comparing two empty strings is the only way
-        // "unchanged" is reached here, and that only happens when NEITHER
-        // side ever had that field (a pre-canonical-host policy with no
-        // current host either).
-        const hostChanged = normalizeOwnerRepo(approved.host) !== normalizeOwnerRepo(current.host);
+        // can't reproduce is a change, never a silent match.
         const ownerChanged = normalizeOwnerRepo(approved.owner) !== normalizeOwnerRepo(current.owner);
         const repoChanged = !!approved.repo && normalizeOwnerRepo(approved.repo) !== normalizeOwnerRepo(current.repo);
-        pushDestinationDrift = hostChanged || ownerChanged || repoChanged;
+
+        let hostChanged: boolean;
+        let portChanged = false;
+        if (options.resolveCanonicalDestinationDrift) {
+          // Expensive, on-demand path (explicit "Check Shield Health"
+          // only — see ShieldInspectOptions.resolveCanonicalDestinationDrift
+          // for why routine background scans never set this): re-resolves
+          // the CURRENT destination's REAL canonical endpoint right now,
+          // the same way enable()/repair() established the APPROVED one,
+          // which is the only way to catch an SSH alias silently
+          // repointed in ~/.ssh/config since Shield was last
+          // enabled/repaired — its NAME never changes, so no literal
+          // string comparison can see it.
+          const currentCanonical = await this.canonicalizeDestination(repoRoot, current.protocol, current.host, options.env);
+          hostChanged =
+            !approved.canonicalHost ||
+            !currentCanonical.canonicalHost ||
+            normalizeOwnerRepo(approved.canonicalHost) !== normalizeOwnerRepo(currentCanonical.canonicalHost);
+          portChanged =
+            !!approved.canonicalPort &&
+            !!currentCanonical.canonicalPort &&
+            approved.canonicalPort !== currentCanonical.canonicalPort;
+        } else {
+          // Cheap path: literal host/owner/repo comparison only. Catches
+          // a genuinely different remote, but NOT a same-named alias
+          // quietly repointed to a different physical endpoint — that
+          // requires the canonical resolution above. What actually
+          // enforces at push time (evaluator.ts / shield-evaluate.sh)
+          // ALWAYS canonicalizes the current route fresh, unconditionally,
+          // on every real push — this cheap path only affects how
+          // promptly the sidebar's diagnostic indicator notices, never
+          // what a push allows.
+          hostChanged = normalizeOwnerRepo(approved.host) !== normalizeOwnerRepo(current.host);
+        }
+
+        pushDestinationDrift = hostChanged || ownerChanged || repoChanged || portChanged;
       }
     }
 
@@ -896,6 +972,71 @@ export class ShieldManager {
    *    those hooks are inspected properly by the main path above and are
    *    not orphans at all.
    */
+  /**
+   * Reads the SSH transport-override environment for this repo, the same
+   * way `evaluate_push`/`destinationReasons` do at hook time —
+   * `GIT_SSH`/`GIT_SSH_COMMAND`/`GIT_SSH_VARIANT` from the process
+   * environment, `core.sshCommand`/`ssh.variant` from Git config at this
+   * repo's effective scope. Never reads a key, a credential, or executes
+   * anything the override VALUES would run — see `resolveSshCommandOverrides`
+   * for why presence alone, never the value, is what matters.
+   */
+  private async readSshTransportEnvironment(repoRoot: string, env: NodeJS.ProcessEnv): Promise<SshTransportEnvironment> {
+    const [coreSshCommand, sshVariantConfig] = await Promise.all([
+      getGitConfigValue(repoRoot, "core.sshCommand"),
+      getGitConfigValue(repoRoot, "ssh.variant"),
+    ]);
+    return {
+      gitSsh: env.GIT_SSH,
+      gitSshCommand: env.GIT_SSH_COMMAND,
+      coreSshCommand: coreSshCommand ?? undefined,
+      gitSshVariant: env.GIT_SSH_VARIANT,
+      sshVariantConfig: sshVariantConfig ?? undefined,
+    };
+  }
+
+  /**
+   * Resolves a push destination's REAL physical endpoint — the single
+   * canonicalization routine shared by `enable()`/`repair()` (building the
+   * APPROVED endpoint once, durably) and an explicit "Check Shield
+   * Health" (re-resolving the CURRENT endpoint on demand — see
+   * `ShieldInspectOptions.resolveCanonicalDestinationDrift`). Never
+   * attempted, and never trusted, when an SSH transport override is in
+   * effect: the override can redirect the connection regardless of what
+   * `ssh -G` reports for the URL's own host, so a caller must treat an
+   * empty result here as "unprovable," never as "unchanged" or "fine" —
+   * see `destinationReasons()` in evaluator.ts for the full fail-closed
+   * rationale this mirrors.
+   */
+  private async canonicalizeDestination(
+    repoRoot: string,
+    protocol: string | undefined,
+    host: string | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+  ): Promise<{ canonicalHost?: string; canonicalPort?: string }> {
+    if (!host) {
+      return {};
+    }
+    if (protocol !== "ssh") {
+      // Only SSH has local ~/.ssh/config alias indirection an attacker
+      // could silently repoint after Shield approved a destination --
+      // HTTPS, and any other/unrecognized protocol Git itself accepts
+      // (git://, file://, ...), have no such ambiguity: the literal host
+      // IS the canonical host. Kept 1:1 with destinationReasons() in
+      // evaluator.ts and the shell evaluator's matching branch.
+      return { canonicalHost: host };
+    }
+    const overrides = resolveSshCommandOverrides(await this.readSshTransportEnvironment(repoRoot, env));
+    if (overrides.length > 0) {
+      return {};
+    }
+    const endpoint = await resolveCanonicalSshEndpoint(host, { env });
+    if (!endpoint) {
+      return {};
+    }
+    return { canonicalHost: endpoint.host, canonicalPort: endpoint.port };
+  }
+
   private async findOrphanedShieldHookPaths(gitContext: ShieldGitContext): Promise<string[]> {
     const record = await readShieldInstallRecord(shieldInstallRecordFilePath(shieldStorageDir(gitContext.gitCommonDir)));
     if (!record) return [];
@@ -922,7 +1063,10 @@ export class ShieldManager {
    * (`profile-unresolved`) or 2+/a fork conflict (`profile-conflict`) are
    * both "cannot enable Shield yet," not an error.
    */
-  private buildPolicyForRepo(input: ShieldEnableInput): { policy: ShieldPolicy } | { error: "profile-unresolved" | "profile-conflict"; message: string } {
+  private async buildPolicyForRepo(
+    repoRoot: string,
+    input: ShieldEnableInput,
+  ): Promise<{ policy: ShieldPolicy } | { error: "profile-unresolved" | "profile-conflict"; message: string }> {
     const { facts, profiles, protectedBranches, now } = input;
     const resolution = resolveProfiles(facts, profiles);
 
@@ -977,10 +1121,32 @@ export class ShieldManager {
     // (see `destinationReasons`), and silently substituting origin here
     // would reintroduce exactly the bug this fixes.
     const approvedRepositoryKey = canonicalRepoKey(facts.remoteHost, facts.remoteOwner, facts.remoteRepo);
-    const approvedPushDestination =
-      facts.pushRemoteOwner || facts.pushRemoteHost || facts.pushRemoteRepo
-        ? { host: facts.pushRemoteHost, owner: facts.pushRemoteOwner, repo: facts.pushRemoteRepo }
-        : undefined;
+    let approvedPushDestination: ShieldPolicy["approvedPushDestination"];
+    if (facts.pushRemoteOwner || facts.pushRemoteHost || facts.pushRemoteRepo) {
+      // Round-2 release-blocker fix: resolve and persist the REAL
+      // canonical physical endpoint NOW, once, durably -- never trust the
+      // literal host/alias text alone. See `canonicalizeDestination` and
+      // `ShieldPolicy.approvedPushDestination.canonicalHost`'s doc
+      // comment for the full "why a literal comparison isn't enough"
+      // writeup. An unresolvable endpoint (an SSH transport override in
+      // effect, `ssh` unavailable, or resolution failing) is NOT refused
+      // here -- enable()/repair() still install Shield's commit
+      // protection, exactly like an entirely absent push destination
+      // already does, and `canonicalHost` is simply left undefined, which
+      // makes push destination fail closed on every push until the
+      // override is removed and Shield is repaired (see
+      // `destinationReasons()`).
+      const canonical = await this.canonicalizeDestination(repoRoot, facts.pushRemoteProtocol, facts.pushRemoteHost, input.env);
+      approvedPushDestination = {
+        host: facts.pushRemoteHost,
+        owner: facts.pushRemoteOwner,
+        repo: facts.pushRemoteRepo,
+        canonicalHost: canonical.canonicalHost,
+        canonicalPort: canonical.canonicalPort,
+      };
+    } else {
+      approvedPushDestination = undefined;
+    }
 
     const policy = buildShieldPolicy({
       profile,
@@ -1043,7 +1209,7 @@ export class ShieldManager {
       };
     }
 
-    const built = this.buildPolicyForRepo(input);
+    const built = await this.buildPolicyForRepo(repoRoot, input);
     if ("error" in built) {
       const inspection = await this.inspect(repoRoot);
       return { ok: false, inspection: { ...inspection, reasons: [built.message, ...inspection.reasons] } };

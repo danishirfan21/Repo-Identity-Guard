@@ -144,13 +144,23 @@ async function hooksDirFor(repo: Repo): Promise<string> {
 async function enableShield(
   manager: ShieldManager,
   repo: Repo,
-  overrides: { profiles?: Profile[]; facts?: Partial<RepoFacts>; chainForeignHooks?: boolean } = {},
+  overrides: { profiles?: Profile[]; facts?: Partial<RepoFacts>; chainForeignHooks?: boolean; fakeSshBin?: string } = {},
 ) {
+  // Round-2 release-blocker fix: enable() now resolves and persists the
+  // approved destination's REAL canonical SSH endpoint via a live
+  // `ssh -G` call. Threading the fake ssh's PATH-shadowing directory
+  // through here (via ShieldEnableInput.env, never this test process's
+  // real global environment) is what makes that resolution see the fake
+  // "github-work -> github.com" route.
+  const env = overrides.fakeSshBin
+    ? { ...repo.env, PATH: `${overrides.fakeSshBin}${path.delimiter}${repo.env.PATH}` }
+    : undefined;
   return manager.enable(repo.dir, EVALUATOR_SOURCE, {
     facts: baseFacts(repo, overrides.facts),
     profiles: overrides.profiles ?? [workProfile],
     protectedBranches: ["main", "master"],
     chainForeignHooks: overrides.chainForeignHooks,
+    env,
   });
 }
 
@@ -285,6 +295,21 @@ async function makeFakeSshBin(): Promise<string> {
     `"use strict";
 const { execFileSync } = require("node:child_process");
 const args = process.argv.slice(2);
+const joined = " " + args.join(" ") + " ";
+// Round-2 release-blocker fix: enable()/repair() now resolve the approved
+// destination's canonical endpoint via a real "ssh -G" call. This fake
+// ssh answers it the same way the alias is expected to behave throughout
+// this file ("github-work" -> "github.com") so that resolution succeeds
+// under the fake instead of failing to parse a bare "-G" invocation as a
+// push transport command.
+if (joined.includes(" -G ")) {
+  process.stdout.write(
+    "user " + (process.env.FAKE_SSH_USER || "git") + "\\n" +
+    "hostname " + (process.env.FAKE_SSH_HOSTNAME || "github.com") + "\\n" +
+    "port " + (process.env.FAKE_SSH_PORT || "22") + "\\n"
+  );
+  process.exit(0);
+}
 const remoteCommand = args[args.length - 1] || "";
 const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
 if (!match) {
@@ -344,10 +369,7 @@ test("a chained pre-push hook receives the same argv AND the same stdin ref line
     // route/destination enforcement, already covered elsewhere).
     await enableShield(manager, repo, {
       chainForeignHooks: true,
-      // pushRemoteHost matches the literal alias the push below uses, so
-      // the destination check's host equality is satisfied literally and
-      // never needs to canonicalize via "ssh -G" -- this fixture's fake
-      // ssh only implements the git-transport passthrough, not "-G"/"-T".
+      fakeSshBin,
       facts: {
         remoteHost: "github-work",
         remoteOwner: "AcmeSoftware",
@@ -744,6 +766,55 @@ test("integrity: missing repo evidence in the current push destination is drift,
   }
 });
 
+// Review case F: health inspection after an SSH alias's endpoint changes
+// must report DEGRADED — but only via the EXPLICIT, on-demand canonical
+// check (resolveCanonicalDestinationDrift), since that is what actually
+// re-resolves the current route through a real "ssh -G" call rather than
+// comparing literal host text (see the class-level doc comment on
+// ShieldInspectOptions.resolveCanonicalDestinationDrift for why routine
+// background scans intentionally do NOT pay that cost automatically).
+test("integrity: an SSH alias's endpoint changing since enable() is caught by the explicit canonical health check (case F), never by the cheap literal check alone", async () => {
+  const repo = await makeTempRepo();
+  try {
+    const manager = new ShieldManager();
+    const fakeSshBin = await makeFakeSshBin();
+    const enableEnv = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}`, FAKE_SSH_HOSTNAME: "github.com" };
+    await enableShield(manager, repo, { fakeSshBin });
+    assert.equal((await manager.inspect(repo.dir)).state, "active");
+
+    // Literal host/owner/repo text is UNCHANGED (still "github.com" per
+    // baseFacts) -- only what the alias ACTUALLY resolves to right now
+    // has changed, simulating a ~/.ssh/config edit since enable().
+    const repointedEnv = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}`, FAKE_SSH_HOSTNAME: "evil.example" };
+
+    const cheapCheck = await manager.inspect(repo.dir, {
+      currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
+    });
+    assert.equal(cheapCheck.pushDestinationDrift, false, "the cheap literal check cannot see an alias repoint by design");
+    assert.equal(cheapCheck.state, "active");
+
+    const canonicalCheck = await manager.inspect(repo.dir, {
+      currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
+      resolveCanonicalDestinationDrift: true,
+      env: repointedEnv,
+    });
+    assert.equal(canonicalCheck.pushDestinationDrift, true, "the explicit canonical check must catch the repoint");
+    assert.equal(canonicalCheck.state, "degraded");
+
+    // Sanity: the SAME explicit canonical check, with NO repoint, must not
+    // false-positive.
+    const canonicalCheckUnchanged = await manager.inspect(repo.dir, {
+      currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
+      resolveCanonicalDestinationDrift: true,
+      env: enableEnv,
+    });
+    assert.equal(canonicalCheckUnchanged.pushDestinationDrift, false);
+    assert.equal(canonicalCheckUnchanged.state, "active");
+  } finally {
+    await cleanup(repo.dir);
+  }
+});
+
 test("integrity: account verification configuration drift (expectedGitHubLogin changed) is detected via currentProfiles, and repair() re-syncs it", async () => {
   const repo = await makeTempRepo();
   try {
@@ -808,7 +879,7 @@ test("lifecycle: an interrupted enable (policy written, hooks/evaluator not yet)
     await fs.writeFile(
       path.join(commonDir, "repo-identity-guard", "shield-policy.json"),
       JSON.stringify({
-        policyVersion: 1,
+        policyVersion: 2,
         generatedAt: Date.now(),
         matchedProfileId: "work",
         profileLabel: "Work",

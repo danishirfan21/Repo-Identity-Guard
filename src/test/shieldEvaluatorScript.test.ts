@@ -83,7 +83,7 @@ async function writePolicy(repo: string, policy: ShieldPolicy): Promise<void> {
 function defaultPolicy(overrides: Partial<Parameters<typeof buildShieldPolicy>[0]> = {}): ShieldPolicy {
   return buildShieldPolicy({
     profile: workProfile,
-    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend" },
+    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com" },
     protectedBranches: ["main", "master"],
     enabledActions: ["commit", "push"],
     now: 1,
@@ -123,7 +123,7 @@ test("corrupt (non-JSON garbage) policy file -> exit non-zero with policy-corrup
 test("wrong policyVersion -> exit non-zero with policy-corrupt", async () => {
   const repo = await makeTempRepo();
   try {
-    const policy = { ...defaultPolicy(), policyVersion: 999 as unknown as 1 };
+    const policy = { ...defaultPolicy(), policyVersion: 999 as unknown as 2 };
     await writePolicy(repo, policy);
     const result = await runScript(repo, ["commit"]);
     assert.notEqual(result.code, 0);
@@ -433,18 +433,20 @@ for (const [label, url] of INCOMPLETE_PUSH_URLS) {
 
 test("a policy that never recorded a repository name IS still satisfied by owner alone -- absence in the POLICY is different from absence in the URL", async () => {
   const repo = await makeTempRepo();
+  const fakeSshBin = await makeFakeSshBin();
   try {
     const ownerOnlyPolicy = defaultPolicy({
-      approvedPushDestination: { host: "github.com", owner: "AcmeSoftware" },
+      approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", canonicalHost: "github.com" },
       profile: { ...workProfile, strictPushSetup: false },
     });
     await writePolicy(repo, ownerOnlyPolicy);
-    const result = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/anything.git"]);
+    const env = withFakeSshOnPath(process.env, fakeSshBin);
+    const result = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/anything.git"], "", env);
     assert.equal(result.code, 0, result.stderr);
 
     const decision = evaluatePush(
       ownerOnlyPolicy,
-      { remoteName: "origin", remoteUrl: "git@github.com:AcmeSoftware/anything.git", sshCommandOverrides: [] },
+      { remoteName: "origin", remoteUrl: "git@github.com:AcmeSoftware/anything.git", sshCommandOverrides: [], resolvedHost: "github.com" },
       1,
     );
     assert.equal(decision.allowed, true);
@@ -463,22 +465,24 @@ test("a policy that never recorded a repository name IS still satisfied by owner
 // ====================================================================
 
 const VALID_ONE_LINE_POLICY =
-  '{ "policyVersion": 1, "generatedAt": 1, "matchedProfileId": "work", "profileLabel": "Work",' +
+  '{ "policyVersion": 2, "generatedAt": 1, "matchedProfileId": "work", "profileLabel": "Work",' +
   ' "expectedGitName": "Danish Irfan", "expectedGitEmail": "work@example.com",' +
-  ' "approvedPushDestination": { "host": "github.com", "owner": "AcmeSoftware", "repo": "acme-frontend" },' +
+  ' "approvedPushDestination": { "host": "github.com", "owner": "AcmeSoftware", "repo": "acme-frontend", "canonicalHost": "github.com" },' +
   ' "trustedSshHostAliases": [], "strictPushSetup": false, "protectedBranches": [],' +
   ' "expectedBranchPatterns": [], "enabledActions": ["commit","push"] }';
 
 test("policy parsing: a VALID policy formatted entirely on one line is honoured (formatting is no longer load-bearing)", async () => {
   const repo = await makeTempRepo();
+  const fakeSshBin = await makeFakeSshBin();
   try {
     await writeRawPolicy(repo, VALID_ONE_LINE_POLICY);
+    const env = withFakeSshOnPath(process.env, fakeSshBin);
     // Governed and matching -> allowed.
-    const allowed = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"]);
+    const allowed = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"], "", env);
     assert.equal(allowed.code, 0, allowed.stderr);
     // Governed and NOT matching -> blocked. This is the half that used to
     // fail open: enabledActions parsed as empty, so nothing was enforced.
-    const blocked = await runScript(repo, ["push", "origin", "git@github.com:Attacker/acme-frontend.git"]);
+    const blocked = await runScript(repo, ["push", "origin", "git@github.com:Attacker/acme-frontend.git"], "", env);
     assert.notEqual(blocked.code, 0);
     assert.match(blocked.stderr, /push-destination-mismatch/);
   } finally {
@@ -543,7 +547,7 @@ const ADVERSARIAL_POLICIES: ReadonlyArray<readonly [string, string, RegExp]> = [
   [
     "approvedPushDestination is not an object",
     VALID_ONE_LINE_POLICY.replace(
-      '"approvedPushDestination": { "host": "github.com", "owner": "AcmeSoftware", "repo": "acme-frontend" }',
+      '"approvedPushDestination": { "host": "github.com", "owner": "AcmeSoftware", "repo": "acme-frontend", "canonicalHost": "github.com" }',
       '"approvedPushDestination": "github.com/AcmeSoftware/acme-frontend"',
     ),
     /approvedPushDestination must be an object/,
@@ -560,7 +564,7 @@ const ADVERSARIAL_POLICIES: ReadonlyArray<readonly [string, string, RegExp]> = [
   ],
   [
     "wrong policyVersion",
-    VALID_ONE_LINE_POLICY.replace('"policyVersion": 1', '"policyVersion": 2'),
+    VALID_ONE_LINE_POLICY.replace('"policyVersion": 2', '"policyVersion": 1'),
     /policyVersion/,
   ],
   [
@@ -638,10 +642,12 @@ test("policy parsing: a nested key can never be mistaken for a top-level one, an
 
 test("policy parsing: arbitrary whitespace, tabs, and newlines between every token are accepted", async () => {
   const repo = await makeTempRepo();
+  const fakeSshBin = await makeFakeSshBin();
   try {
     const spaced = VALID_ONE_LINE_POLICY.replace(/([{}[\],:])/g, "\n \t$1\t \n");
     await writeRawPolicy(repo, spaced);
-    const result = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"]);
+    const env = withFakeSshOnPath(process.env, fakeSshBin);
+    const result = await runScript(repo, ["push", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"], "", env);
     assert.equal(result.code, 0, result.stderr);
   } finally {
     await cleanup(repo);

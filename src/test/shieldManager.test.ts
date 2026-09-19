@@ -157,6 +157,43 @@ async function hooksDirFor(repo: Repo): Promise<string> {
   return git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"]);
 }
 
+// ==================== round-2 release-blocker: canonical destination model ====================
+
+// Regression guard: canonicalizeDestination() (manager.ts) must treat ANY
+// non-ssh protocol as literal-comparable, matching destinationReasons()
+// (evaluator.ts) and the shell evaluator's own branch exactly. An earlier
+// draft of this fix only did so for "https" specifically, which meant a
+// push destination using git:// or file:// (unusual, but real for local
+// mirrors/test setups, and never blocked pre-fix) got NO canonicalHost
+// persisted at enable() time -- and then could never be approved again at
+// push time, since destination matching requires canonicalHost for ANY
+// match. Only SSH has local alias indirection to canonicalize away.
+for (const protocol of ["unknown", "https"] as const) {
+  test(`enable() persists a literal canonicalHost for a "${protocol}" protocol push destination (no ssh spawn needed or possible)`, async () => {
+    const repo = await makeTempRepo();
+    try {
+      const manager = new ShieldManager();
+      const result = await enableShield(manager, repo, {
+        facts: {
+          pushRemoteUrl:
+            protocol === "https"
+              ? "https://github.com/AcmeSoftware/acme-frontend.git"
+              : "git://github.com/AcmeSoftware/acme-frontend.git",
+          pushRemoteProtocol: protocol,
+          pushRemoteHost: "github.com",
+          pushRemoteOwner: "AcmeSoftware",
+          pushRemoteRepo: "acme-frontend",
+        },
+      });
+      assert.equal(result.ok, true, `enable() should succeed: ${result.inspection.reasons.join("; ")}`);
+      const inspection = await manager.inspect(repo.dir);
+      assert.equal(inspection.policySnapshot?.approvedPushDestination?.canonicalHost, "github.com");
+    } finally {
+      await cleanup(repo);
+    }
+  });
+}
+
 // ==================== lifecycle: inspect / enable / disable / repair ====================
 
 test("inspect() on a repo Shield has never touched reports off, with nothing written", async () => {

@@ -206,10 +206,10 @@ is its own independent evaluation.
 ## `ShieldPolicy`: intent, not cached status
 
 ```ts
-const SHIELD_POLICY_VERSION = 1;
+const SHIELD_POLICY_VERSION = 2; // bumped from 1 -- see "Phase 8, round 2" below
 
 interface ShieldPolicy {
-  policyVersion: 1;
+  policyVersion: 2;
   generatedAt: number; // epoch ms
 
   matchedProfileId: string;
@@ -221,9 +221,11 @@ interface ShieldPolicy {
   approvedRepositoryKey?: string; // canonical host/owner/repo, lowercased
 
   approvedPushDestination?: {
-    host?: string;
+    host?: string; // literal alias/hostname at approval time -- display only, never compared for identity
     owner?: string;
     repo?: string;
+    canonicalHost?: string; // the REAL physical endpoint, resolved via "ssh -G" (or literal for HTTPS) -- this is what destination matching actually compares
+    canonicalPort?: string;
   };
 
   trustedSshHostAliases: string[];
@@ -2009,6 +2011,134 @@ fix (`resolvedHost`, above) already applies to Shield's hook-time
 `destinationReasons` — a canonical host has to be established through
 something the profile actually trusts, never assumed from matching
 owner/repo text on an arbitrary host.
+
+### Phase 8, round 2: the canonical physical push endpoint must be PERSISTED, never re-derived from the approved alias's own name (policyVersion 2)
+
+**Defect (independent review, second pass).** The round-1 fix
+(`resolvedHost`, above) closed the "arbitrary host shares the approved
+owner/repo text" hole, but left one path open: it accepted a **literal**
+host-string match between the push URL and the policy's own recorded
+`approvedPushDestination.host` without ANY resolution, reasoning that this
+"covers the common unchanged-remote case." It does — but it also means:
+
+1. Shield is enabled while `github-work` (an SSH alias) resolves to
+   `github.com`. The policy records `approvedPushDestination.host =
+   "github-work"` (the literal alias text).
+2. `~/.ssh/config` is later edited so `github-work` resolves to
+   `evil.example` instead.
+3. The push URL is unchanged: still `git@github-work:AcmeSoftware/backend.git`.
+4. Owner/repo still match. The literal host strings still match
+   (`"github-work" === "github-work"`) — the alias's NAME never changed,
+   only where it points.
+5. The literal-match fast path accepted this without ever asking "does
+   `github-work` still resolve to what it resolved to when Shield was
+   enabled?" — it doesn't need to, because it isn't comparing physical
+   endpoints at all, only alias text.
+
+Worse, the fallback path for when the literal text *didn't* match
+compounded the problem: it re-resolved the *approved* alias's name through
+`ssh -G` **right now**, at hook time, and compared that against an equally
+fresh resolution of the *current* URL's host. If both sides name the same
+alias (the ordinary case), resolving it twice through today's
+`~/.ssh/config` trivially "agrees" with itself — it cannot detect that the
+alias itself has been repointed since Shield was enabled, because it never
+consults what the alias resolved to *then*, only what it resolves to *now*
+on both sides of the comparison.
+
+A transport override (`GIT_SSH_COMMAND`, `core.sshCommand`, a non-OpenSSH
+`ssh.variant`) at push time has the same effect through a different door:
+even though the literal alias text is provably unchanged, the PROGRAM that
+would actually speak SSH for this push might not be the one `ssh -G`
+just asked. The route being physically unprovable must block Push
+DESTINATION itself — not merely Push Account/route trust, which
+`strictPushSetup` legitimately gates — because "is this the physical place
+Shield approved" is not a judgment call the way "can the authenticating
+account be trusted" is.
+
+**Fix — a canonical endpoint model, established once and persisted:**
+
+- `ShieldPolicy.approvedPushDestination` gains two new fields:
+  `canonicalHost` and `canonicalPort`. `host` (the literal alias/hostname
+  from the push URL at enable/repair time) is kept for display only and is
+  **never** compared against for identity.
+- **At `enable()`/`repair()` time** (`ShieldManager.canonicalizeDestination`
+  in manager.ts), Shield resolves the REAL endpoint once:
+  - HTTPS has no local `~/.ssh/config` alias indirection — the literal host
+    IS the canonical host, set verbatim.
+  - SSH: if no transport override is in effect, a real `ssh -G <host>` call
+    (via `src/shield/sshEndpoint.ts`'s `resolveCanonicalSshEndpoint` —
+    `execFile`, no shell, never executes `GIT_SSH_COMMAND`/`core.sshCommand`
+    to "discover" what they'd do) resolves the effective hostname and port.
+  - If resolution fails (no `ssh` available) or a transport override is
+    present, `canonicalHost` is left **undefined** — enable()/repair() are
+    NOT refused (same precedent as an entirely unresolvable push
+    destination): Shield still installs commit protection, and push
+    destination fails closed on every push until the override is removed
+    and Shield is repaired.
+- **At hook/evaluation time**, `destinationReasons()` (evaluator.ts) and
+  `evaluate_push()` (shield-evaluate.sh) compare ONLY canonical values:
+  - HTTPS: the current literal host against `approvedPushDestination
+    .canonicalHost` (still a literal comparison, but now explicitly a
+    canonical one, since `canonicalHost` was set to the literal at
+    approval time for HTTPS).
+  - SSH: the CURRENT push URL's host, freshly resolved via `ssh -G` **right
+    now** (`resolve_canonical_ssh_route` in the shell; a caller-supplied
+    `resolvedHost`/`resolvedPort` in the TypeScript reference), against
+    `approvedPushDestination.canonicalHost`/`canonicalPort` — **never**
+    against a fresh re-resolution of the approved alias's own name, which
+    is exactly the mistake that let round 1 miss the repointing case.
+  - There is no literal-string fallback for SSH at all anymore. Missing
+    canonical evidence on either side — absent `canonicalHost` (a
+    pre-canonicalization policy, or a transport-override-tainted
+    enable/repair), an override present now, or an unresolvable current
+    route — is never a match; it fails closed with a distinct, explanatory
+    reason (a pre-canonicalization policy names "Run Repair Shield"; an
+    override names itself; a resolved-but-different endpoint names the
+    mismatch).
+  - Port is part of destination identity when both sides resolved one: a
+    same-hostname, different-port endpoint is a mismatch too.
+  - Any protocol OTHER than SSH (HTTPS, `git://`, `file://`, an unparseable
+    scheme) uses the literal-comparison path — only SSH has the local
+    alias-indirection ambiguity a canonical resolution exists to close.
+- **Health/drift** (`ShieldManager.inspect()`'s `pushDestinationDrift`) has
+  two tiers, deliberately: a cheap literal host/owner/repo comparison runs
+  on every routine background scan (file-watcher events, workspace-folder
+  switches, ...), where spawning a real `ssh -G` process on every one of
+  them would be a real, unwanted performance cost. The fully correct
+  canonical comparison — the only way to actually catch a same-named alias
+  quietly repointed underneath a policy — is available on demand via
+  `ShieldInspectOptions.resolveCanonicalDestinationDrift`, which the
+  sidebar's explicit "Check Shield Health" action sets. Either way, what
+  *enforces* at push time is the hook itself, which always canonicalizes
+  fresh, unconditionally, on every real push — the drift indicator is a
+  diagnostic convenience, never the enforcement mechanism.
+- **`SHIELD_POLICY_VERSION` bumped 1 → 2.** A v1 policy never captured
+  `canonicalHost`/`canonicalPort` and cannot be trusted to mean what a v2
+  policy means, so it is rejected outright as `policy-corrupt` (both the
+  TypeScript validator and the shell's own inline schema check) rather than
+  silently reinterpreted — deliberate fail-closed migration: every existing
+  Shield-enabled repository blocks commits and pushes until "Repair Shield"
+  regenerates a v2 policy with a real canonical resolution. This is a
+  meaningfully disruptive migration (all enforcement pauses until repair,
+  not just push) — the alternative, silently treating an old policy as
+  though it had canonical evidence it never gathered, is the exact silent-
+  reinterpretation this fix exists to avoid.
+
+**Regression coverage:** `shieldEvaluator.test.ts` ("release blocker round
+2" test block — same alias, repointed endpoint blocks; same alias,
+unchanged endpoint allows; a transport override blocks destination
+regardless of `strictPushSetup`; a port change on the same host blocks; a
+pre-canonicalization policy fails closed), `shieldPrePush.test.ts` (a real,
+end-to-end `git push` through the compiled hook, alias repointed between
+two pushes through the unchanged remote URL), `shieldCoexistenceAndIntegrity
+.test.ts` (the explicit canonical health check catches a repoint the cheap
+literal check cannot), `shieldRemoteUrlDifferential.test.ts`,
+`shieldHardeningMatrix.test.ts`, `shieldGitHubAccountBinding.test.ts`,
+`shieldSshTransportEquivalence.test.ts`, `shieldAccountVerificationCrossPlatform
+.test.ts`, and `shieldPolicyParserFuzz.test.ts` (all updated to build
+policies with canonical fields and, where an SSH destination needs to
+resolve, a fake `ssh -G` responder — every one of these files previously
+relied on the literal-comparison fallback this fix removes).
 
 ### Phase 8: no durable policy from stale UI facts
 

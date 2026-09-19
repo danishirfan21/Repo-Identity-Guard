@@ -114,6 +114,21 @@ function fakeSshPassthroughImplSource(): string {
   return `"use strict";
 const { execFileSync } = require("node:child_process");
 const args = process.argv.slice(2);
+const joined = " " + args.join(" ") + " ";
+// Round-2 release-blocker fix: enable()/repair() now resolve the approved
+// destination's canonical endpoint via a real "ssh -G" call. This fake
+// ssh answers it the same way the alias is expected to behave throughout
+// this file ("github-work" -> "github.com") so that resolution succeeds
+// under the fake instead of failing to parse a bare "-G" invocation as a
+// push transport command.
+if (joined.includes(" -G ")) {
+  process.stdout.write(
+    "user " + (process.env.FAKE_SSH_USER || "git") + "\\n" +
+    "hostname " + (process.env.FAKE_SSH_HOSTNAME || "github.com") + "\\n" +
+    "port " + (process.env.FAKE_SSH_PORT || "22") + "\\n"
+  );
+  process.exit(0);
+}
 const remoteCommand = args[args.length - 1] || "";
 const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
 if (!match) {
@@ -273,8 +288,16 @@ async function enableShield(
   repo: Repo,
   facts: RepoFacts,
   profiles: Profile[] = [workProfile],
+  fakeSshBin?: string,
 ): Promise<void> {
-  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles, protectedBranches: [] });
+  // Round-2 release-blocker fix: enable() now resolves and persists the
+  // approved destination's REAL canonical SSH endpoint via a live
+  // `ssh -G` call. Threading the fake ssh's PATH-shadowing directory
+  // through here (via ShieldEnableInput.env, never this test process's
+  // real global environment) is what makes that resolution see the fake
+  // "github-work -> github.com" route.
+  const env = fakeSshBin ? { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` } : undefined;
+  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles, protectedBranches: [], env });
   assert.equal(result.ok, true, `enable() should succeed: ${result.inspection.reasons.join("; ")}`);
 }
 
@@ -304,7 +327,7 @@ test("push to the approved destination through a trusted SSH alias -> allowed, a
   try {
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
     const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
@@ -317,6 +340,45 @@ test("push to the approved destination through a trusted SSH alias -> allowed, a
   }
 });
 
+// Release-blocker round 2 (review case A), end-to-end: enable Shield while
+// the alias resolves one way, then repoint it in "~/.ssh/config" (here,
+// simulated by changing what the fake ssh reports for -G) BEFORE pushing
+// again through the exact same, unchanged remote URL. The literal alias
+// text never changes across the two pushes -- only what it actually
+// resolves to does -- so this is the precise scenario the round-1 fix
+// (literal-host-match fallback) missed.
+test("an SSH alias repointed after enable() blocks a real git push through the SAME unchanged remote URL (release-blocker round 2, case A)", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
+  const repo = await makeTempRepo();
+  const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
+  const fakeSshBin = await makeFakeSshBin();
+  try {
+    const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
+    const manager = new ShieldManager();
+    // Enable while "github-work" resolves to "github.com" (the fake's
+    // default) -- this is what gets persisted as the canonical endpoint.
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
+    await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
+
+    // Sanity: unchanged alias still resolves the same way -> push allowed.
+    const unchangedEnv = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
+    const firstPush = await push(repo, ["origin", "main"], unchangedEnv);
+    assert.equal(firstPush.code, 0, firstPush.stderr);
+
+    // Now simulate ~/.ssh/config being edited so "github-work" resolves to
+    // an entirely different host. The remote URL, the policy, and the
+    // literal alias text are all UNCHANGED from the first push above.
+    await git(repo, ["commit", "-q", "--allow-empty", "-m", "second"]);
+    const repointedEnv = { ...unchangedEnv, FAKE_SSH_HOSTNAME: "evil.example" };
+    const secondPush = await push(repo, ["origin", "main"], repointedEnv);
+    assert.notEqual(secondPush.code, 0, "a repointed alias must block, even though its literal name never changed");
+    assert.match(secondPush.stderr, /push-destination-mismatch/);
+    // The ref must NOT have moved to the second (blocked) commit.
+    assert.equal(await remoteRefSha(bare), await git(repo, ["rev-parse", "HEAD~1"]));
+  } finally {
+    await cleanup(repo.dir, remoteParent, fakeSshBin);
+  }
+});
+
 test("pushing multiple refs in one invocation still allows/enforces correctly (multi-ref stdin input)", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
@@ -324,7 +386,7 @@ test("pushing multiple refs in one invocation still allows/enforces correctly (m
   try {
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     await git(repo, ["branch", "second"]);
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
@@ -366,7 +428,7 @@ test("a pushurl changed to a different owner after Shield approval -> blocked, r
   try {
     // Shield was enabled while the approved destination was AcmeSoftware/acme-frontend...
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     // ...but the push URL now points somewhere else entirely (e.g.
     // `github-personal` in the task's own example) — still a trusted-
@@ -395,7 +457,7 @@ test("a different remote entirely (not 'origin') is still checked against the sa
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "SomeoneElse", "unrelated");
     await git(repo, ["remote", "add", "upstream", `git@github-work:${bare}`]);
@@ -416,7 +478,7 @@ test("a direct URL push (git push <url>, no configured remote) to an unexpected 
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "RandomOrg", "random-repo");
     const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
@@ -443,7 +505,7 @@ test("no approved destination on file (policy predates a resolvable remote) -> f
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     const policyPath = path.join(commonDir, "repo-identity-guard", "shield-policy.json");
@@ -473,7 +535,7 @@ test("a generic SSH host (github.com) under a strict profile -> blocked, ref NOT
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github.com:${bare}`]);
@@ -495,7 +557,7 @@ test("an untrusted SSH alias under a strict profile -> blocked, ref NOT updated"
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     // "github-personal" LOOKS like a dedicated alias but was never listed
@@ -553,7 +615,7 @@ test("GIT_SSH_COMMAND set at push time -> route unverifiable, strict mode blocks
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
@@ -574,7 +636,7 @@ test("GIT_SSH set at push time -> route unverifiable, strict mode blocks a push 
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
@@ -595,7 +657,7 @@ test("core.sshCommand set (persisted repo config) -> route unverifiable, strict 
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
@@ -617,7 +679,7 @@ test("a command-scoped `git -c core.sshCommand=...` override is visible at hook 
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
@@ -645,22 +707,31 @@ test("a command-scoped `git -c core.sshCommand=...` override is visible at hook 
   }
 });
 
-test("an SSH override does NOT block a non-strict profile (route trust is only ever gated by strictPushSetup)", async () => {
+// Release-blocker round 2 (review cases D/E): an SSH transport override at
+// PUSH time makes the physical destination unprovable — a real "ssh -G"
+// run right now can't be shown to reproduce the transport GIT_SSH_COMMAND
+// would actually use — so Push DESTINATION itself must fail closed
+// regardless of strictPushSetup. This is a genuinely different question
+// from route/account TRUST (routeReasons/accountReasons), which strictness
+// legitimately gates and which this test previously (incorrectly, before
+// this fix) conflated with destination provability.
+test("an SSH override at push time makes the destination unprovable and blocks, even under a non-strict profile", async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
   try {
     const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo), [relaxedProfile]);
+    await enableShield(manager, repo, approvedFacts(repo), [relaxedProfile], fakeSshBin);
 
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
     const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}`, GIT_SSH_COMMAND: toShellPath(path.join(fakeSshBin, "ssh")) };
 
     const result = await push(repo, ["origin", "main"], env);
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(await remoteRefSha(bare), await git(repo, ["rev-parse", "HEAD"]));
+    assert.notEqual(result.code, 0, result.stderr);
+    assert.equal(await remoteRefSha(bare), null);
+    assert.match(result.stderr, /push-destination-mismatch/);
   } finally {
     await cleanup(repo.dir, remoteParent, fakeSshBin);
   }
@@ -674,7 +745,7 @@ test("missing Shield policy at push time -> blocked, ref NOT updated", { skip: S
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     await fs.unlink(path.join(commonDir, "repo-identity-guard", "shield-policy.json"));
@@ -698,7 +769,7 @@ test("malformed (corrupted) Shield policy at push time -> blocked, ref NOT updat
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     await fs.writeFile(path.join(commonDir, "repo-identity-guard", "shield-policy.json"), "{ not valid json ][");
@@ -722,7 +793,7 @@ test("an evaluator that fails unexpectedly (corrupted copy) still blocks the pus
   const fakeSshBin = await makeFakeSshBin();
   try {
     const manager = new ShieldManager();
-    await enableShield(manager, repo, approvedFacts(repo));
+    await enableShield(manager, repo, approvedFacts(repo), undefined, fakeSshBin);
 
     const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     const evaluatorPath = path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh");

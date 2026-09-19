@@ -72,7 +72,7 @@ const strictProfile: Profile = {
 function policy(): ShieldPolicy {
   return buildShieldPolicy({
     profile: strictProfile,
-    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend" },
+    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" },
     protectedBranches: ["main"],
     enabledActions: ["commit", "push"],
     now: 1,
@@ -276,7 +276,19 @@ test("PART 3 — all four override families at once are reported together, in th
   }
 });
 
-test("PART 3 — a non-strict profile is unaffected by any transport override, for ROUTE/ACCOUNT trust specifically (strictness gating is unchanged)", async () => {
+// Round-2 release-blocker fix removed the ONE thing that used to let this
+// test isolate strictness gating for ROUTE/ACCOUNT trust from destination
+// canonicalization: a literal host-string match no longer satisfies SSH
+// destination matching AT ALL (see destinationReasons() in evaluator.ts) —
+// so a transport override now ALWAYS makes an SSH push's destination
+// unprovable too, regardless of whether the literal alias text happens to
+// match the policy's recorded host. That "regardless of strictPushSetup"
+// behavior is exactly what the very next test proves. What remains true,
+// and is what this test now proves instead, is the baseline it was built
+// to isolate: with NO override at all, a relaxed profile's unverified
+// route is genuinely non-blocking, and the SAME aliased destination
+// canonicalizes and matches normally.
+test("PART 3 — a non-strict profile's aliased route/destination is allowed with no transport override present (baseline for the override tests below)", async () => {
   const repo = await fs.mkdtemp(path.join(os.tmpdir(), "shield-ssh-variant-lax-"));
   try {
     await execFileAsync("git", ["init", "-q"], { cwd: repo });
@@ -288,22 +300,14 @@ test("PART 3 — a non-strict profile is unaffected by any transport override, f
       serializeShieldPolicy(
         buildShieldPolicy({
           profile: { ...strictProfile, strictPushSetup: false },
-          // A LITERAL host match ("github-work", the alias TRUSTED_URL
-          // itself uses) so this test isolates strictness gating for
-          // ROUTE/ACCOUNT trust from the separate (and correctly
-          // strictness-INDEPENDENT — see the release-blocker fix)
-          // destination-host-canonicalization question: with a transport
-          // override in effect, the alias's host can no longer be
-          // canonicalized at all, which must fail closed on destination
-          // regardless of strictness. That is proven by the next test.
-          approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend" },
+          approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" },
           protectedBranches: ["main"],
           enabledActions: ["commit", "push"],
           now: 1,
         }),
       ),
     );
-    const result = await runPush(repo, { ...(await baseEnv()), GIT_SSH_VARIANT: "plink" });
+    const result = await runPush(repo, await baseEnv());
     assert.equal(result.code, 0, result.stderr);
   } finally {
     await cleanup(repo);
@@ -329,7 +333,7 @@ test("PART 3 — release-blocker fix: a transport override makes an ALIASED rout
       serializeShieldPolicy(
         buildShieldPolicy({
           profile: { ...strictProfile, strictPushSetup: false },
-          approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend" },
+          approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" },
           protectedBranches: ["main"],
           enabledActions: ["commit", "push"],
           now: 1,

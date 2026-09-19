@@ -177,6 +177,20 @@ export async function getCoreHooksPathConfig(repoRoot: string): Promise<string |
   return tryGit(repoRoot, ["config", "--get", "core.hooksPath"]);
 }
 
+/**
+ * Reads any single-valued `git config --get <key>` at this repo's
+ * effective scope (worktree/local/global/system, in Git's own precedence
+ * order) — the general-purpose form `getCoreHooksPathConfig` and friends
+ * are thin, key-specific wrappers around. Used by Shield's SSH
+ * transport-override detection (`core.sshCommand`, `ssh.variant`), which
+ * has no reason to duplicate this. Never writes, never reads a key's
+ * VALUE for anything beyond presence/comparison — see the callers for
+ * why (a command override's value is deliberately never executed).
+ */
+export async function getGitConfigValue(repoRoot: string, key: string): Promise<string | null> {
+  return tryGit(repoRoot, ["config", "--get", key]);
+}
+
 /** Returns null when unset/unknown (older Git or never configured) rather than defaulting either way. */
 export async function getWorktreeConfigEnabled(repoRoot: string): Promise<boolean | null> {
   const value = await tryGit(repoRoot, ["config", "--get", "extensions.worktreeConfig"]);

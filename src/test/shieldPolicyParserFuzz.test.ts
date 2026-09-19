@@ -48,7 +48,7 @@ const SEED = fuzzSeed(0x9011c4);
 // is attributable to parsing rather than to policy content.
 function baselinePolicy(): ShieldPolicy {
   return {
-    policyVersion: 1,
+    policyVersion: 2,
     generatedAt: 1_700_000_000_000,
     matchedProfileId: "work",
     profileLabel: "Work",
@@ -167,8 +167,8 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
   const add = (label: string, raw: string) => cases.push({ label, raw, expect: "block" });
 
   // --- duplicate keys, top-level and nested ---
-  add("duplicate policyVersion", compact.replace('{"policyVersion":1', '{"policyVersion":1,"policyVersion":1'));
-  add("duplicate policyVersion with DIFFERENT values", compact.replace('{"policyVersion":1', '{"policyVersion":999,"policyVersion":1'));
+  add("duplicate policyVersion", compact.replace('{"policyVersion":2', '{"policyVersion":2,"policyVersion":2'));
+  add("duplicate policyVersion with DIFFERENT values", compact.replace('{"policyVersion":2', '{"policyVersion":999,"policyVersion":2'));
   add("duplicate expectedGitEmail with a different value", compact.replace('"expectedGitEmail"', '"expectedGitEmail":"attacker@example.com","expectedGitEmail"'));
   add("duplicate enabledActions", `${compact.slice(0, -1)},"enabledActions":[]}`);
   add(
@@ -206,16 +206,16 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
   add("capitalized True for strictPushSetup", compact.replace('"strictPushSetup":false', '"strictPushSetup":True'));
   add("bare word for strictPushSetup", compact.replace('"strictPushSetup":false', '"strictPushSetup":yes'));
   add("NULL literal in wrong case", compact.replace('"expectedGitName":"Danish Irfan"', '"expectedGitName":NULL'));
-  add("leading-zero number", compact.replace('"policyVersion":1', '"policyVersion":01'));
-  add("hex number", compact.replace('"policyVersion":1', '"policyVersion":0x1'));
+  add("leading-zero number", compact.replace('"policyVersion":2', '"policyVersion":02'));
+  add("hex number", compact.replace('"policyVersion":2', '"policyVersion":0x2'));
   add("trailing-dot number", compact.replace('"generatedAt":1700000000000', '"generatedAt":1700000000000.'));
-  add("plus-signed number", compact.replace('"policyVersion":1', '"policyVersion":+1'));
+  add("plus-signed number", compact.replace('"policyVersion":2', '"policyVersion":+2'));
   add("Infinity", compact.replace('"generatedAt":1700000000000', '"generatedAt":Infinity'));
   add("NaN", compact.replace('"generatedAt":1700000000000', '"generatedAt":NaN'));
 
   // --- schema-invalid but JSON-valid ---
-  add("wrong policyVersion", compact.replace('"policyVersion":1', '"policyVersion":2'));
-  add("policyVersion as a string", compact.replace('"policyVersion":1', '"policyVersion":"1"'));
+  add("wrong policyVersion", compact.replace('"policyVersion":2', '"policyVersion":1'));
+  add("policyVersion as a string", compact.replace('"policyVersion":2', '"policyVersion":"2"'));
   add("strictPushSetup as a string", compact.replace('"strictPushSetup":false', '"strictPushSetup":"false"'));
   add("strictPushSetup as a number", compact.replace('"strictPushSetup":false', '"strictPushSetup":0'));
   add("strictPushSetup as null", compact.replace('"strictPushSetup":false', '"strictPushSetup":null'));
@@ -391,7 +391,7 @@ test("PART 8 — every rejected policy is reported as policy-corrupt specificall
     `${compact}trailing`,
     compact.slice(0, 40),
     compact.replace('"strictPushSetup":false', '"strictPushSetup":"no"'),
-    compact.replace('"policyVersion":1', '"policyVersion":1,"policyVersion":1'),
+    compact.replace('"policyVersion":2', '"policyVersion":2,"policyVersion":2'),
     JSON.stringify({ ...baselinePolicy(), token: "x" }),
     "not json",
   ];
@@ -425,6 +425,11 @@ test("PART 8 — a nested key that shadows a top-level field name is never read 
         ...baselinePolicy(),
         approvedPushDestination: {
           host: "github.com",
+          // canonicalHost: literal HTTPS host below needs no "ssh -G"
+          // resolution (this file has no fake-ssh transport set up — its
+          // whole point is nested-key isolation, not SSH canonicalization,
+          // which has its own dedicated coverage elsewhere).
+          canonicalHost: "github.com",
           owner: "AcmeSoftware",
           repo: "acme-frontend",
           strictPushSetup: true,
@@ -444,9 +449,9 @@ test("PART 8 — a nested key that shadows a top-level field name is never read 
     assert.equal(commit.allowed, true, commit.stderr);
 
     // And on the push side, the nested `strictPushSetup: true` must not turn
-    // a non-strict policy strict: an untrusted generic SSH host is allowed
+    // a non-strict policy strict: an unverifiable HTTPS route is allowed
     // here precisely because the TOP-LEVEL policy is not strict.
-    const push = await runEvaluator(repo, ["push", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"]);
+    const push = await runEvaluator(repo, ["push", "origin", "https://github.com/AcmeSoftware/acme-frontend.git"]);
     assert.equal(push.allowed, true, push.stderr);
   } finally {
     await destroyRepoPool(repos);

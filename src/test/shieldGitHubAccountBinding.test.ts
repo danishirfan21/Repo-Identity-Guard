@@ -243,8 +243,14 @@ function approvedFacts(repo: Repo, overrides: Partial<RepoFacts> = {}): RepoFact
   };
 }
 
-async function enableShield(manager: ShieldManager, repo: Repo, facts: RepoFacts, profiles: Profile[] = [workProfile]): Promise<void> {
-  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles, protectedBranches: [] });
+async function enableShield(
+  manager: ShieldManager,
+  repo: Repo,
+  facts: RepoFacts,
+  profiles: Profile[] = [workProfile],
+  env?: NodeJS.ProcessEnv,
+): Promise<void> {
+  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles, protectedBranches: [], env });
   assert.equal(result.ok, true, `enable() should succeed: ${result.inspection.reasons.join("; ")}`);
 }
 
@@ -255,13 +261,27 @@ interface Scenario {
   fakeSshBin: string;
 }
 
-async function setUpScenario(profiles: Profile[] = [workProfile]): Promise<Scenario> {
+async function setUpScenario(profiles: Profile[] = [workProfile], enableEnvOverrides: NodeJS.ProcessEnv = {}): Promise<Scenario> {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
   const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
   const manager = new ShieldManager();
-  await enableShield(manager, repo, approvedFacts(repo), profiles);
+  // Round-2 release-blocker fix: enable() now resolves and persists the
+  // approved destination's REAL canonical SSH endpoint via a live
+  // `ssh -G` call (see ShieldManager.canonicalizeDestination). Threading
+  // the fake ssh's PATH-shadowing directory through here (via the new
+  // ShieldEnableInput.env, rather than mutating this test process's real
+  // global environment) is what makes that resolution see the fake
+  // "github-work -> github.com" route instead of failing to find a real
+  // `ssh` binary at all. `enableEnvOverrides` lets a scenario simulate
+  // "the alias already resolved to a non-default endpoint (e.g.
+  // ssh.github.com:443) when Shield was enabled" — i.e. the REALISTIC
+  // baseline for a test whose push later exercises that same endpoint,
+  // as opposed to a genuine post-enable repoint (covered separately in
+  // shieldEvaluator.test.ts and shieldCoexistenceAndIntegrity.test.ts).
+  const enableEnv = { ...repo.env, ...enableEnvOverrides, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
+  await enableShield(manager, repo, approvedFacts(repo), profiles, enableEnv);
   await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
   return { repo, remoteParent, bare, fakeSshBin };
 }
@@ -515,7 +535,11 @@ test("a look-alike hostname (github.com.evil.example) is not a GitHub endpoint",
 });
 
 test("GitHub's documented alternative endpoint (ssh.github.com on port 443) IS accepted", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
-  const scenario = await setUpScenario();
+  // The alias already resolved to ssh.github.com:443 when Shield was
+  // enabled (see setUpScenario's enableEnvOverrides doc comment) -- this
+  // test is about the alternate endpoint being ACCEPTED as a stable
+  // arrangement, not about a route that changed between enable and push.
+  const scenario = await setUpScenario([workProfile], { FAKE_SSH_HOSTNAME: "ssh.github.com", FAKE_SSH_PORT: "443" });
   try {
     const result = await pushWithFakeSsh(scenario, {
       FAKE_SSH_HOSTNAME: "ssh.github.com",

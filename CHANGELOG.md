@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+### Fixed — release blocker, round 2: canonical physical push endpoint must be persisted (policyVersion 2)
+
+A second independent review found the round-1 destination-host fix still
+had a gap: it accepted a **literal** match between the push URL's host and
+the policy's own recorded host without any resolution — which covers the
+ordinary unchanged-remote case, but also means an SSH alias silently
+repointed in `~/.ssh/config` *after* Shield was enabled (e.g. `github-work`
+moved from `github.com` to `evil.example`) was never caught, because the
+alias's literal NAME never changed. The fallback path for a literal
+mismatch compounded this: it re-resolved the *approved* alias's name
+through `ssh -G` at hook time and compared it against an equally fresh
+resolution of the current URL — trivially "agreeing" with itself whenever
+both sides are the same alias, regardless of what it currently resolves to.
+
+Fixed with a canonical-endpoint model established once, at enable/repair
+time, and persisted:
+
+- `approvedPushDestination` gains `canonicalHost`/`canonicalPort`, resolved
+  via a real `ssh -G` call at enable/repair time (`src/shield/sshEndpoint.ts`)
+  — never re-derived from the approved alias's own name at hook time.
+- Destination matching now compares ONLY canonical values for SSH — the
+  literal-string fallback is gone entirely for SSH. HTTPS (and any other
+  non-SSH protocol) still compares literal host directly, since only SSH
+  has local alias indirection to canonicalize away.
+- An SSH transport override present at push time makes the destination
+  itself unprovable and blocks — independent of `strictPushSetup`, which
+  legitimately gates route/account trust but never destination identity.
+- Health/drift gained an opt-in, on-demand canonical check
+  (`resolveCanonicalDestinationDrift`, used by "Check Shield Health") that
+  actually catches a repointed alias; routine background scans keep a
+  cheap literal comparison to avoid spawning `ssh` on every file-watcher
+  event. The hook itself always canonicalizes fresh on every real push,
+  regardless of what the sidebar's diagnostic indicator shows.
+- **`SHIELD_POLICY_VERSION` bumped 1 → 2.** A v1 policy never captured
+  canonical endpoint data and is rejected as `policy-corrupt` rather than
+  silently reinterpreted — every existing Shield-enabled repository will
+  need "Repair Shield" once this ships, which regenerates a v2 policy with
+  real canonical resolution. This is a deliberate, disruptive-on-purpose
+  migration: the alternative is trusting a policy that never established
+  the guarantee this fix depends on.
+
+See `docs/SHIELD_MODE.md`'s "Phase 8, round 2" section for the full
+writeup and regression coverage across `shieldEvaluator.test.ts`,
+`shieldPrePush.test.ts` (a real end-to-end push through the compiled hook
+with the alias repointed mid-test), `shieldCoexistenceAndIntegrity.test.ts`,
+and every other Shield SSH-destination test file (updated to carry
+canonical fields and, where needed, a fake `ssh -G` responder).
+
 ### Fixed — independent adversarial review: 7 correctness/security fixes
 
 An independent review of the release branch found seven issues, all now

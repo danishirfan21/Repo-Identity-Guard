@@ -181,12 +181,22 @@ function baseFacts(repo: Repo, overrides: Partial<RepoFacts> = {}): RepoFacts {
 async function enableShield(
   manager: ShieldManager,
   repo: Repo,
-  overrides: { profiles?: Profile[]; protectedBranches?: string[]; facts?: Partial<RepoFacts> } = {},
+  overrides: { profiles?: Profile[]; protectedBranches?: string[]; facts?: Partial<RepoFacts>; fakeSshBin?: string } = {},
 ) {
+  // Round-2 release-blocker fix: enable() now resolves and persists the
+  // approved destination's REAL canonical SSH endpoint via a live
+  // `ssh -G` call. Threading the fake ssh's PATH-shadowing directory
+  // through here (via ShieldEnableInput.env, never this test process's
+  // real global environment) is what makes that resolution see the fake
+  // "github-work -> github.com" route.
+  const env = overrides.fakeSshBin
+    ? { ...repo.env, PATH: `${overrides.fakeSshBin}${path.delimiter}${repo.env.PATH}` }
+    : undefined;
   const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, {
     facts: baseFacts(repo, overrides.facts),
     profiles: overrides.profiles ?? [workProfile],
     protectedBranches: overrides.protectedBranches ?? ["main", "master"],
+    env,
   });
   assert.equal(result.ok, true, `enable() should succeed: ${result.inspection.reasons.join("; ")}`);
   return result;
@@ -210,6 +220,21 @@ async function makeFakeSshBin(): Promise<string> {
     `"use strict";
 const { execFileSync } = require("node:child_process");
 const args = process.argv.slice(2);
+const joined = " " + args.join(" ") + " ";
+// Round-2 release-blocker fix: enable()/repair() now resolve the approved
+// destination's canonical endpoint via a real "ssh -G" call. This fake
+// ssh answers it the same way the alias is expected to behave throughout
+// this file ("github-work" -> "github.com") so that resolution succeeds
+// under the fake instead of failing to parse a bare "-G" invocation as a
+// push transport command.
+if (joined.includes(" -G ")) {
+  process.stdout.write(
+    "user " + (process.env.FAKE_SSH_USER || "git") + "\\n" +
+    "hostname " + (process.env.FAKE_SSH_HOSTNAME || "github.com") + "\\n" +
+    "port " + (process.env.FAKE_SSH_PORT || "22") + "\\n"
+  );
+  process.exit(0);
+}
 const remoteCommand = args[args.length - 1] || "";
 const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
 if (!match) {
@@ -688,7 +713,7 @@ test("branch.pushRemote redirects a push and Shield evaluates the ACTUAL destina
     const wrongBare = await makeBareRemote(remoteParent, "AcmeSoftware", "wrong-repo");
     const rightBare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     const manager = new ShieldManager();
-    await enableShield(manager, repo, { profiles: [routeOnlyProfile] });
+    await enableShield(manager, repo, { profiles: [routeOnlyProfile], fakeSshBin });
 
     await git(repo, ["remote", "add", "origin", `git@github-work:${wrongBare}`]);
     await git(repo, ["remote", "add", "upstream", `git@github-work:${rightBare}`]);
@@ -715,7 +740,7 @@ test("remote.pushDefault redirects a bare `git push` and is evaluated against th
     const wrongBare = await makeBareRemote(remoteParent, "AcmeSoftware", "wrong-repo");
     const rightBare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     const manager = new ShieldManager();
-    await enableShield(manager, repo, { profiles: [routeOnlyProfile] });
+    await enableShield(manager, repo, { profiles: [routeOnlyProfile], fakeSshBin });
 
     await git(repo, ["remote", "add", "origin", `git@github-work:${wrongBare}`]);
     await git(repo, ["remote", "add", "upstream", `git@github-work:${rightBare}`]);
@@ -738,7 +763,7 @@ test("remote.pushurl (asymmetric fetch/push URL) is what's actually evaluated at
   try {
     const rightBare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     const manager = new ShieldManager();
-    await enableShield(manager, repo, { profiles: [routeOnlyProfile] });
+    await enableShield(manager, repo, { profiles: [routeOnlyProfile], fakeSshBin });
 
     // Fetch URL points somewhere Shield never approved; only the pushurl matters for `git push`.
     await git(repo, ["remote", "add", "origin", "https://example.com/nonexistent/repo.git"]);
@@ -760,7 +785,7 @@ test("force push to the approved destination is still subject to the same destin
   try {
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     const manager = new ShieldManager();
-    await enableShield(manager, repo, { profiles: [routeOnlyProfile] });
+    await enableShield(manager, repo, { profiles: [routeOnlyProfile], fakeSshBin });
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
     const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
@@ -789,7 +814,7 @@ test("ref deletion (`git push origin :branch`) is evaluated the same as any othe
   try {
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     const manager = new ShieldManager();
-    await enableShield(manager, repo, { profiles: [routeOnlyProfile] });
+    await enableShield(manager, repo, { profiles: [routeOnlyProfile], fakeSshBin });
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
     const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 
@@ -838,7 +863,7 @@ test("expected GitHub login match under strict verification -> allowed (network 
   try {
     const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
     const manager = new ShieldManager();
-    await enableShield(manager, repo);
+    await enableShield(manager, repo, { fakeSshBin });
     await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
     const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
 

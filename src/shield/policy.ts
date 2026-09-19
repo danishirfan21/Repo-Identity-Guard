@@ -6,8 +6,20 @@ import { SHIELD_ACTIONS, ShieldAction } from "./types";
  * additive-optional. A hook (once one exists) reading a policy with an
  * unrecognized/newer version, or an older version it doesn't know how to
  * interpret, should treat that as `policy-corrupt` rather than guess.
+ *
+ * v1 -> v2 (independent-review release blocker): `approvedPushDestination`
+ * gained `canonicalHost`/`canonicalPort`, resolved via a real `ssh -G` at
+ * enable/repair time and required for destination host matching — see
+ * `destinationReasons()` in evaluator.ts. A v1 policy never captured this,
+ * so treating one as v2 would let a repointed SSH alias masquerade as an
+ * unchanged destination purely because its literal name never changed
+ * (the exact hole this version bump exists to close). v1 policies are
+ * therefore deliberately rejected as `policy-corrupt` rather than
+ * silently reinterpreted — Shield fails closed on every commit/push until
+ * "Repair Shield" regenerates a v2 policy with a real canonical
+ * resolution.
  */
-export const SHIELD_POLICY_VERSION = 1 as const;
+export const SHIELD_POLICY_VERSION = 2 as const;
 
 /**
  * Non-secret, non-cached intent for enforcing Git safety on one underlying
@@ -38,9 +50,29 @@ export interface ShieldPolicy {
 
   /** Where a plain push is expected to land, as non-secret facts only — never credentials for reaching it. */
   approvedPushDestination?: {
+    /** Literal host/alias as it appeared in the push URL at enable/repair time — display only, never compared against for identity (see `canonicalHost`). */
     host?: string;
     owner?: string;
     repo?: string;
+    /**
+     * The REAL physical endpoint `ssh -G` resolved this destination to at
+     * enable/repair time (or, for an HTTPS destination, the literal host
+     * itself — HTTPS has no local `~/.ssh/config` alias indirection to
+     * canonicalize away). This, never `host`, is what destination
+     * matching compares against: `host` can be a bare alias name
+     * (`github-work`) that `~/.ssh/config` can silently repoint to a
+     * different endpoint at any time without this policy's literal text
+     * ever changing — comparing literal `host` strings would miss exactly
+     * that repointing. Undefined means Shield could not establish a
+     * canonical endpoint when this policy was last built (an SSH
+     * transport override was in effect, `ssh` was unavailable, or
+     * resolution failed) — see `destinationReasons()` in evaluator.ts,
+     * which fails closed whenever this is absent, never treating it as a
+     * license to fall back to `host`.
+     */
+    canonicalHost?: string;
+    /** The effective port `canonicalHost` was resolved on, when it could affect destination identity (a non-default SSH port is part of "which physical endpoint," not incidental). Undefined exactly when `canonicalHost` is. */
+    canonicalPort?: string;
   };
 
   /** SSH host aliases this profile explicitly trusts as push routes (see Profile.trustedSshHostAliases). Never a private key or its fingerprint. */
@@ -72,7 +104,7 @@ export interface ShieldPolicy {
 export interface ShieldPolicyInput {
   profile: Profile;
   approvedRepositoryKey?: string;
-  approvedPushDestination?: { host?: string; owner?: string; repo?: string };
+  approvedPushDestination?: { host?: string; owner?: string; repo?: string; canonicalHost?: string; canonicalPort?: string };
   protectedBranches: string[];
   enabledActions: ShieldAction[];
   now?: number;
@@ -164,7 +196,7 @@ export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResu
       errors.push({ path: "approvedPushDestination", message: "approvedPushDestination must be an object when present." });
     } else {
       const d = dest as Record<string, unknown>;
-      for (const key of ["host", "owner", "repo"] as const) {
+      for (const key of ["host", "owner", "repo", "canonicalHost", "canonicalPort"] as const) {
         if (d[key] !== undefined && typeof d[key] !== "string") {
           errors.push({ path: `approvedPushDestination.${key}`, message: `${key} must be a string when present.` });
         }

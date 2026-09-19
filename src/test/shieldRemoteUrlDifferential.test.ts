@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import test from "node:test";
 import {
   createRepoPool,
@@ -8,7 +11,7 @@ import {
   fuzzSeed,
   mapWithRepos,
   rngFrom,
-  runEvaluator,
+  runEvaluator as runEvaluatorRaw,
   writeRawPolicy,
 } from "./fuzzHarness";
 import { parseRemoteUrl } from "../services/gitService";
@@ -49,6 +52,80 @@ import { ShieldPolicy, serializeShieldPolicy } from "../shield/policy";
  */
 
 const SEED = fuzzSeed(0x9a2b1c);
+
+// ==================== identity fake ssh ====================
+//
+// Round-2 release-blocker fix: the evaluator now canonicalizes an
+// ssh-protocol destination's CURRENT host via a real "ssh -G" call,
+// unconditionally (see resolve_canonical_ssh_route in
+// shield-evaluate.sh) — there is no literal-comparison fallback left for
+// ssh at all. This differential suite's whole point is comparing the
+// TypeScript reference against the shell for OWNER/REPO extraction across
+// a large URL corpus, independent of host-identity canonicalization
+// (which has its own dedicated coverage in shieldEvaluator.test.ts /
+// shieldCoexistenceAndIntegrity.test.ts). So rather than driving a real
+// `~/.ssh/config`, this fake `ssh -G` simply ECHOES BACK whatever
+// host/alias it was asked about — exactly what a real, unconfigured `ssh`
+// does for a host with no matching `Host` block. Paired with policies
+// built with `canonicalHost` set to the SAME literal host the test
+// approves, canonical resolution trivially agrees with the literal text,
+// which keeps every test below isolated to what it actually probes.
+let identityFakeSshBinPromise: Promise<string> | undefined;
+async function identityFakeSshBin(): Promise<string> {
+  if (!identityFakeSshBinPromise) {
+    identityFakeSshBinPromise = (async () => {
+      const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p9-identity-ssh-"));
+      const implPath = path.join(binDir, "impl.js");
+      await fs.writeFile(
+        implPath,
+        `"use strict";
+const args = process.argv.slice(2);
+const joined = " " + args.join(" ") + " ";
+if (joined.includes(" -G ")) {
+  const target = args[args.length - 1] || "";
+  const at = target.lastIndexOf("@");
+  const host = at !== -1 ? target.slice(at + 1) : target;
+  let port = "22";
+  const pIdx = args.indexOf("-p");
+  if (pIdx !== -1 && args[pIdx + 1]) port = args[pIdx + 1];
+  process.stdout.write("user git\\nhostname " + host.toLowerCase() + "\\nport " + port + "\\n");
+  process.exit(0);
+}
+process.stderr.write("fake-ssh-identity: unexpected invocation: " + joined + "\\n");
+process.exit(1);
+`,
+      );
+      await fs.writeFile(path.join(binDir, "ssh"), `#!/usr/bin/env node\nrequire(${JSON.stringify(implPath)});\n`, { mode: 0o755 });
+      await fs.writeFile(path.join(binDir, "ssh.cmd"), `@echo off\r\nnode "${implPath}" %*\r\n`);
+      return binDir;
+    })();
+  }
+  return identityFakeSshBinPromise;
+}
+
+function withIdentityFakeSshPath(env: NodeJS.ProcessEnv, fakeSshBin: string): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {};
+  let existingPath: string | undefined;
+  for (const [key, value] of Object.entries(env)) {
+    if (key.toUpperCase() === "PATH") {
+      existingPath = existingPath ?? value;
+      continue;
+    }
+    result[key] = value;
+  }
+  result.PATH = `${fakeSshBin}${path.delimiter}${existingPath ?? ""}`;
+  return result;
+}
+
+async function runEvaluator(
+  repo: Parameters<typeof runEvaluatorRaw>[0],
+  args: string[],
+  options: { stdin?: string; env?: NodeJS.ProcessEnv } = {},
+): ReturnType<typeof runEvaluatorRaw> {
+  const baseEnv = options.env ?? repo.env;
+  const env = withIdentityFakeSshPath(baseEnv, await identityFakeSshBin());
+  return runEvaluatorRaw(repo, args, { ...options, env });
+}
 
 // ==================== corpus ====================
 
@@ -193,14 +270,20 @@ const ROUTE_MUST_DIFFER: Array<[string, string, string]> = [
 // these tests are probing.
 function destinationPolicy(owner: string, repo: string, host = "github.com"): ShieldPolicy {
   return {
-    policyVersion: 1,
+    policyVersion: 2,
     generatedAt: 1_700_000_000_000,
     matchedProfileId: "work",
     profileLabel: "Work",
     expectedGitName: undefined,
     expectedGitEmail: "work@example.com",
     approvedRepositoryKey: undefined,
-    approvedPushDestination: { host, owner, repo },
+    // canonicalHost = host: paired with the identity fake ssh above, "ssh
+    // -G" for an ssh-protocol destination echoes back the SAME literal
+    // host it was asked about, so canonical resolution trivially agrees
+    // with a literal match here — isolating this file's owner/repo
+    // differential from the (separately covered) host-canonicalization
+    // requirement itself.
+    approvedPushDestination: { host, owner, repo, canonicalHost: host },
     trustedSshHostAliases: ["github-work"],
     expectedGitHubLogin: undefined,
     // Non-strict: the route is not a blocking factor here, so the ONLY
@@ -219,7 +302,7 @@ function routePolicy(): ShieldPolicy {
     // Strict, and the destination is deliberately left wide (owner only)
     // so a destination mismatch does not mask the route reason. The route
     // reason id is what reveals protocol/host classification.
-    approvedPushDestination: { host: "github.com", owner: "acme" },
+    approvedPushDestination: { host: "github.com", owner: "acme", canonicalHost: "github.com" },
     strictPushSetup: true,
   };
 }
@@ -241,7 +324,14 @@ function referenceDestinationAllows(url: string, owner: string, repo: string, ho
     norm(parsed.repo) === norm(repo) &&
     !!parsed.repo &&
     norm(parsed.host) === norm(host) &&
-    !!parsed.host
+    !!parsed.host &&
+    // A degenerate parse that leaves stray userinfo attached to the host
+    // (e.g. "git@" for a URL with no actual host component) is not a
+    // string any real "ssh -G" resolution would ever echo back as a
+    // hostname — it fails to resolve at all, and the canonical-only
+    // destination model (round-2 release-blocker fix) correctly reads
+    // that as unprovable, never as an approved match.
+    !parsed.host.includes("@")
   );
 }
 

@@ -245,27 +245,40 @@ export interface PushEvalFacts {
   githubAccountCheck?: GitHubAccountVerificationOutcome;
 
   /**
-   * The CURRENT push route's CANONICAL host, when it could be safely
-   * resolved outside this pure module — mirrors
-   * `resources/shield/shield-evaluate.sh`'s `resolve_canonical_ssh_host`:
-   * `ssh -G` only (purely local: reads `~/.ssh/config`, makes no network
-   * connection, never executes `GIT_SSH_COMMAND`/`core.sshCommand`). Only
-   * needed when the push URL's literal host does not already equal the
-   * approved destination's host — a literal match needs no resolution at
-   * all (see `destinationReasons`).
+   * The CURRENT push route's CANONICAL host, resolved outside this pure
+   * module by a real `ssh -G` run against the CURRENT push URL's host —
+   * mirrors `resources/shield/shield-evaluate.sh`'s
+   * `resolve_canonical_ssh_route` (purely local: reads `~/.ssh/config`,
+   * makes no network connection, never executes
+   * `GIT_SSH_COMMAND`/`core.sshCommand`).
+   *
+   * Round-2 release-blocker fix: this is now REQUIRED for every
+   * ssh-protocol push, never bypassed by a literal host-string match. The
+   * original fix compared the push URL's literal host against the
+   * approved destination's literal host, short-circuiting to "match"
+   * whenever both were the same alias NAME (e.g. both "github-work") —
+   * which is exactly the case that misses an alias later repointed in
+   * `~/.ssh/config` (`github-work` from `github.com` to `evil.example`):
+   * the literal text never changes, so the old literal-fast-path kept
+   * reporting the destination confirmed. There is no literal-comparison
+   * path for ssh at all anymore (see `destinationReasons`) — only a
+   * canonical-to-canonical comparison against
+   * `ShieldPolicy.approvedPushDestination.canonicalHost` counts, and that
+   * field is ONLY ever populated by re-resolving the CURRENT push URL's
+   * host right now, never by re-resolving the *approved* alias's name
+   * (which would just re-resolve a possibly attacker-repointed alias
+   * through today's config and trivially "agree" with an equally
+   * freshly-resolved current host).
    *
    * `undefined` means resolution was not attempted or was not possible
    * (no `ssh` available, an SSH transport override was in effect, or the
-   * protocol isn't ssh) — and is treated as "destination host unprovable",
-   * which fails closed exactly like every other missing-evidence case in
-   * this module. This is the release-blocker fix (see docs/SHIELD_MODE.md):
-   * before it, `destinationReasons` matched on owner/repo ALONE, so a push
-   * to an entirely different host (`evil.example`) sharing the approved
-   * owner/repo text by coincidence — or by attacker choice — was reported
-   * "destination confirmed," with only the (non-blocking under a relaxed
-   * profile) push_account check standing between it and an allowed push.
+   * protocol isn't ssh) — treated as "destination host unprovable," which
+   * fails closed exactly like every other missing-evidence case in this
+   * module.
    */
   resolvedHost?: string;
+  /** The effective port `resolvedHost` was resolved on, alongside `resolvedHost` — `undefined` exactly when `resolvedHost` is. Compared against `approvedPushDestination.canonicalPort` when both are present. */
+  resolvedPort?: string;
 }
 
 /**
@@ -328,28 +341,49 @@ export function resolveSshCommandOverrides(env: SshTransportEnvironment): string
  * every alias-based push as a destination mismatch, which is precisely the
  * case `trustedSshHostAliases` exists to allow.
  *
- * But owner/repo text alone is never sufficient (this was the release
- * blocker fixed here — see `PushEvalFacts.resolvedHost`'s doc comment):
- * `evil.example/acme/backend` must never be treated as the same
- * destination as an approved `github.com/acme/backend` merely because the
- * owner/repo path happens to match. So host identity is ALSO required,
- * judged on a CANONICAL host — a literal match needs no resolution, and an
- * alias is accepted only once it has actually been resolved (via `ssh -G`,
- * never by trusting the alias's NAME) to the same host the approved
- * destination names. Missing/unprovable host evidence is never treated as
- * a match — it fails closed, exactly like the owner/repo rules below.
+ * But owner/repo text alone is never sufficient, and — round 2 of the
+ * release-blocker fix — NEITHER is a literal host-string match, even
+ * between the push URL and the policy's own recorded host. The original
+ * fix accepted a literal match ("github-work" push URL == "github-work"
+ * approved host) without resolution, reasoning that it "covers the common
+ * unchanged-remote case." It does — but it ALSO covers the exact attack it
+ * was meant to close: enable Shield while `github-work` resolves to
+ * `github.com`, then repoint `github-work` to `evil.example` in
+ * `~/.ssh/config` — the push URL's literal text never changes, so the
+ * literal-fast-path kept reporting the destination confirmed, never
+ * noticing the alias now goes somewhere else entirely.
  *
- * This canonical-host requirement holds regardless of `strictPushSetup`:
- * it answers "is this the physical place Shield approved?", not "can the
- * authenticating account be trusted?" (that's `routeReasons`/`accountReasons`,
- * which strictness legitimately gates).
+ * So for SSH, host identity is judged EXCLUSIVELY on a canonical
+ * comparison: the CURRENT route's host, freshly resolved via `ssh -G`
+ * right now (`resolvedHost`, supplied by the caller), against the
+ * CANONICAL host Shield resolved and persisted when the destination was
+ * approved (`approved.canonicalHost` — see `ShieldPolicy.approvedPushDestination`).
+ * The policy's own recorded `approved.host` (a literal alias name) is
+ * NEVER compared against for identity, and re-resolving IT through
+ * today's `~/.ssh/config` would be equally wrong (it would just re-resolve
+ * a possibly-repointed alias through the current config and trivially
+ * "agree" with an equally freshly-resolved current host). For HTTPS,
+ * which has no local alias indirection to canonicalize away, the literal
+ * host IS the canonical host, and `approved.canonicalHost` was set to it
+ * verbatim at approval time — so a literal comparison there is exactly a
+ * canonical comparison, not a shortcut around one.
+ *
+ * Missing canonical evidence — on either side, or because the policy
+ * predates canonical resolution entirely — is never treated as a match; it
+ * fails closed, exactly like the owner/repo rules below. This canonical
+ * requirement holds regardless of `strictPushSetup`: it answers "is this
+ * the physical place Shield approved?", not "can the authenticating
+ * account be trusted?" (that's `routeReasons`/`accountReasons`, which
+ * strictness legitimately gates).
  */
 function destinationReasons(
   policy: ShieldPolicy,
   owner: string | undefined,
   repo: string | undefined,
+  protocol: string,
   host: string | undefined,
   resolvedHost: string | undefined,
+  resolvedPort: string | undefined,
 ): ShieldReason[] {
   const approved = policy.approvedPushDestination;
   // Fail closed, per docs/SHIELD_MODE.md "Phase 4": if Shield never
@@ -389,18 +423,47 @@ function destinationReasons(
   // must have been independently resolved (by the caller, outside this
   // pure module) to the SAME host the approval names — never assumed from
   // an alias's name alone.
-  const normalizedApprovedHost = approved.host ? normalize(approved.host) : undefined;
-  const literalHostMatches = !!normalizedApprovedHost && !!host && normalize(host) === normalizedApprovedHost;
-  const canonicalHostMatches = !!normalizedApprovedHost && !!resolvedHost && normalize(resolvedHost) === normalizedApprovedHost;
-  const hostMatches = literalHostMatches || canonicalHostMatches;
+  const normalizedCanonicalApprovedHost = approved.canonicalHost ? normalize(approved.canonicalHost) : undefined;
 
-  if (ownerMatches && repoMatches && hostMatches) {
+  let hostMatches = false;
+  let portMatches = true;
+  if (normalizedCanonicalApprovedHost) {
+    if (protocol !== "ssh") {
+      // Only SSH has local ~/.ssh/config alias indirection an attacker
+      // could silently repoint after Shield approved a destination —
+      // HTTPS, and any other/unrecognized protocol Git itself accepts
+      // (git://, file://, ...), have no such ambiguity: the literal host
+      // IS the canonical host, and approved.canonicalHost was set to it
+      // verbatim at approval time. Comparing the CURRENT literal host
+      // against it here is a canonical comparison, not a bypass of one.
+      hostMatches = !!host && normalize(host) === normalizedCanonicalApprovedHost;
+    } else if (!!resolvedHost) {
+      hostMatches = normalize(resolvedHost) === normalizedCanonicalApprovedHost;
+      if (hostMatches && !!approved.canonicalPort && !!resolvedPort && approved.canonicalPort !== resolvedPort) {
+        // Same canonical host, different effective port — a different
+        // physical endpoint even when the hostname matches (e.g. a
+        // GitHub-shaped host answering on an unexpected port).
+        portMatches = false;
+      }
+    }
+  }
+
+  if (ownerMatches && repoMatches && hostMatches && portMatches) {
     return [];
   }
+  const currentDisplay = protocol === "ssh" && resolvedHost ? resolvedHost : (host ?? "an unknown host");
   return [
     {
       id: "push-destination-mismatch",
-      message: `Profile: ${policy.profileLabel}\nExpected approved destination: ${approved.host ?? "(unknown host)"}:${approved.owner}${approved.repo ? `/${approved.repo}` : ""}\nReason: Push destination changed since Shield approval (this push would go to ${host ?? "an unknown host"}:${owner ?? "an unknown owner"}${repo ? `/${repo}` : ""}).`,
+      message: `Profile: ${policy.profileLabel}\nExpected approved destination: ${approved.canonicalHost ?? approved.host ?? "(unknown host)"}:${approved.owner}${approved.repo ? `/${approved.repo}` : ""}\nReason: ${
+        !normalizedCanonicalApprovedHost
+          ? "Shield has no canonically-resolved push endpoint on file for this profile (the destination predates canonical resolution, or it could not be established the last time Shield was enabled or repaired). Run \"Repair Shield\" after confirming the intended remote."
+          : protocol === "ssh" && !resolvedHost
+            ? "This push's SSH endpoint could not be safely resolved right now (an SSH transport override may be in effect, or \"ssh\" is unavailable), so it cannot be confirmed against the approved destination."
+            : !portMatches
+              ? `Push destination's port changed since Shield approval (this push would use port ${resolvedPort}, approved: ${approved.canonicalPort}).`
+              : `Push destination changed since Shield approval (this push would go to ${currentDisplay}:${owner ?? "an unknown owner"}${repo ? `/${repo}` : ""}).`
+      }`,
       capability: "push_destination",
     },
   ];
@@ -531,7 +594,15 @@ export function evaluatePush(policy: ShieldPolicy, facts: PushEvalFacts, now: nu
   }
 
   const parsed = parseRemoteUrl(facts.remoteUrl);
-  const reasons = destinationReasons(policy, parsed.owner, parsed.repo, parsed.host, facts.resolvedHost);
+  const reasons = destinationReasons(
+    policy,
+    parsed.owner,
+    parsed.repo,
+    parsed.protocol,
+    parsed.host,
+    facts.resolvedHost,
+    facts.resolvedPort,
+  );
   const route = routeReasons(policy, parsed.protocol, parsed.host, facts.sshCommandOverrides);
   // routeReasons returns [] in exactly one case: an ssh protocol, no
   // overrides, host matched against a trusted alias — i.e. an empty

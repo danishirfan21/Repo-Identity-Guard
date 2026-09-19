@@ -388,8 +388,15 @@ if [ "$(policy_type "")" != "object" ]; then
   fail_immediately policy-corrupt "Shield's policy file must contain a JSON object"
 fi
 
-if [ "$(policy_type .policyVersion)" != "number" ] || [ "$(policy_scalar .policyVersion)" != "1" ]; then
-  fail_immediately policy-corrupt "unexpected or missing policyVersion (got: '$(policy_scalar .policyVersion)')"
+# v1 -> v2 (independent-review release blocker): approvedPushDestination
+# gained canonicalHost/canonicalPort, resolved via a real "ssh -G" at
+# enable/repair time. A v1 policy never captured this, so accepting one
+# here would let a repointed SSH alias masquerade as an unchanged
+# destination purely because its literal name never changed -- exactly
+# the hole this version bump exists to close. Deliberately rejected, not
+# reinterpreted: run "Repair Shield" to regenerate a v2 policy.
+if [ "$(policy_type .policyVersion)" != "number" ] || [ "$(policy_scalar .policyVersion)" != "2" ]; then
+  fail_immediately policy-corrupt "unexpected or missing policyVersion (got: '$(policy_scalar .policyVersion)'; Shield now requires policyVersion 2, which records a canonically-resolved SSH push endpoint -- run \"Repo Identity Guard: Repair Shield\" to upgrade)"
 fi
 
 if [ "$(policy_type .generatedAt)" != "number" ]; then
@@ -413,6 +420,8 @@ esac
 require_optional_string .approvedPushDestination.host
 require_optional_string .approvedPushDestination.owner
 require_optional_string .approvedPushDestination.repo
+require_optional_string .approvedPushDestination.canonicalHost
+require_optional_string .approvedPushDestination.canonicalPort
 
 # A non-boolean strictPushSetup used to read as "not strict", silently
 # turning OFF every route and account check. It is now corruption.
@@ -565,33 +574,51 @@ Found: $WHO"
   # operation) are deliberately never checked here — must never block.
 }
 
-# ==================== push: canonical SSH host resolution (release-blocker fix) ====================
+# ==================== push: canonical SSH route resolution (release-blocker fix, round 2) ====================
 #
-# Resolves the EFFECTIVE hostname `ssh -G <user>@<host>` reports for a given
-# host/alias -- purely local (reads the effective client SSH configuration,
-# makes no network connection, reads no key material, writes nothing).
-# Never falls back to trusting the input string itself as evidence: when
-# `ssh` isn't available, or produces no answer, the caller gets an empty
-# result and must treat that as "unresolved" (fail closed), exactly like
-# `verify_github_account`'s identical resolution below.
+# Resolves the EFFECTIVE hostname AND port `ssh -G <user>@<host>` reports
+# for a given host/alias -- purely local (reads the effective client SSH
+# configuration, makes no network connection, reads no key material,
+# writes nothing). Never falls back to trusting the input string itself as
+# evidence: when `ssh` isn't available, or produces no hostname line, the
+# caller gets EMPTY output (no lines at all) and must treat that as
+# "unresolved" (fail closed), exactly like `verify_github_account`'s
+# separate, identical-shaped resolution below.
 #
-# Used by `evaluate_push`'s destination check to decide whether a push
-# through an SSH alias genuinely reaches the approved host, rather than
-# merely sharing its owner/repo path text by coincidence (or by an
-# attacker's design) -- see that function for the full writeup.
-resolve_canonical_ssh_host() {
-  RCSH_HOST="$1"
-  RCSH_USER="$2"
-  RCSH_PORT="${3:-}"
-  if [ -z "$RCSH_HOST" ]; then
+# Prints exactly two lines on success -- hostname, then port -- or nothing
+# at all on failure/no resolution. Callers read them with `sed -n '1p'`/
+# `'2p'` rather than two separate `ssh -G` invocations, so a route is only
+# ever resolved once per call site.
+#
+# Used by `evaluate_push`'s destination check to resolve the CURRENT push
+# URL's real endpoint. Deliberately NEVER used to re-resolve the policy's
+# OWN recorded (approved) alias name: doing that would resolve a possibly
+# attacker-repointed alias through TODAY's ~/.ssh/config and trivially
+# "agree" with an equally freshly-resolved current host -- see
+# `evaluate_push`'s destination-check comment for the full writeup of why
+# that was the round-1 fix's remaining hole. The APPROVED side of the
+# comparison is instead the CANONICAL endpoint Shield resolved and
+# persisted once, durably, at enable/repair time (`approvedPushDestination
+# .canonicalHost`/`.canonicalPort` in the policy) -- never re-derived here.
+resolve_canonical_ssh_route() {
+  RCSR_HOST="$1"
+  RCSR_USER="$2"
+  RCSR_PORT="${3:-}"
+  if [ -z "$RCSR_HOST" ]; then
     return 0
   fi
-  if [ -n "$RCSH_PORT" ]; then
-    RCSH_CONFIG=$(ssh -G -p "$RCSH_PORT" "${RCSH_USER}@${RCSH_HOST}" 2>/dev/null) || RCSH_CONFIG=""
+  if [ -n "$RCSR_PORT" ]; then
+    RCSR_CONFIG=$(ssh -G -p "$RCSR_PORT" "${RCSR_USER}@${RCSR_HOST}" 2>/dev/null) || RCSR_CONFIG=""
   else
-    RCSH_CONFIG=$(ssh -G "${RCSH_USER}@${RCSH_HOST}" 2>/dev/null) || RCSH_CONFIG=""
+    RCSR_CONFIG=$(ssh -G "${RCSR_USER}@${RCSR_HOST}" 2>/dev/null) || RCSR_CONFIG=""
   fi
-  printf '%s\n' "$RCSH_CONFIG" | tr '[:upper:]' '[:lower:]' | awk '$1 == "hostname" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }'
+  RCSR_LOWER=$(printf '%s\n' "$RCSR_CONFIG" | tr '[:upper:]' '[:lower:]')
+  RCSR_HOSTNAME=$(printf '%s\n' "$RCSR_LOWER" | awk '$1 == "hostname" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }')
+  if [ -z "$RCSR_HOSTNAME" ]; then
+    return 0
+  fi
+  RCSR_RESOLVED_PORT=$(printf '%s\n' "$RCSR_LOWER" | awk '$1 == "port" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }')
+  printf '%s\n%s\n' "$RCSR_HOSTNAME" "${RCSR_RESOLVED_PORT:-22}"
 }
 
 # ==================== push: GitHub SSH account verification (Phase 5) ====================
@@ -994,9 +1021,11 @@ evaluate_push() {
   # cannot be proven to be the same one, that is treated as a mismatch,
   # not silently allowed. ----
   APPROVED_HOST=$(policy_scalar .approvedPushDestination.host)
+  APPROVED_CANONICAL_HOST=$(policy_scalar .approvedPushDestination.canonicalHost)
+  APPROVED_CANONICAL_PORT=$(policy_scalar .approvedPushDestination.canonicalPort)
   APPROVED_OWNER=$(policy_scalar .approvedPushDestination.owner)
   APPROVED_REPO=$(policy_scalar .approvedPushDestination.repo)
-  EXPECTED_DESTINATION_DISPLAY="${APPROVED_HOST:-(unknown host)}:${APPROVED_OWNER:-?}${APPROVED_REPO:+/$APPROVED_REPO}"
+  EXPECTED_DESTINATION_DISPLAY="${APPROVED_CANONICAL_HOST:-${APPROVED_HOST:-(unknown host)}}:${APPROVED_OWNER:-?}${APPROVED_REPO:+/$APPROVED_REPO}"
 
   if [ -z "$APPROVED_OWNER" ]; then
     add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
@@ -1018,34 +1047,75 @@ Reason: Refresh Shield after confirming the intended remote before pushing."
       OWNER_REPO_MISMATCH=1
     fi
 
-    # Host identity: a LITERAL match never needs resolution (the common
-    # unchanged-remote case, and every HTTPS push, whose host is
-    # unambiguous). Otherwise the current route's host is canonicalized
-    # via "ssh -G" (never by trusting an alias's NAME, and never by
-    # running GIT_SSH_COMMAND/core.sshCommand to "discover" what it does)
-    # and compared against the SAME canonicalization of the approved
-    # host -- so a legitimate alias ("github-work" -> "github.com")
-    # matches, but an unrelated host sharing the approved owner/repo text
-    # does not, and an unresolvable route (no "ssh" available, an SSH
-    # transport override in effect, or a non-ssh/https protocol) is never
-    # silently accepted.
+    # Host identity -- CANONICAL ONLY (round 2 of the release-blocker fix).
+    # A literal string match between the push URL's host and the policy's
+    # OWN recorded host/alias is NEVER sufficient on its own for SSH: both
+    # could be the identical alias NAME while ~/.ssh/config has since
+    # repointed it to a different physical endpoint. The previous version
+    # of this check accepted a literal match without resolution -- which
+    # covers the common unchanged-remote case, but ALSO covers the exact
+    # attack this exists to close: enable Shield while "github-work"
+    # resolves to "github.com", then repoint "github-work" to
+    # "evil.example" in ~/.ssh/config -- the push URL's literal text never
+    # changes, so the old literal-fast-path kept reporting the destination
+    # confirmed.
+    #
+    # So the ONLY thing ever compared now is:
+    #  - HTTPS (no local alias indirection to canonicalize away): the
+    #    literal current host against APPROVED_CANONICAL_HOST, which was
+    #    set to the literal host verbatim when the destination was
+    #    approved -- a literal comparison here IS a canonical comparison.
+    #  - SSH: the CURRENT push URL's host/alias, freshly resolved via
+    #    "ssh -G" RIGHT NOW (never by trusting its NAME, and never by
+    #    running GIT_SSH_COMMAND/core.sshCommand to "discover" what it
+    #    does), against APPROVED_CANONICAL_HOST. The policy's OWN recorded
+    #    alias name is NEVER re-resolved here -- doing that would resolve
+    #    the (possibly attacker-repointed) alias through TODAY's
+    #    ~/.ssh/config and trivially "agree" with an equally
+    #    freshly-resolved current host, which is exactly how the previous
+    #    version of this fix still missed the repointing case.
+    # Missing canonical evidence on either side -- no APPROVED_CANONICAL_HOST
+    # at all (a pre-canonicalization policy, impossible once policyVersion
+    # 2 is enforced, but defended here anyway), an unresolvable current
+    # route (no "ssh" available), or an SSH transport override in effect --
+    # is never a match.
     HOST_MATCH=0
-    LOWER_APPROVED_HOST=$(lower "$APPROVED_HOST")
-    LOWER_CURRENT_HOST=$(lower "$HOST")
-    if [ -n "$LOWER_APPROVED_HOST" ] && [ -n "$LOWER_CURRENT_HOST" ] && [ "$LOWER_APPROVED_HOST" = "$LOWER_CURRENT_HOST" ]; then
-      HOST_MATCH=1
-    elif [ -n "$APPROVED_HOST" ] && [ -n "$HOST" ] && [ "$PROTOCOL" = "ssh" ] && [ -z "$SSH_OVERRIDES" ]; then
-      CANONICAL_APPROVED_HOST=$(resolve_canonical_ssh_host "$APPROVED_HOST" "$SSH_USER" "$URL_PORT")
-      CANONICAL_CURRENT_HOST=$(resolve_canonical_ssh_host "$HOST" "$SSH_USER" "$URL_PORT")
-      if [ -n "$CANONICAL_APPROVED_HOST" ] && [ -n "$CANONICAL_CURRENT_HOST" ] && [ "$CANONICAL_APPROVED_HOST" = "$CANONICAL_CURRENT_HOST" ]; then
-        HOST_MATCH=1
+    PORT_MATCH=1
+    if [ -n "$APPROVED_CANONICAL_HOST" ]; then
+      if [ "$PROTOCOL" != "ssh" ]; then
+        # Only SSH has local ~/.ssh/config alias indirection an attacker
+        # could silently repoint after Shield approved a destination --
+        # HTTPS, and any other/unrecognized protocol Git itself accepts
+        # (git://, file://, ...), have no such ambiguity: the literal host
+        # IS the canonical host.
+        if [ "$(lower "$HOST")" = "$(lower "$APPROVED_CANONICAL_HOST")" ]; then
+          HOST_MATCH=1
+        fi
+      elif [ -n "$HOST" ] && [ -z "$SSH_OVERRIDES" ]; then
+        CURRENT_ROUTE=$(resolve_canonical_ssh_route "$HOST" "$SSH_USER" "$URL_PORT")
+        CANONICAL_CURRENT_HOST=$(printf '%s\n' "$CURRENT_ROUTE" | sed -n '1p')
+        CANONICAL_CURRENT_PORT=$(printf '%s\n' "$CURRENT_ROUTE" | sed -n '2p')
+        if [ -n "$CANONICAL_CURRENT_HOST" ] && [ "$(lower "$CANONICAL_CURRENT_HOST")" = "$(lower "$APPROVED_CANONICAL_HOST")" ]; then
+          HOST_MATCH=1
+          if [ -n "$APPROVED_CANONICAL_PORT" ] && [ -n "$CANONICAL_CURRENT_PORT" ] && [ "$CANONICAL_CURRENT_PORT" != "$APPROVED_CANONICAL_PORT" ]; then
+            PORT_MATCH=0
+          fi
+        fi
       fi
     fi
 
-    if [ "$OWNER_REPO_MISMATCH" = 1 ] || [ "$HOST_MATCH" != 1 ]; then
+    if [ "$OWNER_REPO_MISMATCH" = 1 ] || [ "$HOST_MATCH" != 1 ] || [ "$PORT_MATCH" != 1 ]; then
+      DESTINATION_REASON="Push destination changed since Shield approval (this push would go to ${HOST:-an unknown host}:${PARSED_OWNER:-an unknown owner}${PARSED_REPO:+/$PARSED_REPO})."
+      if [ -z "$APPROVED_CANONICAL_HOST" ]; then
+        DESTINATION_REASON="Shield has no canonically-resolved push endpoint on file for this profile (the destination predates canonical resolution, or it could not be established the last time Shield was enabled or repaired). Run \"Repo Identity Guard: Repair Shield\" after confirming the intended remote."
+      elif [ "$PROTOCOL" = "ssh" ] && [ -n "$SSH_OVERRIDES" ]; then
+        DESTINATION_REASON="This push's SSH endpoint could not be safely resolved right now (an SSH transport override is in effect: $SSH_OVERRIDES), so it cannot be confirmed against the approved destination."
+      elif [ "$PROTOCOL" = "ssh" ] && [ "$HOST_MATCH" = 1 ] && [ "$PORT_MATCH" != 1 ]; then
+        DESTINATION_REASON="Push destination's port changed since Shield approval (this push would use port ${CANONICAL_CURRENT_PORT:-unknown}, approved: $APPROVED_CANONICAL_PORT)."
+      fi
       add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
 Expected approved destination: $EXPECTED_DESTINATION_DISPLAY
-Reason: Push destination changed since Shield approval (this push would go to ${HOST:-an unknown host}:${PARSED_OWNER:-an unknown owner}${PARSED_REPO:+/$PARSED_REPO})."
+Reason: $DESTINATION_REASON"
     fi
   fi
 

@@ -46,16 +46,29 @@ const SCRIPT_PATH = path.join(__dirname, "..", "..", "resources", "shield", "shi
 const TRUSTED_ALIAS = "github-work";
 const REMOTE_URL = `git@${TRUSTED_ALIAS}:AcmeSoftware/acme-frontend.git`;
 
-function policyWithLogin(login: string | undefined): ShieldPolicy {
+// canonicalHost/canonicalPort default to the fake ssh's own defaults
+// ("github.com"/"22") -- i.e. "Shield was enabled under the same
+// environment this test is about to push under," which is the realistic
+// baseline this file's account-verification matrix wants (destination
+// confirmed, so a test's outcome is attributable to the account check
+// alone). A test that deliberately overrides FAKE_SSH_HOSTNAME/PORT to
+// simulate a genuinely different route passes the SAME values here via
+// `evaluatePush`, below, so canonicalHost still matches what a real
+// enable() would have persisted under that same environment -- only a
+// route that changes BETWEEN enable-time and push-time should ever
+// surface push-destination-mismatch, and no test in this matrix does that
+// (that scenario is release-blocker-round-2 territory, covered in
+// shieldEvaluator.test.ts and shieldGitHubAccountBinding.test.ts instead).
+function policyWithLogin(login: string | undefined, canonicalHost = "github.com", canonicalPort = "22"): ShieldPolicy {
   return {
-    policyVersion: 1,
+    policyVersion: 2,
     generatedAt: 1,
     matchedProfileId: "work",
     profileLabel: "Work",
     expectedGitName: "Danish Irfan",
     expectedGitEmail: "work@example.com",
     approvedRepositoryKey: "github.com/AcmeSoftware/acme-frontend",
-    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend" },
+    approvedPushDestination: { host: TRUSTED_ALIAS, owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost, canonicalPort },
     trustedSshHostAliases: [TRUSTED_ALIAS],
     expectedGitHubLogin: login,
     strictPushSetup: true,
@@ -125,6 +138,8 @@ function withPath(env: NodeJS.ProcessEnv, prepend: string): NodeJS.ProcessEnv {
 
 interface Fixture {
   repoDir: string;
+  commonDir: string;
+  login: string | undefined;
   fakeSshBin: string;
   fakeSshBinPosix: string;
   baseEnv: NodeJS.ProcessEnv;
@@ -160,7 +175,14 @@ async function setUp(login: string | null = "danish-work"): Promise<Fixture> {
   await fs.writeFile(shieldPolicyFilePath(commonDir), serializeShieldPolicy(policyWithLogin(login ?? undefined)));
 
   const fakeSshBin = await makeFakeSsh();
-  return { repoDir, fakeSshBin, fakeSshBinPosix: await toGitForWindowsPath(fakeSshBin, env), baseEnv: env };
+  return {
+    repoDir,
+    commonDir,
+    login: login ?? undefined,
+    fakeSshBin,
+    fakeSshBinPosix: await toGitForWindowsPath(fakeSshBin, env),
+    baseEnv: env,
+  };
 }
 
 interface Result {
@@ -188,6 +210,21 @@ function runInEvaluatorShell(fixture: Fixture, shellCommand: string, args: strin
 
 function evaluatePush(fixture: Fixture, extraEnv: NodeJS.ProcessEnv = {}, url = REMOTE_URL): Promise<Result> {
   const launch = async (): Promise<{ stdout: string; stderr: string }> => {
+    // Rewrite the policy's canonical destination to match THIS call's own
+    // FAKE_SSH_HOSTNAME/PORT before running — i.e. "Shield was enabled
+    // under the same environment this push is about to run under" (see
+    // policyWithLogin's doc comment). Skipped for FAKE_SSH_G_FAIL, whose
+    // whole point is an UNRESOLVABLE route — there is no hostname to
+    // canonicalize to, and the fixture's default canonicalHost ("github.com")
+    // correctly stays unreachable by the current (failing) resolution.
+    if (extraEnv.FAKE_SSH_G_FAIL !== "1") {
+      await fs.writeFile(
+        shieldPolicyFilePath(fixture.commonDir),
+        serializeShieldPolicy(
+          policyWithLogin(fixture.login, extraEnv.FAKE_SSH_HOSTNAME || "github.com", extraEnv.FAKE_SSH_PORT || "22"),
+        ),
+      );
+    }
     const scriptPath = await toGitForWindowsPath(SCRIPT_PATH, fixture.baseEnv);
     // Source the evaluator in the shell whose POSIX PATH the preflight just
     // verified. Executing the file via its shebang starts a second MSYS

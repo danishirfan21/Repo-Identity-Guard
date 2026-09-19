@@ -78,7 +78,7 @@ function randomPolicy(rng: Rng): ShieldPolicy {
   const hasDestination = rng.bool(0.85);
   const hasRepoInDestination = hasDestination && rng.bool(0.8);
   return {
-    policyVersion: 1,
+    policyVersion: 2,
     generatedAt: 1_700_000_000_000,
     matchedProfileId: "work",
     profileLabel: rng.pick(["Work", "Personal", "Work / Acme"]),

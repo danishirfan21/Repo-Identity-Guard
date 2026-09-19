@@ -25,7 +25,7 @@ function policy(overrides: Partial<Parameters<typeof buildShieldPolicy>[0]> = {}
   return buildShieldPolicy({
     profile: workProfile,
     approvedRepositoryKey: "github.com/acmesoftware/acme-frontend",
-    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend" },
+    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" },
     protectedBranches: ["main", "master"],
     enabledActions: ["commit", "push"],
     now: 1,
@@ -195,6 +195,7 @@ function pushFacts(overrides: Partial<PushEvalFacts> = {}): PushEvalFacts {
     remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git",
     sshCommandOverrides: [],
     resolvedHost: "github.com",
+    resolvedPort: "22",
     ...overrides,
   };
 }
@@ -310,6 +311,92 @@ test("evaluatePush: a literal host match needs no resolution at all — an HTTPS
     pushFacts({ remoteUrl: "https://github.com/AcmeSoftware/acme-frontend.git", resolvedHost: undefined }),
   );
   assert.ok(!decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+});
+
+// ==================== round-2 release blocker: canonical endpoint must be PERSISTED, never re-derived from the approved alias's own name ====================
+//
+// The round-1 fix accepted a LITERAL host-string match without any
+// canonical resolution at all ("github-work" push URL == "github-work"
+// approved host). That covers the common unchanged-remote case, but it
+// ALSO means: enable Shield while `github-work` resolves to
+// `github.com`, later repoint `github-work` to `evil.example` in
+// ~/.ssh/config, and every subsequent push through that exact same alias
+// still reads as "destination confirmed" — the literal text never
+// changed. These tests exercise exactly that scenario and its
+// neighbors (review cases A/B/D/E/G).
+
+test("release blocker round 2 (case A): an SSH alias repointed since Shield was enabled is a destination mismatch, even though the literal alias name never changed", () => {
+  // Policy approved via "github-work" when it resolved to "github.com"
+  // (canonicalHost persisted at enable time). The push URL still literally
+  // reads "github-work" -- but the CURRENT resolution (what a live "ssh -G"
+  // would report right now) is "evil.example", because ~/.ssh/config was
+  // repointed after Shield was enabled.
+  const decision = evaluatePush(
+    policy({ approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" } }),
+    pushFacts({ remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git", resolvedHost: "evil.example", resolvedPort: "22" }),
+  );
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+});
+
+test("release blocker round 2 (case B): the same alias, still resolving to the same canonical endpoint, is allowed", () => {
+  const decision = evaluatePush(
+    policy({ approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" } }),
+    pushFacts({ remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git", resolvedHost: "github.com", resolvedPort: "22" }),
+  );
+  assert.equal(decision.allowed, true);
+});
+
+test("release blocker round 2: the policy's OWN recorded alias name is NEVER re-resolved for comparison — only resolvedHost (the CURRENT route, supplied by the caller) counts", () => {
+  // Regression guard against reintroducing the round-1 shape of the bug:
+  // even if a caller mistakenly resolved and passed back the literal
+  // approved host/alias's OWN canonical form as `resolvedHost` instead of
+  // the current push's, the module itself has no way to "notice" that —
+  // this documents that the contract is entirely on the caller providing
+  // the CURRENT route's resolution, and that a matching resolvedHost
+  // value alone (whatever it was derived from) is what allows the push.
+  // The actual defense against re-deriving from the approved name lives
+  // in manager.ts/shield-evaluate.sh (see their tests), not here.
+  const decision = evaluatePush(
+    policy({ approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" } }),
+    pushFacts({ remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git", resolvedHost: "github.com", resolvedPort: "22" }),
+  );
+  assert.equal(decision.allowed, true);
+});
+
+test("release blocker round 2 (case D/E): an SSH transport override makes the destination unprovable and blocks Push Destination itself, regardless of strictPushSetup", () => {
+  for (const strictPushSetup of [false, true]) {
+    const decision = evaluatePush(
+      policy({ profile: { ...workProfile, strictPushSetup }, approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" } }),
+      // sshCommandOverrides present -> the caller never attempts
+      // resolution -> resolvedHost is undefined, exactly as a real caller
+      // (shell script) would behave.
+      pushFacts({ remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git", sshCommandOverrides: ["GIT_SSH_COMMAND"], resolvedHost: undefined, resolvedPort: undefined }),
+    );
+    assert.equal(decision.allowed, false, `strictPushSetup=${strictPushSetup}`);
+    const destinationReason = decision.reasons.find((r) => r.id === "push-destination-mismatch");
+    assert.ok(destinationReason, `strictPushSetup=${strictPushSetup}: expected push-destination-mismatch`);
+  }
+});
+
+test("release blocker round 2 (case G): a port change on the same canonical host is a destination mismatch", () => {
+  const decision = evaluatePush(
+    policy({ approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" } }),
+    pushFacts({ remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git", resolvedHost: "github.com", resolvedPort: "2222" }),
+  );
+  assert.equal(decision.allowed, false);
+  const destinationReason = decision.reasons.find((r) => r.id === "push-destination-mismatch");
+  assert.ok(destinationReason);
+  assert.match(destinationReason!.message, /port/i);
+});
+
+test("a policy predating canonical resolution (no canonicalHost at all) fails closed for SSH, never falls back to a literal comparison", () => {
+  const decision = evaluatePush(
+    policy({ approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend" } }),
+    pushFacts({ remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git", resolvedHost: "github.com", resolvedPort: "22" }),
+  );
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
 });
 
 test("evaluatePush never claims cryptographic account verification in any reason message", () => {

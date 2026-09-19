@@ -383,7 +383,15 @@ export function activate(context: vscode.ExtensionContext): void {
               host: facts.pushRemoteHost,
               owner: facts.pushRemoteOwner,
               repo: facts.pushRemoteRepo,
+              protocol: facts.pushRemoteProtocol,
             },
+            // Deliberately NOT set here: this runs on every routine scan
+            // (file-watcher events, workspace-folder switches, ...), and a
+            // real "ssh -G" call on every one of those would be a real
+            // performance cost for a check nobody explicitly asked for in
+            // the moment. See ShieldInspectOptions.resolveCanonicalDestinationDrift
+            // and "Check Shield Health" below, which does set it.
+            resolveCanonicalDestinationDrift: false,
           })
           .catch(() => undefined);
 
@@ -873,7 +881,13 @@ export function activate(context: vscode.ExtensionContext): void {
           host: facts.pushRemoteHost,
           owner: facts.pushRemoteOwner,
           repo: facts.pushRemoteRepo,
+          protocol: facts.pushRemoteProtocol,
         },
+        // This IS the explicit, on-demand check: worth a real "ssh -G"
+        // call to catch an SSH alias silently repointed since Shield was
+        // last enabled/repaired — see
+        // ShieldInspectOptions.resolveCanonicalDestinationDrift.
+        resolveCanonicalDestinationDrift: true,
       });
       if (state === "active") {
         await vscode.window.showInformationMessage(summary);
