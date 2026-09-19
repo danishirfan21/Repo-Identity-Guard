@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Fixed — release blocker, round 3: the canonical endpoint's PORT, and an IPv6 host-formatting bug
+
+Round 2 persisted a canonical **host** at enable/repair time so an SSH
+alias silently repointed in `~/.ssh/config` could be caught at push time.
+A further independent review found the same gap one level down, in the
+**port**: `ParsedRemote`/`RepoFacts` never tracked an explicit SSH URL
+port, so enable/repair-time canonicalization asked `ssh -G <host>` (no
+`-p`) while the shipped hook already correctly asked `ssh -G -p 443
+<host>` whenever the push URL carried one — two different questions that
+are not guaranteed the same answer, so a completely unchanged destination
+whose URL carried an explicit port could report a port mismatch.
+
+Fixed by extending `ParsedRemote`/`RepoFacts` with the explicit URL port
+and SSH user, and threading them into `ShieldManager.canonicalizeDestination`
+and `resolveCanonicalSshEndpoint` so enable/repair and the hook ask the
+identical `ssh -G [-p <port>] <user>@<host>` question. Also fixed, found by
+this round's own regression tests: a bracketed IPv6 literal
+(`[2001:db8::1]`) could read as different from its unbracketed form (the
+SAME address) if one side of a host comparison happened to report it
+bracketed and the other didn't — fixed with a dedicated host-normalizing
+comparison (`normalizeHost()`/`normalize_host()`) kept 1:1 across the
+TypeScript evaluator, the shell evaluator, and `ShieldManager`; and a
+separate shell-only bug where `shield-evaluate.sh`'s `URL_PORT` regex
+couldn't handle a bracketed IPv6 host at all, silently extracting no port
+for one.
+
+A parallel re-review of this round's Windows test coverage rejected an
+earlier pass that had converted genuine Windows test failures into
+`skip`s (fail-closed being safe is not evidence the expected-ALLOW
+behavior works there) — those cases were reclassified and fixed instead,
+via a generalized cross-platform evaluator-shell test harness
+(`src/test/testUtil/evaluatorShell.ts`) and a test-only dependency-injection
+seam (`ShieldEnableInput.sshResolver`/`ShieldInspectOptions.sshResolver`)
+for the manager's own canonical `ssh -G` call. See docs/SHIELD_MODE.md's
+"Phase 8, round 3" section for the full writeup, including a Windows
+production-architecture audit (enable-time Node vs. hook-time Git-for-
+Windows MSYS `ssh` can genuinely be different binaries — documented as a
+standing manual-test item, never silently papered over, and provably
+fail-closed-only by construction).
+
 ### Fixed — release blocker, round 2: canonical physical push endpoint must be persisted (policyVersion 2)
 
 A second independent review found the round-1 destination-host fix still

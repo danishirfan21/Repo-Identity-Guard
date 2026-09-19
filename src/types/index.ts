@@ -52,6 +52,10 @@ export interface RepoFacts {
   pushRemoteHost?: string;
   pushRemoteOwner?: string;
   pushRemoteRepo?: string;
+  /** Explicit SSH port from the push URL (`ssh://` form only) — see `ParsedRemote.port`. Undefined means "whatever the host/alias's effective ssh config says," never "22". */
+  pushRemotePort?: string;
+  /** SSH connection user from the push URL, defaulting to "git" — see `ParsedRemote.sshUser`. Only set when `pushRemoteProtocol === "ssh"`. */
+  pushRemoteUser?: string;
 
   /** The `upstream` remote, if one exists (the conventional fork-tracking remote name). Evidence only — never auto-selects a profile by itself. */
   upstreamRemoteUrl?: string;

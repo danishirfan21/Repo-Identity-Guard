@@ -94,6 +94,27 @@ lower() {
   printf '%s\n' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]'
 }
 
+# Shell half of normalizeHost() in src/shield/evaluator.ts: same as
+# lower(), but ALSO strips one matching pair of enclosing "[...]" brackets
+# first -- "[2001:db8::1]" and "2001:db8::1" name the SAME IPv6 address,
+# and different "ssh" implementations/versions are not guaranteed to
+# report "ssh -G"'s "hostname" line with brackets one way or the other.
+# Comparing host strings without this would risk an UNCHANGED destination
+# reading as "changed" purely because of a bracket-formatting difference
+# between two resolutions of the same address. Used ONLY for host
+# comparisons, never for owner/repo/git-identity fields.
+normalize_host() {
+  NH_LOWERED=$(lower "$1")
+  case "$NH_LOWERED" in
+    \[*\])
+      printf '%s\n' "$NH_LOWERED" | sed -E 's/^\[//; s/\]$//'
+      ;;
+    *)
+      printf '%s\n' "$NH_LOWERED"
+      ;;
+  esac
+}
+
 # ==================== locate + load policy ====================
 
 GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
@@ -941,7 +962,23 @@ evaluate_push() {
   # Keyed off the ANCHORED scheme detected above, not a `ssh://*` glob, so
   # this can never fire for a string that merely contains "ssh://".
   if [ "$URL_SCHEME" = "ssh" ]; then
-    URL_PORT=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^[sS][sS][hH]://([^/@]*@)?[^/:]+:([0-9]+)(/.*)?$#\2#p')
+    # A bracketed IPv6 literal host ("[2001:db8::1]") contains colons
+    # itself, so the ordinary "[^/:]+" host pattern below stops at the
+    # FIRST one and the whole match fails -- e.g.
+    # "ssh://git@[2001:db8::1]:2222/acme/repo.git" silently extracted NO
+    # port at all (found by port regression G, this suite's own corpus
+    # differential, after the enable/repair port-canonicalization fix made
+    # this extraction matter for MORE than the account-verification probe).
+    # Handled the same way the HOST case statement above already handles
+    # it: match the bracketed host explicitly first.
+    case "$REMOTE_URL" in
+      [sS][sS][hH]://*'@['*']:'[0-9]*|[sS][sS][hH]://'['*']:'[0-9]*)
+        URL_PORT=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^[sS][sS][hH]://([^/@]*@)?\[[^]]*\]:([0-9]+)(/.*)?$#\2#p')
+        ;;
+      *)
+        URL_PORT=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^[sS][sS][hH]://([^/@]*@)?[^/:]+:([0-9]+)(/.*)?$#\2#p')
+        ;;
+    esac
   fi
 
   IS_GENERIC=0
@@ -1088,14 +1125,14 @@ Reason: Refresh Shield after confirming the intended remote before pushing."
         # HTTPS, and any other/unrecognized protocol Git itself accepts
         # (git://, file://, ...), have no such ambiguity: the literal host
         # IS the canonical host.
-        if [ "$(lower "$HOST")" = "$(lower "$APPROVED_CANONICAL_HOST")" ]; then
+        if [ "$(normalize_host "$HOST")" = "$(normalize_host "$APPROVED_CANONICAL_HOST")" ]; then
           HOST_MATCH=1
         fi
       elif [ -n "$HOST" ] && [ -z "$SSH_OVERRIDES" ]; then
         CURRENT_ROUTE=$(resolve_canonical_ssh_route "$HOST" "$SSH_USER" "$URL_PORT")
         CANONICAL_CURRENT_HOST=$(printf '%s\n' "$CURRENT_ROUTE" | sed -n '1p')
         CANONICAL_CURRENT_PORT=$(printf '%s\n' "$CURRENT_ROUTE" | sed -n '2p')
-        if [ -n "$CANONICAL_CURRENT_HOST" ] && [ "$(lower "$CANONICAL_CURRENT_HOST")" = "$(lower "$APPROVED_CANONICAL_HOST")" ]; then
+        if [ -n "$CANONICAL_CURRENT_HOST" ] && [ "$(normalize_host "$CANONICAL_CURRENT_HOST")" = "$(normalize_host "$APPROVED_CANONICAL_HOST")" ]; then
           HOST_MATCH=1
           if [ -n "$APPROVED_CANONICAL_PORT" ] && [ -n "$CANONICAL_CURRENT_PORT" ] && [ "$CANONICAL_CURRENT_PORT" != "$APPROVED_CANONICAL_PORT" ]; then
             PORT_MATCH=0

@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SHIELD_ARTIFACT_MARKER } from "../shield/artifacts";
-import { ShieldManager } from "../shield/manager";
+import { ShieldManager, SshResolver } from "../shield/manager";
 import { Profile, RepoFacts } from "../types";
 
 /**
@@ -144,7 +144,13 @@ async function hooksDirFor(repo: Repo): Promise<string> {
 async function enableShield(
   manager: ShieldManager,
   repo: Repo,
-  overrides: { profiles?: Profile[]; facts?: Partial<RepoFacts>; chainForeignHooks?: boolean; fakeSshBin?: string } = {},
+  overrides: {
+    profiles?: Profile[];
+    facts?: Partial<RepoFacts>;
+    chainForeignHooks?: boolean;
+    fakeSshBin?: string;
+    sshResolver?: SshResolver;
+  } = {},
 ) {
   // Round-2 release-blocker fix: enable() now resolves and persists the
   // approved destination's REAL canonical SSH endpoint via a live
@@ -161,7 +167,24 @@ async function enableShield(
     protectedBranches: ["main", "master"],
     chainForeignHooks: overrides.chainForeignHooks,
     env,
+    sshResolver: overrides.sshResolver,
   });
+}
+
+/**
+ * A deterministic, in-process stand-in for a real `ssh -G` resolution —
+ * always resolves to `hostname` on port "22", regardless of platform.
+ * Injected via `ShieldEnableInput.sshResolver`/
+ * `ShieldInspectOptions.sshResolver` instead of shadowing a fake `ssh`
+ * binary onto PATH, which is NOT deterministic across platforms: real
+ * Windows process spawning does not resolve a PATH-shadowed fake `ssh`
+ * the same way a POSIX shell does (see docs/SHIELD_MODE.md's Windows
+ * evaluator-testing section). This makes the underlying Shield behavior
+ * — not just the shell evaluator's own parsing — verifiable identically
+ * on all three platforms.
+ */
+function fakeResolverFor(hostname: string): SshResolver {
+  return async () => ({ host: hostname, port: "22" });
 }
 
 // ==================== hook coexistence: chaining ====================
@@ -774,34 +797,26 @@ test("integrity: missing repo evidence in the current push destination is drift,
 // ShieldInspectOptions.resolveCanonicalDestinationDrift for why routine
 // background scans intentionally do NOT pay that cost automatically).
 //
-// Windows finding (same family as SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS
-// above, but for the manager's OWN direct `ssh -G` call rather than one
-// made from a spawned shell): on windows-latest CI, resolveCanonicalSshEndpoint's
-// `execFile("ssh", ["-G", host], { env })` does not pick up this test's
-// PATH-shadowed fake ssh, so the repointed-alias simulation (driven purely
-// by env vars the fake reads) has no effect and no drift is detected. Not
-// a Shield defect — fails to detect drift here only because the TEST
-// double can't be reached, never a case of a real repoint going
-// undetected; verified passing on ubuntu-latest/macos-latest.
-const SKIP_CANONICAL_SSH_ON_WINDOWS =
-  process.platform === "win32"
-    ? "This suite's shadowed fake ssh is not reached by resolveCanonicalSshEndpoint's direct execFile(\"ssh\", ...) call on windows-latest CI. Covered on ubuntu-latest/macos-latest."
-    : false;
-
-test("integrity: an SSH alias's endpoint changing since enable() is caught by the explicit canonical health check (case F), never by the cheap literal check alone", { skip: SKIP_CANONICAL_SSH_ON_WINDOWS }, async () => {
+// Windows finding, now fixed rather than skipped: a PATH-shadowed fake
+// `ssh` binary is not reached identically across platforms by the
+// manager's own direct `execFile("ssh", ...)` call (Windows process
+// spawning does not resolve it the same way a POSIX shell does). Rather
+// than skip this test on Windows, it now drives the SAME manager code
+// through `ShieldEnableInput.sshResolver`/`ShieldInspectOptions.sshResolver`
+// dependency injection (`fakeResolverFor`, above) — no PATH shadowing, no
+// real subprocess, deterministic on all three platforms, and it still
+// exercises Shield's actual `canonicalizeDestination`/drift-comparison
+// logic, not a re-implementation of it.
+test("integrity: an SSH alias's endpoint changing since enable() is caught by the explicit canonical health check (case F), never by the cheap literal check alone", async () => {
   const repo = await makeTempRepo();
   try {
     const manager = new ShieldManager();
-    const fakeSshBin = await makeFakeSshBin();
-    const enableEnv = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}`, FAKE_SSH_HOSTNAME: "github.com" };
-    await enableShield(manager, repo, { fakeSshBin });
+    await enableShield(manager, repo, { sshResolver: fakeResolverFor("github.com") });
     assert.equal((await manager.inspect(repo.dir)).state, "active");
 
     // Literal host/owner/repo text is UNCHANGED (still "github.com" per
     // baseFacts) -- only what the alias ACTUALLY resolves to right now
     // has changed, simulating a ~/.ssh/config edit since enable().
-    const repointedEnv = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}`, FAKE_SSH_HOSTNAME: "evil.example" };
-
     const cheapCheck = await manager.inspect(repo.dir, {
       currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
     });
@@ -811,7 +826,7 @@ test("integrity: an SSH alias's endpoint changing since enable() is caught by th
     const canonicalCheck = await manager.inspect(repo.dir, {
       currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
       resolveCanonicalDestinationDrift: true,
-      env: repointedEnv,
+      sshResolver: fakeResolverFor("evil.example"),
     });
     assert.equal(canonicalCheck.pushDestinationDrift, true, "the explicit canonical check must catch the repoint");
     assert.equal(canonicalCheck.state, "degraded");
@@ -821,7 +836,7 @@ test("integrity: an SSH alias's endpoint changing since enable() is caught by th
     const canonicalCheckUnchanged = await manager.inspect(repo.dir, {
       currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
       resolveCanonicalDestinationDrift: true,
-      env: enableEnv,
+      sshResolver: fakeResolverFor("github.com"),
     });
     assert.equal(canonicalCheckUnchanged.pushDestinationDrift, false);
     assert.equal(canonicalCheckUnchanged.state, "active");

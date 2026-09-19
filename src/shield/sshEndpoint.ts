@@ -39,14 +39,25 @@ export interface CanonicalSshEndpoint {
  */
 export async function resolveCanonicalSshEndpoint(
   hostOrAlias: string,
-  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {},
+  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv; port?: string; user?: string } = {},
 ): Promise<CanonicalSshEndpoint | undefined> {
   const trimmed = hostOrAlias.trim();
   if (!trimmed) {
     return undefined;
   }
+  // Matches shield-evaluate.sh's resolve_canonical_ssh_route exactly: `-p
+  // <port>` is passed ONLY when the caller supplied an explicit port (from
+  // the URL itself, e.g. `ssh://git@host:443/...`) — an absent port here
+  // must ask `ssh -G` with no `-p` at all, the same "whatever this host's
+  // effective config says" question the real push transport asks, never a
+  // guessed default. Passing the two sides of a comparison through
+  // DIFFERENT port semantics (one with an explicit `-p`, one without) is
+  // exactly what let an unchanged approved SSH destination read as a port
+  // mismatch — see docs/SHIELD_MODE.md's explicit-SSH-URL-port section.
+  const user = options.user?.trim() || "git";
+  const args = options.port ? ["-G", "-p", options.port, `${user}@${trimmed}`] : ["-G", `${user}@${trimmed}`];
   try {
-    const { stdout } = await execFileAsync("ssh", ["-G", trimmed], {
+    const { stdout } = await execFileAsync("ssh", args, {
       encoding: "utf8",
       timeout: options.timeoutMs ?? 5000,
       windowsHide: true,

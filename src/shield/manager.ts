@@ -22,7 +22,6 @@ import {
 } from "./artifacts";
 import { SshTransportEnvironment, resolveSshCommandOverrides } from "./evaluator";
 import { SHIELD_MIN_GIT_VERSION_DISPLAY, evaluateGitVersionSupport } from "./gitVersion";
-import { resolveCanonicalSshEndpoint } from "./sshEndpoint";
 import {
   normalizeHookDirs,
   readShieldInstallRecord,
@@ -31,8 +30,26 @@ import {
   writeShieldInstallRecord,
 } from "./installRecord";
 import { ShieldPolicy, buildShieldPolicy, parseShieldPolicy, serializeShieldPolicy } from "./policy";
+import { CanonicalSshEndpoint, resolveCanonicalSshEndpoint } from "./sshEndpoint";
 import { shieldEvaluatorScriptFilePath, shieldPolicyFilePath, shieldStorageDir } from "./storage";
 import { ShieldAction, ShieldLifecycleState } from "./types";
+
+/**
+ * The real `ssh -G` resolution `canonicalizeDestination` uses by default —
+ * factored out purely so tests can substitute a deterministic in-process
+ * fake via `ShieldEnableInput.sshResolver`/`ShieldInspectOptions.sshResolver`
+ * instead of shadowing a fake `ssh` binary onto PATH, which real Windows
+ * shells and Node's own process spawning do not resolve identically (see
+ * docs/SHIELD_MODE.md's Windows evaluator-testing section). Production
+ * code always takes this default; nothing user-facing can override it.
+ */
+export type SshResolver = (
+  host: string,
+  options: { env: NodeJS.ProcessEnv; port?: string; user?: string },
+) => Promise<CanonicalSshEndpoint | undefined>;
+
+const defaultSshResolver: SshResolver = (host, options) =>
+  resolveCanonicalSshEndpoint(host, { env: options.env, port: options.port, user: options.user });
 
 /**
  * ShieldManager owns Shield's on-disk lifecycle: installing/removing/
@@ -302,6 +319,15 @@ export interface ShieldEnableInput {
    * PATH-shadowing directory; production callers should simply omit this.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Test-only dependency injection for the canonical SSH endpoint
+   * resolution `enable()`/`repair()` perform — defaults to a real `ssh -G`
+   * call. Deterministic across all three platforms (unlike PATH-shadowing
+   * a fake `ssh` binary, which Windows' process spawning does not resolve
+   * the same way a POSIX shell does) — see manager.ts's `SshResolver` doc
+   * comment. Never set by production code.
+   */
+  sshResolver?: SshResolver;
 }
 
 export interface ShieldInspectOptions {
@@ -330,7 +356,7 @@ export interface ShieldInspectOptions {
    * Omit to skip this check. `protocol` (ssh/https/unknown) is needed only
    * when `resolveCanonicalDestinationDrift` is also set.
    */
-  currentPushDestination?: { host?: string; owner?: string; repo?: string; protocol?: string };
+  currentPushDestination?: { host?: string; owner?: string; repo?: string; protocol?: string; port?: string; sshUser?: string };
   /**
    * Opt-in, expensive drift check: re-resolves the CURRENT push
    * destination's REAL canonical SSH endpoint right now (a real `ssh -G`
@@ -366,6 +392,8 @@ export interface ShieldInspectOptions {
    * global environment; production callers should simply omit this.
    */
   env?: NodeJS.ProcessEnv;
+  /** Test-only dependency injection — see `ShieldEnableInput.sshResolver`. Never set by production code. */
+  sshResolver?: SshResolver;
 }
 
 interface HookSpec {
@@ -550,6 +578,21 @@ function normalizeAliasList(aliases: string[] | undefined): string {
 
 function normalizeOwnerRepo(value: string | undefined): string {
   return (value ?? "").trim().toLowerCase();
+}
+
+/**
+ * Same idea as `normalizeOwnerRepo`, but for HOST strings specifically:
+ * also strips one matching pair of enclosing `[...]` brackets, since
+ * `[2001:db8::1]` and `2001:db8::1` name the same IPv6 address and
+ * different `ssh` implementations/versions are not guaranteed to report
+ * `ssh -G`'s `hostname` line bracketed one way or the other. Mirrors
+ * `normalizeHost()` in evaluator.ts and `normalize_host()` in
+ * shield-evaluate.sh exactly, so health/drift agrees with hook
+ * enforcement on what counts as "the same host."
+ */
+function normalizeHost(value: string | undefined): string {
+  const trimmed = (value ?? "").trim().toLowerCase();
+  return trimmed.length > 2 && trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
 }
 
 /** Byte-level ownership check — see {@link readBytesIfExists} for why nothing here decodes text it did not write. */
@@ -797,11 +840,19 @@ export class ShieldManager {
           // repointed in ~/.ssh/config since Shield was last
           // enabled/repaired — its NAME never changes, so no literal
           // string comparison can see it.
-          const currentCanonical = await this.canonicalizeDestination(repoRoot, current.protocol, current.host, options.env);
+          const currentCanonical = await this.canonicalizeDestination(
+            repoRoot,
+            current.protocol,
+            current.host,
+            options.env,
+            current.port,
+            current.sshUser,
+            options.sshResolver,
+          );
           hostChanged =
             !approved.canonicalHost ||
             !currentCanonical.canonicalHost ||
-            normalizeOwnerRepo(approved.canonicalHost) !== normalizeOwnerRepo(currentCanonical.canonicalHost);
+            normalizeHost(approved.canonicalHost) !== normalizeHost(currentCanonical.canonicalHost);
           portChanged =
             !!approved.canonicalPort &&
             !!currentCanonical.canonicalPort &&
@@ -816,7 +867,7 @@ export class ShieldManager {
           // on every real push — this cheap path only affects how
           // promptly the sidebar's diagnostic indicator notices, never
           // what a push allows.
-          hostChanged = normalizeOwnerRepo(approved.host) !== normalizeOwnerRepo(current.host);
+          hostChanged = normalizeHost(approved.host) !== normalizeHost(current.host);
         }
 
         pushDestinationDrift = hostChanged || ownerChanged || repoChanged || portChanged;
@@ -1013,6 +1064,9 @@ export class ShieldManager {
     protocol: string | undefined,
     host: string | undefined,
     env: NodeJS.ProcessEnv = process.env,
+    explicitPort?: string,
+    sshUser?: string,
+    sshResolver: SshResolver = defaultSshResolver,
   ): Promise<{ canonicalHost?: string; canonicalPort?: string }> {
     if (!host) {
       return {};
@@ -1030,7 +1084,17 @@ export class ShieldManager {
     if (overrides.length > 0) {
       return {};
     }
-    const endpoint = await resolveCanonicalSshEndpoint(host, { env });
+    // The explicit URL port (e.g. "443" in `ssh://git@host:443/...`) must
+    // travel into THIS SAME "ssh -G" call, exactly as
+    // shield-evaluate.sh's resolve_canonical_ssh_route does for the hook's
+    // own resolution -- an unchanged approved destination whose URL
+    // carries an explicit port must canonicalize identically at
+    // enable/repair time and at push time. Passing no port here (when the
+    // URL carried none) while the push-time side passes one, or vice
+    // versa, is exactly the bug this parameter closes: `ssh -G host` and
+    // `ssh -G -p 443 host` can legitimately report different effective
+    // ports for the SAME unchanged destination.
+    const endpoint = await sshResolver(host, { env, port: explicitPort, user: sshUser });
     if (!endpoint) {
       return {};
     }
@@ -1136,7 +1200,15 @@ export class ShieldManager {
       // makes push destination fail closed on every push until the
       // override is removed and Shield is repaired (see
       // `destinationReasons()`).
-      const canonical = await this.canonicalizeDestination(repoRoot, facts.pushRemoteProtocol, facts.pushRemoteHost, input.env);
+      const canonical = await this.canonicalizeDestination(
+        repoRoot,
+        facts.pushRemoteProtocol,
+        facts.pushRemoteHost,
+        input.env,
+        facts.pushRemotePort,
+        facts.pushRemoteUser,
+        input.sshResolver,
+      );
       approvedPushDestination = {
         host: facts.pushRemoteHost,
         owner: facts.pushRemoteOwner,

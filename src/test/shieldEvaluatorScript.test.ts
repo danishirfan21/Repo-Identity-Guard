@@ -10,6 +10,7 @@ import { ShieldPolicy, buildShieldPolicy, serializeShieldPolicy } from "../shiel
 import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
 import { Profile } from "../types";
 import { makeFakeSshBin, withFakeSshOnPath } from "./testUtil/fakeSsh";
+import { runEvaluatorScript } from "./testUtil/evaluatorShell";
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
@@ -298,24 +299,17 @@ test("Shield's policy is found identically from a linked worktree, end-to-end th
 
 // ---------------- push ----------------
 
-// Windows finding (same family as shieldPrePush.test.ts's/
-// shieldSshTransportEquivalence.test.ts's SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS
-// / SKIP_ALIAS_RESOLUTION_ON_WINDOWS): the release-blocker fix made the
-// evaluator's own `ssh -G` alias-canonicalization call mandatory for every
-// SSH destination, and on windows-latest CI that call does not resolve
-// through this suite's shadowed fake ssh the way it does on
-// ubuntu-latest/macos-latest, so "github-work" reads as unresolved/
-// unchanged rather than "github.com" and the push is (safely) blocked
-// instead of allowed. A test-technique gap, not a Shield defect — it
-// fails CLOSED, and the sibling test right below (expecting BLOCKED for a
-// mismatched owner) passes identically on all three platforms because a
-// blocked verdict never depends on the alias resolving correctly.
-const SKIP_ALIAS_RESOLUTION_ON_WINDOWS =
-  process.platform === "win32"
-    ? "Git-for-Windows' sh does not resolve this suite's shadowed fake ssh for the evaluator's own `ssh -G` alias-canonicalization call. Covered on ubuntu-latest/macos-latest."
-    : false;
-
-test("push through the trusted SSH alias to the approved owner -> exit 0", { skip: SKIP_ALIAS_RESOLUTION_ON_WINDOWS }, async () => {
+// Windows finding, fixed rather than skipped: driving the shell evaluator
+// via a plain `execFile("sh", [SCRIPT_PATH, ...])` (as `runScript` does)
+// spawns a SECOND MSYS process from the shebang, which does not inherit a
+// PATH-shadowed fake ssh the way a Windows-side env var assignment
+// expects. `runEvaluatorScript` (shieldAccountVerificationCrossPlatform.
+// test.ts's proven mechanism, generalized into testUtil/evaluatorShell.ts)
+// instead SOURCES the script inside a shell whose POSIX PATH was set from
+// inside that same shell (via `cygpath -u`), which Git for Windows'
+// bundled `sh` resolves correctly — making this test's expected-ALLOW
+// outcome verifiable identically on all three platforms.
+test("push through the trusted SSH alias to the approved owner -> exit 0", async () => {
   const repo = await makeTempRepo();
   const fakeSshBin = await makeFakeSshBin();
   try {
@@ -325,8 +319,11 @@ test("push through the trusted SSH alias to the approved owner -> exit 0", { ski
     // resolve_canonical_ssh_host) — a fake ssh answering "github.com" for
     // any "-G" query (the shim's default) stands in for a real
     // ~/.ssh/config "Host github-work \ HostName github.com" alias.
-    const env = withFakeSshOnPath(process.env, fakeSshBin);
-    const result = await runScript(repo, ["push", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"], "", env);
+    const result = await runEvaluatorScript(repo, process.env, fakeSshBin, SCRIPT_PATH, [
+      "push",
+      "origin",
+      "git@github-work:AcmeSoftware/acme-frontend.git",
+    ]);
     assert.equal(result.code, 0, result.stderr);
   } finally {
     await cleanup(repo);

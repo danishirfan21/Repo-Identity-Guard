@@ -2379,6 +2379,183 @@ deliberate-bypass class.
 
 ---
 
+### Phase 8, round 3: the canonical endpoint's PORT, IPv6 bracket formatting, and a Windows test-technique/product audit
+
+An independent re-review of round 2 confirmed the canonical-host fix was
+correct, but found the same structural gap still applied one level down:
+the canonical endpoint's **port**.
+
+**The bug.** `ParsedRemote`/`RepoFacts` tracked protocol/host/owner/repo
+but never an explicit SSH URL port (`ssh://git@ssh.github.com:443/...`).
+At enable/repair time, `ShieldManager.buildPolicyForRepo` canonicalized
+the approved destination with `ssh -G <host>` — no `-p` at all — while
+`shield-evaluate.sh`'s hook-time check already correctly asked `ssh -G -p
+443 <host>` whenever the push URL itself carried an explicit port. Those
+are two *different* questions to `ssh -G`, and OpenSSH is not obligated to
+answer them identically: an unchanged, correctly-configured destination
+whose URL happens to carry an explicit port could canonicalize to two
+different ports depending on which side of Shield asked, and a completely
+unchanged remote would report a port MISMATCH.
+
+**The fix.** `ParsedRemote` (`src/services/gitService.ts`) gained `port`
+(set only when the URL itself carries one — the `ssh://` form only; the
+scp-like `host:path` form can never carry a port, since everything after
+the colon is the path) and `sshUser` (defaulting to `"git"`, mirroring
+`shield-evaluate.sh`'s own `SSH_USER` default). `RepoFacts` gained
+`pushRemotePort`/`pushRemoteUser`. `resolveCanonicalSshEndpoint`
+(`src/shield/sshEndpoint.ts`) now takes `port`/`user` options and builds
+the identical `ssh -G [-p <port>] <user>@<host>` invocation
+`resolve_canonical_ssh_route` in `shield-evaluate.sh` already used —
+passing no `-p` at all when the URL carried none (never a guessed
+default), exactly matching hook-time semantics. `ShieldManager.
+canonicalizeDestination` threads these through both call sites (enable/
+repair's `buildPolicyForRepo`, and the explicit health-check's
+`currentPushDestination`), and `ShieldInspectOptions.currentPushDestination`
+gained the matching `port`/`sshUser` fields.
+
+**A related bracket-formatting bug, found by this round's own regression
+tests.** Comparing hostnames for a bracketed IPv6 literal
+(`[2001:db8::1]`) risked treating it as different from its unbracketed
+form (`2001:db8::1`) — the SAME address — if one side of a comparison
+happened to report it bracketed and the other didn't (`new URL(...)
+.hostname` in `parseRemoteUrl` always keeps brackets, for the literal text
+a URL was written with; nothing guarantees a real `ssh -G`'s `hostname`
+line does the same). Fixed with a dedicated `normalizeHost()` (kept 1:1
+across `evaluator.ts`, `manager.ts`, and `shield-evaluate.sh`'s
+`normalize_host()`) that lower-cases AND strips one matching pair of
+enclosing `[...]` brackets before any host comparison — used ONLY for
+host fields, never owner/repo/git-identity, which cannot legitimately
+contain a bracketed IPv6 literal.
+
+**A second, independent shell-only bug this round's own port regression
+tests caught**: `shield-evaluate.sh`'s `URL_PORT` extraction regex
+(`s#^ssh://([^/@]*@)?[^/:]+:([0-9]+)(/.*)?$#\2#`) assumed the host portion
+contains no colons — true for a hostname or IPv4 literal, false for a
+bracketed IPv6 literal, which contains colons by definition. For
+`ssh://git@[2001:db8::1]:2222/acme/repo.git` the whole pattern failed to
+match at all, silently extracting NO port (defaulting to "whatever the
+config says" instead of the URL's own explicit `:2222`). Fixed by
+special-casing a bracketed host the same way the HOST-extraction case
+statement immediately above it already does, extracting the port from
+after the closing `]:` instead of assuming no colons precede it.
+
+**Required regression coverage** (`src/test/shieldSshPortCanonicalization
+.test.ts`), all passing with no platform skip:
+- **A**: `enable()` from an explicit-port `ssh://` URL persists that same
+  port as `canonicalPort`.
+- **B/C**: an unchanged explicit-port destination confirms; a port that
+  genuinely changes (443→22 or 22→443) blocks, at the pure-evaluator
+  level (`evaluatePush`/`destinationReasons`).
+- **D**: no URL port, but the alias's effective `ssh` config specifies a
+  non-default port — `enable()` (via dependency-injected resolver) and
+  the real shipped hook (via the cross-platform evaluator-shell harness)
+  resolve to, and agree on, the SAME config-driven port.
+- **E**: an explicit URL port overrides the alias's config default,
+  identically on both sides — and a sibling assertion proves omitting the
+  explicit port genuinely changes the outcome (rather than port being
+  silently ignored).
+- **F**: an explicit non-default SSH username in the URL reaches the
+  resolver on the enable-time side, and `parseRemoteUrl` extracts it
+  correctly on the hook-time side.
+- **G**: `parseRemoteUrl`'s port/user extraction, and the real shell
+  evaluator's `URL_PORT` extraction, agree for IPv4, hostname, and IPv6
+  (bracketed) forms, each with and without an explicit port.
+
+**Windows test-methodology fix, not just a skip audit.** A prior pass at
+this round mechanically converted 13 Windows-only test failures (caused
+by the round-2 fix making canonical `ssh -G` resolution mandatory for
+every SSH push, not only Phase 5 account verification) into `skip`s. A
+follow-up re-review correctly rejected that as insufficient: fail-closed
+behavior on Windows is not evidence that the expected-ALLOW behavior
+*works* there. Each case was reclassified and fixed instead of skipped:
+
+- **Cases solvable by driving the evaluator directly** (not `git push`'s
+  own real transport): `shieldEvaluatorScript.test.ts`'s aliased-push
+  test and all 6 of `shieldSshTransportEquivalence.test.ts`'s affected
+  tests now run through `runEvaluatorScript`
+  (`src/test/testUtil/evaluatorShell.ts`) — the proven mechanism from
+  `shieldAccountVerificationCrossPlatform.test.ts` (Phase 3 Windows-skip
+  reduction), generalized into a shared module: source
+  `shield-evaluate.sh` inside a shell whose POSIX PATH was set from
+  *inside that same shell* (via `cygpath -u` on Windows), rather than
+  executing the script via its shebang (which starts a second MSYS
+  process that does not inherit a Windows-side PATH assignment the same
+  way). No platform skip remains in either file.
+- **Cases solvable at the manager level with dependency isolation**:
+  `shieldCoexistenceAndIntegrity.test.ts`'s case-F canonical health-check
+  test drove `ShieldManager`'s own direct `execFile("ssh", ...)` call,
+  which PATH-shadowing cannot intercept identically across platforms
+  (Windows process spawning does not resolve a shadowed fake `ssh` the
+  same way a POSIX shell does). Fixed by adding `ShieldEnableInput.
+  sshResolver`/`ShieldInspectOptions.sshResolver` — test-only dependency
+  injection for the canonical resolution step, defaulting to the real
+  `ssh -G` call in production, never settable by a user or config. The
+  test now injects a deterministic in-process resolver instead of a
+  shadowed subprocess, and passes identically on all three platforms.
+- **The two IPv6 IPv6-bracket corpus entries** in
+  `shieldRemoteUrlDifferential.test.ts` that a prior pass had excluded
+  from Windows comparison were root-caused (the bracket-formatting bug
+  above) and fixed rather than excluded — no corpus entry is skipped on
+  any platform.
+- **Remaining, unavoidable skips** (pre-existing, from before this round):
+  every test in `shieldPrePush.test.ts`, `shieldGitHubAccountBinding.test.ts`,
+  and `shieldHardeningMatrix.test.ts` marked `SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS`
+  drives a REAL `git push` over a REAL (faked) SSH transport — that
+  requires *Git's own* subprocess spawning to route through a
+  PATH-shadowed fake `ssh`, which Git for Windows genuinely does not do
+  (it does not resolve its SSH transport through the caller's PATH at
+  all). This is Git's behavior, not a gap Shield's own code can route
+  around, and it is category C in the sense the round-3 re-review defined
+  it: a platform skip may legitimately remain, PROVIDED the underlying
+  Shield behavior has independent Windows coverage elsewhere. It does —
+  `shieldAccountVerificationCrossPlatform.test.ts` (account verification)
+  and this round's evaluator-shell-driven tests above (destination
+  canonicalization, including host/port) exercise the identical
+  decision logic without needing Git's own transport to cooperate.
+
+**Windows product-compatibility audit (not just tests).** Reviewed
+whether Shield's own production architecture — not merely this test
+suite — can silently approve a destination under one SSH implementation
+and then enforce against a different effective configuration on a real
+Windows machine. The two `ssh -G` calls that matter run in genuinely
+different processes:
+
+- `ShieldManager`'s enable/repair-time canonicalization runs `execFile
+  ("ssh", ...)` directly from the VS Code extension host — a native
+  Windows Node.js process, resolving `ssh` via the ordinary Windows
+  `PATH`/`PATHEXT` search. Depending on what's installed and in what PATH
+  order, this can resolve to Windows' own built-in OpenSSH client
+  (`C:\Windows\System32\OpenSSH\ssh.exe`) or to Git for Windows' bundled
+  one, if its directories were added to the user's PATH.
+- The shipped hook's `ssh -G`/`ssh -T` calls run inside Git for Windows'
+  bundled MSYS `sh`, spawned by `git.exe` itself — and MSYS shells are
+  documented to prioritize their OWN bundled `usr/bin` tools ahead of
+  whatever the outer Windows PATH says, so the hook very plausibly always
+  resolves Git's own bundled `ssh.exe`, regardless of what Node resolved.
+
+These CAN be different binaries, and in principle could read different
+`~/.ssh/config` files (MSYS's `$HOME` is not guaranteed to equal Windows'
+`%USERPROFILE%`). This is a real environmental inconsistency risk on
+Windows specifically — but it is NOT a security hole, by construction:
+Shield's push-destination check requires the CURRENT canonical resolution
+to EXACTLY match the PERSISTED approved one, or it fails closed. Any
+divergence between what enable-time Node resolved and what hook-time MSYS
+resolves — whether from a genuine `~/.ssh/config` repoint (the attack
+round 2 exists to catch) or merely from two different SSH clients
+disagreeing about an unchanged config — collapses to the same fail-closed
+outcome: a blocked push, never a silently-approved wrong destination.
+The only user-facing consequence of this Windows-specific risk is
+possible over-blocking (a "destination changed" report for a destination
+that didn't), never under-blocking. Documented as a standing manual
+Windows checklist item in `TESTING.md` ("Two SSH clients installed on
+Windows") rather than papered over with a heuristic guess at which SSH
+client a user has, since Shield has no reliable way to detect this
+automatically without executing configuration it does not control (the
+same reason `GIT_SSH_COMMAND`/`core.sshCommand` are never executed to
+"discover" what they do).
+
+---
+
 ## Phase 9: Git hook mechanism research (findings only — nothing migrated)
 
 Both investigations below were run against **git version 2.43.0**, the Git

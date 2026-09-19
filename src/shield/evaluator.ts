@@ -43,6 +43,25 @@ function normalize(value: string | undefined): string {
   return (value ?? "").trim().toLocaleLowerCase();
 }
 
+/**
+ * Same as `normalize()`, but ALSO strips one matching pair of enclosing
+ * `[...]` brackets first — `[2001:db8::1]` and `2001:db8::1` name the SAME
+ * IPv6 address, and different `ssh` implementations/versions are not
+ * guaranteed to report `ssh -G`'s `hostname` line with brackets one way or
+ * the other (`new URL(...).hostname` in `parseRemoteUrl` always keeps
+ * them, for the LITERAL host a URL was written with). Comparing host
+ * strings without this normalization risks the exact bug this function
+ * exists to prevent, in reverse: an UNCHANGED destination reading as
+ * "changed" purely because of a bracket-formatting difference between two
+ * resolutions of the same address, not because the endpoint moved. Used
+ * ONLY for host comparisons — never for owner/repo/git-identity fields,
+ * which cannot legitimately contain a bracketed IPv6 literal.
+ */
+function normalizeHost(value: string | undefined): string {
+  const trimmed = (value ?? "").trim().toLocaleLowerCase();
+  return trimmed.length > 2 && trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
+}
+
 // ==================== commit ====================
 
 export interface CommitEvalFacts {
@@ -423,7 +442,7 @@ function destinationReasons(
   // must have been independently resolved (by the caller, outside this
   // pure module) to the SAME host the approval names — never assumed from
   // an alias's name alone.
-  const normalizedCanonicalApprovedHost = approved.canonicalHost ? normalize(approved.canonicalHost) : undefined;
+  const normalizedCanonicalApprovedHost = approved.canonicalHost ? normalizeHost(approved.canonicalHost) : undefined;
 
   let hostMatches = false;
   let portMatches = true;
@@ -436,9 +455,9 @@ function destinationReasons(
       // IS the canonical host, and approved.canonicalHost was set to it
       // verbatim at approval time. Comparing the CURRENT literal host
       // against it here is a canonical comparison, not a bypass of one.
-      hostMatches = !!host && normalize(host) === normalizedCanonicalApprovedHost;
+      hostMatches = !!host && normalizeHost(host) === normalizedCanonicalApprovedHost;
     } else if (!!resolvedHost) {
-      hostMatches = normalize(resolvedHost) === normalizedCanonicalApprovedHost;
+      hostMatches = normalizeHost(resolvedHost) === normalizedCanonicalApprovedHost;
       if (hostMatches && !!approved.canonicalPort && !!resolvedPort && approved.canonicalPort !== resolvedPort) {
         // Same canonical host, different effective port — a different
         // physical endpoint even when the hostname matches (e.g. a

@@ -174,9 +174,13 @@ A separate "Other Notes" section below the checklist shows info notes
 4. Toggle "Require identity to be locked locally" and "Include pinned
    memory note in Copy Context for AI"; confirm both persist to
    `settings.json` and trigger a rescan.
-5. Confirm the "Shield Mode" card is a plain note pointing at the Command
-   Palette — no checkbox, no toggle, and no "coming soon"/"not built yet"
-   wording (Shield Mode is implemented and enforcing).
+5. Confirm the "Shield" card shows the current lifecycle badge (OFF /
+   ACTIVE / DEGRADED / BROKEN / UNAVAILABLE) and an "Open Shield" button
+   that navigates to Shield's own sidebar screen (Enable/Disable/Repair/
+   Check Health there) — no "coming soon"/"not built yet" wording, and no
+   claim that Shield's only controls are the Command Palette (the
+   equivalent Command Palette commands still exist and call the same code
+   paths, but are not the only way in).
 
 ### Refresh behavior
 
@@ -289,7 +293,7 @@ independently enforced on GitHub, not only self-reported.
 | High contrast | Switch to a high-contrast theme. | Borders and focus outlines remain visible; badges and the verdict banner stay legible. |
 | Narrow widths | Resize the sidebar to roughly 240px, 280px, 320px, and 360px. | No horizontal scrollbar/overflow at any width; the verdict, next action, and primary buttons stay usable; long repo/profile/branch names truncate rather than overflow; secondary text wraps instead of clipping illegibly. |
 
-## Extension Host / manual beta matrix
+## Extension Host / manual test matrix
 
 The automated suite only covers pure logic (`core/`, most of `services/`)
 — `extension.ts`, `statusBar.ts`, and the webview itself need a real
@@ -336,9 +340,11 @@ to use there:
 | Executable bit on NTFS | After "Enable Shield" on Windows, inspect the hook files' permissions. | Git for Windows' own `sh.exe` shim mechanism runs the hook regardless of NTFS's lack of a real POSIX executable bit — confirm the hook actually fires (it does not silently no-op) rather than assuming Unix permission semantics apply. |
 | `core.hooksPath` / worktree scenarios on Windows | Repeat a couple of `shieldGitTopology.test.ts`/`shieldCoexistenceAndIntegrity.test.ts` scenarios (a linked worktree, a worktree-scoped `core.hooksPath`) by hand on Windows. | Same behavior as the automated Linux/macOS runs — this is a spot-check that Windows path handling (drive letters, backslashes in `git rev-parse --path-format=absolute` output) doesn't quietly break hook resolution. |
 | Merge commit and cherry-pick on Windows | Reproduce the Phase 7 merge-commit fix (`pre-merge-commit`) and the documented clean-cherry-pick gap by hand. | Same results as the automated suite: a mismatched-identity merge is blocked; a clean cherry-pick is not (documented gap, not a Windows-specific difference). |
+| Two SSH clients installed on Windows | With BOTH Windows' built-in OpenSSH (`C:\Windows\System32\OpenSSH\ssh.exe`) and Git for Windows' bundled one on PATH in some order, enable Shield on an SSH-alias remote, then push. | Either it works normally, or a genuinely-unchanged destination is (safely) reported as changed/degraded — never silently allowed against the wrong resolved endpoint. See docs/SHIELD_MODE.md's "Windows: two SSH resolution paths" section for why this can happen and why it can only fail closed, never open. |
 
 None of the above are automated — Windows CI proves the shell scripts
 execute correctly under Git for Windows' `sh.exe`; it says nothing about
 the Extension Host UI, VS Code's own terminal integration, or a real
-user's day-to-day shell. Treat this table as a pre-beta checklist, not a
-one-time verification.
+user's day-to-day shell. Treat this table as a standing manual checklist
+for future changes to Shield's Windows-facing code, not a one-time
+verification.

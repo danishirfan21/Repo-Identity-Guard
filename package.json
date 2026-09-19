@@ -201,7 +201,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "Read-only repo scanning still runs in untrusted workspaces. Fixing commit identity and running saved commands are blocked until the workspace is trusted."
+      "description": "Read-only repo scanning still runs in untrusted workspaces. Every mutating or executing action — fixing commit identity, running saved commands, and enabling/disabling/repairing Shield Mode (which installs Git hooks) — is blocked until the workspace is trusted."
     }
   },
   "devDependencies": {

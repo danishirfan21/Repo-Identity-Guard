@@ -384,6 +384,8 @@ export function activate(context: vscode.ExtensionContext): void {
               owner: facts.pushRemoteOwner,
               repo: facts.pushRemoteRepo,
               protocol: facts.pushRemoteProtocol,
+              port: facts.pushRemotePort,
+              sshUser: facts.pushRemoteUser,
             },
             // Deliberately NOT set here: this runs on every routine scan
             // (file-watcher events, workspace-folder switches, ...), and a
@@ -882,6 +884,8 @@ export function activate(context: vscode.ExtensionContext): void {
           owner: facts.pushRemoteOwner,
           repo: facts.pushRemoteRepo,
           protocol: facts.pushRemoteProtocol,
+          port: facts.pushRemotePort,
+          sshUser: facts.pushRemoteUser,
         },
         // This IS the explicit, on-demand check: worth a real "ssh -G"
         // call to catch an SSH alias silently repointed since Shield was

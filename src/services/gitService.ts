@@ -380,6 +380,26 @@ export interface ParsedRemote {
   host?: string;
   owner?: string;
   repo?: string;
+  /**
+   * Explicit SSH port, e.g. "443" in `ssh://git@ssh.github.com:443/...` —
+   * set ONLY when the URL itself carries one. Only the `ssh://` URL form
+   * can: in the scp-like `host:path` shape everything after the colon is
+   * the PATH, never a port (Git's own rule). An absent port here means
+   * "whatever this host/alias's effective ssh config says," never "22" —
+   * canonicalizing without it must ask `ssh -G` with no `-p` at all, the
+   * same way an absent port here means for `git`/the real push transport.
+   * Mirrors shield-evaluate.sh's `URL_PORT`; kept 1:1 by
+   * shieldRemoteUrlDifferential.test.ts.
+   */
+  port?: string;
+  /**
+   * The SSH connection user, e.g. "git" in `git@github-work:owner/repo.git`
+   * — defaults to "git" (GitHub's own convention) when the URL/alias
+   * doesn't specify one, since an SSH alias commonly sets `User git`
+   * itself. Only set for `protocol === "ssh"`. Mirrors shield-evaluate.sh's
+   * `SSH_USER`; kept 1:1 by shieldRemoteUrlDifferential.test.ts.
+   */
+  sshUser?: string;
 }
 
 /**
@@ -402,19 +422,29 @@ export function parseRemoteUrl(remoteUrl: string): ParsedRemote {
       const segments = parsed.pathname.replace(/^\/+|\/+$/g, "").split("/");
       const repo = segments.pop()?.replace(/\.git$/i, "");
       const owner = segments.pop();
-      return { protocol, host: parsed.hostname, owner, repo };
+      if (protocol !== "ssh") {
+        return { protocol, host: parsed.hostname, owner, repo };
+      }
+      return {
+        protocol,
+        host: parsed.hostname,
+        owner,
+        repo,
+        port: parsed.port || undefined,
+        sshUser: parsed.username || "git",
+      };
     } catch {
       return { protocol: "unknown" };
     }
   }
 
-  const scpLike = trimmed.match(/^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/);
+  const scpLike = trimmed.match(/^(?:([^@/\s]+)@)?([^:/\s]+):(.+)$/);
   if (scpLike) {
-    const host = scpLike[1];
-    const segments = scpLike[2].replace(/^\/+|\/+$/g, "").split("/");
+    const host = scpLike[2];
+    const segments = scpLike[3].replace(/^\/+|\/+$/g, "").split("/");
     const repo = segments.pop()?.replace(/\.git$/i, "");
     const owner = segments.pop();
-    return { protocol: "ssh", host, owner, repo };
+    return { protocol: "ssh", host, owner, repo, sshUser: scpLike[1] || "git" };
   }
 
   return { protocol: "unknown" };
@@ -526,6 +556,8 @@ export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFac
       pushRemoteHost: parsedPushRemote?.host,
       pushRemoteOwner: parsedPushRemote?.owner,
       pushRemoteRepo: parsedPushRemote?.repo,
+      pushRemotePort: parsedPushRemote?.port,
+      pushRemoteUser: parsedPushRemote?.sshUser,
 
       upstreamRemoteUrl: upstreamUrl ?? undefined,
       upstreamHost: parsedUpstream?.host,

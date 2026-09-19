@@ -1,13 +1,16 @@
 /**
  * Settings — Profiles (chip-based owners/exact-repos/branch patterns editor,
  * "Detect from current repo" prefill), Local Branch Policy, Safety
- * Preferences, and a short, plain Shield Mode note.
+ * Preferences, and a Shield summary card.
  *
  * Shield Mode is real and enforcing as of Phase 4+ (see docs/SHIELD_MODE.md
- * and src/shield/). Its controls live in the Command Palette ("Repo
- * Identity Guard: Enable/Disable/Repair Shield", "Check Shield Health") —
- * deliberately NOT a sidebar dashboard yet, which is what the note here
- * says, in those words, instead of the old and now-false "Coming soon".
+ * and src/shield/) and has its own dedicated sidebar screen (OFF / ACTIVE /
+ * DEGRADED / BROKEN / UNAVAILABLE — see shieldView.ts) reached from this
+ * card's "Open Shield" button, which shows the live lifecycle badge and
+ * surfaces Enable/Disable/Repair/Check Health there. The equivalent Command
+ * Palette commands ("Repo Identity Guard: Enable/Disable/Repair Shield",
+ * "Check Shield Health") still exist and call the exact same code paths —
+ * the sidebar is not a separate implementation.
  *
  * "Detect from current repo" only ever prefills form fields from facts the
  * engine already collected this scan (repo owner, effective identity) — it
