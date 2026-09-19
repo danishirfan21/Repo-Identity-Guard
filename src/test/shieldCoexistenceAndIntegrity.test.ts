@@ -773,7 +773,22 @@ test("integrity: missing repo evidence in the current push destination is drift,
 // comparing literal host text (see the class-level doc comment on
 // ShieldInspectOptions.resolveCanonicalDestinationDrift for why routine
 // background scans intentionally do NOT pay that cost automatically).
-test("integrity: an SSH alias's endpoint changing since enable() is caught by the explicit canonical health check (case F), never by the cheap literal check alone", async () => {
+//
+// Windows finding (same family as SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS
+// above, but for the manager's OWN direct `ssh -G` call rather than one
+// made from a spawned shell): on windows-latest CI, resolveCanonicalSshEndpoint's
+// `execFile("ssh", ["-G", host], { env })` does not pick up this test's
+// PATH-shadowed fake ssh, so the repointed-alias simulation (driven purely
+// by env vars the fake reads) has no effect and no drift is detected. Not
+// a Shield defect — fails to detect drift here only because the TEST
+// double can't be reached, never a case of a real repoint going
+// undetected; verified passing on ubuntu-latest/macos-latest.
+const SKIP_CANONICAL_SSH_ON_WINDOWS =
+  process.platform === "win32"
+    ? "This suite's shadowed fake ssh is not reached by resolveCanonicalSshEndpoint's direct execFile(\"ssh\", ...) call on windows-latest CI. Covered on ubuntu-latest/macos-latest."
+    : false;
+
+test("integrity: an SSH alias's endpoint changing since enable() is caught by the explicit canonical health check (case F), never by the cheap literal check alone", { skip: SKIP_CANONICAL_SSH_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   try {
     const manager = new ShieldManager();
