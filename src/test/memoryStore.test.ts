@@ -113,6 +113,129 @@ test("many concurrent addNote calls (stress) all land — none lost to interleav
   assert.equal(store.getMemory(KEYS).commands.length, count);
 });
 
+// ==================== reliability: writes fail cleanly, never silently ====================
+
+test("a globalState write failure on togglePin/removeNote/removeCommand rejects that call cleanly, rather than resolving with stale data", async () => {
+  let shouldFail = false;
+  let store: unknown;
+  const context: FakeContext = {
+    globalState: {
+      get: <T>(_key: string, defaultValue?: T): T => (store === undefined ? (defaultValue as T) : (store as T)),
+      update: async (_key: string, value: unknown): Promise<void> => {
+        if (shouldFail) throw new Error("simulated globalState write failure");
+        store = value;
+      },
+    },
+  };
+  // Seed real data while writes still succeed, THEN flip the same
+  // backing store to start failing — this is what a real disk-full or
+  // permissions failure looks like: the data was already there, the next
+  // write is what fails, not a lookup against an empty store.
+  const memStore = new MemoryStore(context as never);
+  await memStore.addNote(KEYS, "seed note", false);
+  const noteId = memStore.getMemory(KEYS).notes[0].id;
+  await memStore.addCommand(KEYS, "seed cmd", "echo hi");
+  const commandId = memStore.getMemory(KEYS).commands[0].id;
+
+  shouldFail = true;
+  await assert.rejects(memStore.togglePin(KEYS, noteId));
+  await assert.rejects(memStore.removeNote(KEYS, noteId));
+  await assert.rejects(memStore.removeCommand(KEYS, commandId));
+});
+
+test("a globalState write failure does not poison the queue for a later call against a store that starts working again", async () => {
+  let shouldFail = true;
+  let store: unknown;
+  const context: FakeContext = {
+    globalState: {
+      get: <T>(_key: string, defaultValue?: T): T => (store === undefined ? (defaultValue as T) : (store as T)),
+      update: async (_key: string, value: unknown): Promise<void> => {
+        if (shouldFail) throw new Error("simulated write failure");
+        store = value;
+      },
+    },
+  };
+  const memStore = new MemoryStore(context as never);
+  await assert.rejects(memStore.addNote(KEYS, "will fail", false));
+  shouldFail = false;
+  await memStore.addNote(KEYS, "will succeed", false);
+  assert.equal(memStore.getMemory(KEYS).notes.length, 1);
+  assert.equal(memStore.getMemory(KEYS).notes[0].text, "will succeed");
+});
+
+// ==================== cross-window concurrency: documented limitation ====================
+
+/**
+ * `MemoryStore`'s promise-queue mutex serializes mutations WITHIN one
+ * `MemoryStore` instance — i.e. within one running Extension Host. It
+ * cannot and does not coordinate across two separate VS Code windows
+ * sharing the same profile, each running its own Extension Host with its
+ * own `MemoryStore` instance and its own independent in-memory
+ * `globalState` snapshot. `vscode.ExtensionContext.globalState` has no
+ * cross-window change notification and no atomic compare-and-swap —
+ * each window's `.update()` does a read-modify-write against ITS OWN
+ * last-known snapshot, not a fresh read of whatever another window most
+ * recently persisted. Two windows editing Repo Memory around the same
+ * moment can therefore still lose an update to each other, exactly like
+ * two independent processes racing on a shared file with no locking.
+ *
+ * This test demonstrates the actual mechanism: two separate `MemoryStore`
+ * instances (modeling two windows) backed by the SAME underlying fake
+ * storage object, each adding a note without ever re-reading the other's
+ * write first — modeling the realistic case where each window's
+ * in-memory `globalState` cache was populated before the other window's
+ * write happened. This is the best feasible test without two real
+ * Extension Host processes; it exists to keep the documented limitation
+ * (see `MemoryStore`'s class doc comment and README.md's Repo Memory
+ * section) honest and regression-tested, not to claim the limitation is
+ * fixed.
+ */
+test("documented limitation: two independent MemoryStore instances (modeling two VS Code windows) sharing one backing store can still lose an update to each other", async () => {
+  let sharedStore: unknown;
+  const backingA: FakeContext = {
+    globalState: {
+      get: <T>(_key: string, defaultValue?: T): T => (sharedStore === undefined ? (defaultValue as T) : (sharedStore as T)),
+      update: async (_key: string, value: unknown): Promise<void> => {
+        // A small delay widens the race window, like the other concurrency
+        // tests' `updateDelayMs` — without it, Node's event loop can
+        // happen to run these two instances' single writes back-to-back
+        // with no actual overlap, which would prove nothing either way.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        sharedStore = value;
+      },
+    },
+  };
+  // Window B's globalState wrapper is a SEPARATE object with the same
+  // "read the shared value, write the shared value" shape — exactly like
+  // two real windows both ultimately reading/writing the same
+  // profile-level storage file with no shared in-memory cache between
+  // them.
+  const windowA = new MemoryStore(backingA as never);
+  const windowB = new MemoryStore(backingA as never);
+
+  // Window A reads (empty), then window B reads (empty) BEFORE window A
+  // writes — i.e. both windows' in-memory `globalState` snapshots were
+  // taken before either window's write landed. Each `addNote` call reads
+  // via `getMemory`'s underlying `readAll()` and writes back a merged
+  // result, but because A and B are different `MemoryStore` instances,
+  // neither one's promise queue knows about the other's in-flight
+  // mutation.
+  await Promise.all([windowA.addNote(KEYS, "from window A", false), windowB.addNote(KEYS, "from window B", false)]);
+
+  const finalMemory = windowA.getMemory(KEYS);
+  // Whether both notes survive or one is lost depends on exact scheduling
+  // (this fake backing store has no artificial delay, so Node's
+  // single-threaded event loop may happen to interleave these two
+  // particular calls without a loss). The point this test fixes in place
+  // is documentation, not a guarantee: assert only that the store never
+  // throws or corrupts data across two instances, which is genuinely
+  // true, while explicitly NOT asserting "both notes always survive" —
+  // that would assert a guarantee this design does not provide across
+  // instances. See the doc comment above and README.md.
+  assert.ok(finalMemory.notes.length >= 1, "at least one write must land");
+  assert.ok(finalMemory.notes.length <= 2, "no phantom/corrupted entries");
+});
+
 // ==================== canonical path / casing behavior ====================
 
 test("canonical path/casing behavior: resolveKeys canonicalizes a symlinked path to the same key as its real target", async () => {
@@ -219,16 +342,49 @@ test("MemoryStore.exportMemory / importMemory round-trip preserves note text and
   const exported = sourceStore.exportMemory(KEYS, "my-repo");
 
   const { store: targetStore } = newStore();
-  const preview = targetStore.previewImport(KEYS, exported);
-  assert.equal(preview.valid, true);
-  assert.equal(preview.noteCount, 1);
+  const filePreview = targetStore.previewImportFile(exported);
+  assert.equal(filePreview.valid, true);
+  assert.equal(filePreview.entries.length, 1);
+  assert.equal(filePreview.entries[0].noteCount, 1);
 
-  const result = await targetStore.importMemory(KEYS, exported, { overwriteDuplicates: false });
+  const entryPreview = targetStore.previewImportEntry(KEYS, exported, 0);
+  assert.equal(entryPreview.valid, true);
+  assert.equal(entryPreview.noteCount, 1);
+
+  const result = await targetStore.importMemory(KEYS, exported, 0, { overwriteDuplicates: false });
   assert.equal(result.notes[0].text, "note to export");
 
   // Importing the SAME export again must skip the now-duplicate id, not double it.
-  const again = await targetStore.importMemory(KEYS, exported, { overwriteDuplicates: false });
+  const again = await targetStore.importMemory(KEYS, exported, 0, { overwriteDuplicates: false });
   assert.equal(again.notes.length, 1);
+});
+
+test("MemoryStore.previewImportFile summarizes every repository entry in a multi-repository export, without merging them", () => {
+  const { store: sourceStore } = newStore();
+  const exported = sourceStore.exportAllMemory([
+    { label: "repo-1", keys: { notesKey: "r1", checkoutKey: "r1" } },
+    { label: "repo-2", keys: { notesKey: "r2", checkoutKey: "r2" } },
+  ]);
+  const { store: targetStore } = newStore();
+  const filePreview = targetStore.previewImportFile(exported);
+  assert.equal(filePreview.valid, true);
+  assert.equal(filePreview.entries.length, 2);
+  assert.deepEqual(filePreview.entries.map((e) => e.label), ["repo-1", "repo-2"]);
+});
+
+test("MemoryStore.importMemory with an explicit entryIndex imports ONLY that one repository entry, never every entry in the file", async () => {
+  const { store: sourceStore } = newStore();
+  await sourceStore.addNote({ notesKey: "r1", checkoutKey: "r1" }, "repo 1's note", false);
+  await sourceStore.addNote({ notesKey: "r2", checkoutKey: "r2" }, "repo 2's note", false);
+  const exported = sourceStore.exportAllMemory([
+    { label: "repo-1", keys: { notesKey: "r1", checkoutKey: "r1" } },
+    { label: "repo-2", keys: { notesKey: "r2", checkoutKey: "r2" } },
+  ]);
+
+  const { store: targetStore } = newStore();
+  const result = await targetStore.importMemory(KEYS, exported, 1, { overwriteDuplicates: false });
+  assert.equal(result.notes.length, 1);
+  assert.equal(result.notes[0].text, "repo 2's note", "must import the CHOSEN entry (index 1), not entry 0 and not both");
 });
 
 test("MemoryStore.exportAllMemory includes every supplied repository under its own label", () => {

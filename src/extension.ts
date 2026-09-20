@@ -19,7 +19,7 @@ import {
   saveProtectedBranches,
   saveRequireLocalIdentity,
 } from "./storage/configStore";
-import { MemoryExport, MemoryLimitError, MemoryStore } from "./storage/memoryStore";
+import { MAX_IMPORT_FILE_BYTES, MemoryExport, MemoryLimitError, MemoryStore } from "./storage/memoryStore";
 import { RepoIdentitySidebarProvider, SidebarModel } from "./ui/SidebarProvider";
 import { IdentityStatusBar } from "./statusBar";
 import { Profile, RepoFacts, RepositorySafetyState, StatusSummary, WorkspaceSafetyState, emptyRepoMemory } from "./types";
@@ -113,67 +113,85 @@ export function activate(context: vscode.ExtensionContext): void {
 
     addMemoryNote: async (text, pinned) => {
       const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust())) return;
+      if (!repoRoot) return { ok: false, error: "Open a Git repository first." };
+      if (!(await requireWorkspaceTrust("add a note"))) return { ok: false, error: "This workspace isn't trusted." };
       try {
         await memoryStore.addNote(getMemoryKeys(repoRoot), text, pinned);
       } catch (error) {
         await showMemoryError(error);
-        return;
+        return { ok: false, error: memoryErrorMessage(error) };
       }
       refreshSidebar();
+      return { ok: true };
     },
     updateMemoryNote: async (id, text) => {
       const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust())) return;
+      if (!repoRoot) return { ok: false, error: "Open a Git repository first." };
+      if (!(await requireWorkspaceTrust("edit this note"))) return { ok: false, error: "This workspace isn't trusted." };
       try {
         await memoryStore.updateNote(getMemoryKeys(repoRoot), id, text);
       } catch (error) {
         await showMemoryError(error);
-        return;
+        return { ok: false, error: memoryErrorMessage(error) };
       }
       refreshSidebar();
+      return { ok: true };
     },
     removeMemoryNote: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust())) return;
+      if (!(await requireWorkspaceTrust("delete this note"))) return;
       if (!(await confirmDelete("note"))) return;
-      await memoryStore.removeNote(getMemoryKeys(repoRoot), id);
+      try {
+        await memoryStore.removeNote(getMemoryKeys(repoRoot), id);
+      } catch (error) {
+        await showMemoryError(error);
+        return;
+      }
       refreshSidebar();
     },
     togglePinMemoryNote: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust())) return;
-      await memoryStore.togglePin(getMemoryKeys(repoRoot), id);
+      if (!(await requireWorkspaceTrust("pin or unpin this note"))) return;
+      try {
+        await memoryStore.togglePin(getMemoryKeys(repoRoot), id);
+      } catch (error) {
+        await showMemoryError(error);
+        return;
+      }
       await scan();
     },
     addSavedCommand: async (label, command) => {
       const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust())) return;
+      if (!repoRoot) return { ok: false, error: "Open a Git repository first." };
+      if (!(await requireWorkspaceTrust("save this command"))) return { ok: false, error: "This workspace isn't trusted." };
       try {
         await memoryStore.addCommand(getMemoryKeys(repoRoot), label, command);
+      } catch (error) {
+        await showMemoryError(error);
+        return { ok: false, error: memoryErrorMessage(error) };
+      }
+      refreshSidebar();
+      return { ok: true };
+    },
+    removeSavedCommand: async (id) => {
+      const repoRoot = requireRepoRoot();
+      if (!repoRoot) return;
+      if (!(await requireWorkspaceTrust("delete this saved command"))) return;
+      if (!(await confirmDelete("saved command"))) return;
+      try {
+        await memoryStore.removeCommand(getMemoryKeys(repoRoot), id);
       } catch (error) {
         await showMemoryError(error);
         return;
       }
       refreshSidebar();
     },
-    removeSavedCommand: async (id) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust())) return;
-      if (!(await confirmDelete("saved command"))) return;
-      await memoryStore.removeCommand(getMemoryKeys(repoRoot), id);
-      refreshSidebar();
-    },
     runSavedCommand: async (id) => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust())) return;
+      if (!(await requireWorkspaceTrust("run this saved command"))) return;
       const saved = memoryStore.getMemory(getMemoryKeys(repoRoot)).commands.find((c) => c.id === id);
       if (saved) runSavedCommand(repoRoot, saved.command);
     },
@@ -214,7 +232,7 @@ export function activate(context: vscode.ExtensionContext): void {
     importMemory: async () => {
       const repoRoot = requireRepoRoot();
       if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust())) return;
+      if (!(await requireWorkspaceTrust("import Repo Memory"))) return;
 
       const uris = await vscode.window.showOpenDialog({
         canSelectMany: false,
@@ -225,6 +243,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
       let raw: unknown;
       try {
+        const stat = await vscode.workspace.fs.stat(uris[0]);
+        if (stat.size > MAX_IMPORT_FILE_BYTES) {
+          await vscode.window.showErrorMessage(
+            `That file is ${(stat.size / (1024 * 1024)).toFixed(1)} MB, larger than the ${(MAX_IMPORT_FILE_BYTES / (1024 * 1024)).toFixed(0)} MB Repo Memory import supports. A real export never gets this large — this is likely the wrong file.`,
+          );
+          return;
+        }
         const bytes = await vscode.workspace.fs.readFile(uris[0]);
         raw = JSON.parse(Buffer.from(bytes).toString("utf8"));
       } catch {
@@ -232,8 +257,37 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
+      const filePreview = memoryStore.previewImportFile(raw);
+      if (!filePreview.valid) {
+        await vscode.window.showErrorMessage(filePreview.error ?? "This file isn't a valid Repo Memory export.");
+        return;
+      }
+
+      // A multi-repository export (e.g. from "Export all") is never
+      // silently merged together into whichever repo happens to be open
+      // — that would be a poor, surprising default for a feature labelled
+      // Backup/Export all. Exactly one entry imports directly; more than
+      // one always asks which source repository to bring in, showing
+      // enough (label, note count, command count) to tell them apart.
+      let entryIndex = 0;
+      if (filePreview.entries.length > 1) {
+        const picked = await vscode.window.showQuickPick(
+          filePreview.entries.map((entry) => ({
+            label: entry.label,
+            description: `${entry.noteCount} note${entry.noteCount === 1 ? "" : "s"}, ${entry.commandCount} command${entry.commandCount === 1 ? "" : "s"}`,
+            entryIndex: entry.index,
+          })),
+          {
+            title: "Import Repo Memory",
+            placeHolder: "This file has memory from more than one repository. Which one do you want to import into the currently open repository?",
+          },
+        );
+        if (!picked) return;
+        entryIndex = picked.entryIndex;
+      }
+
       const keys = getMemoryKeys(repoRoot);
-      const preview = memoryStore.previewImport(keys, raw);
+      const preview = memoryStore.previewImportEntry(keys, raw, entryIndex);
       if (!preview.valid) {
         await vscode.window.showErrorMessage(preview.error ?? "This file isn't a valid Repo Memory export.");
         return;
@@ -241,7 +295,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
       const duplicateCount = preview.duplicateNoteIds.length + preview.duplicateCommandIds.length;
       const summaryLines = [
-        `This will import ${preview.noteCount} note(s) and ${preview.commandCount} saved command(s) from ${preview.repositoryCount} repositor${preview.repositoryCount === 1 ? "y" : "ies"} in the file into the currently open repository.`,
+        `This will import ${preview.noteCount} note(s) and ${preview.commandCount} saved command(s) into the currently open repository.`,
         "Saved commands are imported as inert data only and are never run automatically.",
       ];
       if (duplicateCount > 0) {
@@ -253,7 +307,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!choice) return;
 
       try {
-        await memoryStore.importMemory(keys, raw, { overwriteDuplicates: choice === "Import and overwrite duplicates" });
+        await memoryStore.importMemory(keys, raw, entryIndex, { overwriteDuplicates: choice === "Import and overwrite duplicates" });
       } catch (error) {
         await showMemoryError(error);
         return;
@@ -327,11 +381,20 @@ export function activate(context: vscode.ExtensionContext): void {
     return latestSummary.facts.repoRoot;
   }
 
-  /** Blocks mutating/executing actions when Workspace Trust is off, with a clear reason. */
-  async function requireWorkspaceTrust(): Promise<boolean> {
+  /**
+   * Blocks mutating/executing actions when Workspace Trust is off, with a
+   * clear reason. `action`, when given, names the SPECIFIC thing that was
+   * just attempted (e.g. "add a note", "run this saved command") so the
+   * warning matches what the user actually clicked instead of always
+   * saying the same generic "run commands or change Git identity" line —
+   * that line was accurate for Fix Commit Identity and Shield, but wrong
+   * for e.g. deleting a note, which changes neither.
+   */
+  async function requireWorkspaceTrust(action?: string): Promise<boolean> {
     if (vscode.workspace.isTrusted) return true;
+    const what = action ?? "run commands or change Git identity here";
     await vscode.window.showWarningMessage(
-      "This workspace isn't trusted, so Repo Identity Guard won't run commands or change Git identity here. Enable Workspace Trust first.",
+      `This workspace isn't trusted, so Repo Identity Guard won't ${what}. Enable Workspace Trust first.`,
     );
     return false;
   }
@@ -350,11 +413,22 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   /** `MemoryLimitError` carries a message meant to be read as-is (empty text, over a length/count limit); anything else is an unexpected failure that shouldn't leak internals into a user-facing toast. */
-  async function showMemoryError(error: unknown): Promise<void> {
-    const message = error instanceof MemoryLimitError ? error.message : "Something went wrong saving to Repo Memory.";
-    await vscode.window.showWarningMessage(message);
+  function memoryErrorMessage(error: unknown): string {
+    return error instanceof MemoryLimitError ? error.message : "Something went wrong saving to Repo Memory.";
   }
 
+  async function showMemoryError(error: unknown): Promise<void> {
+    await vscode.window.showWarningMessage(memoryErrorMessage(error));
+  }
+
+  /**
+   * Writing the export file (a disk I/O call, same as any other) can fail
+   * — a full disk, a permissions error, a path that vanished between
+   * picking the save dialog and the write. That must surface as a clear,
+   * user-facing error rather than an unhandled rejected promise; nothing
+   * about the extension's own in-memory state changes either way, since
+   * exporting never mutates Repo Memory.
+   */
   async function writeMemoryExportToDisk(data: MemoryExport, defaultFileName: string): Promise<void> {
     const uri = await vscode.window.showSaveDialog({
       defaultUri: vscode.Uri.file(defaultFileName),
@@ -362,7 +436,12 @@ export function activate(context: vscode.ExtensionContext): void {
       title: "Export Repo Memory",
     });
     if (!uri) return;
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(data, null, 2), "utf8"));
+    try {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(data, null, 2), "utf8"));
+    } catch (error) {
+      await vscode.window.showErrorMessage(`Could not write the export file: ${getErrorMessage(error)}`);
+      return;
+    }
     await vscode.window.showInformationMessage(`Exported Repo Memory to ${uri.fsPath}`);
   }
 

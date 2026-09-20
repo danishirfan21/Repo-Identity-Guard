@@ -408,25 +408,61 @@ a Markdown knowledge base, not a task manager, and not synced anywhere.
   confirmation first; pinning/unpinning never does, since it's harmless and
   instantly reversible.
 - **Limits.** Notes and saved commands have generous but real size/count
-  ceilings meant for genuine development notes, not unlimited free-form
-  storage — an over-limit add or edit is rejected with a clear message,
-  never silently truncated.
+  ceilings (4,000 characters per note, 200 notes per repository; 200
+  characters / 2,000 characters / 200 saved commands per checkout) meant
+  for genuine development notes, not unlimited free-form storage — a new
+  add or edit that would go over a limit is rejected outright with a
+  clear message, never silently truncated. These limits apply only to
+  NEW adds and edits: a note or repository that already had more text or
+  more entries than these limits before they existed keeps every
+  character and every entry exactly as it was — nothing is retroactively
+  trimmed. Saving an over-limit note unchanged (e.g. just opening and
+  closing its editor) is always a harmless no-op; shrinking it back under
+  the limit is a normal edit.
 - **Export / Import.** Export writes the current repository's memory (or,
   from the same menu, every detected repository's memory) to a JSON file
-  you choose the location for. Import reads a JSON file back in: it always
-  validates the file and shows what it's about to do (how many notes/
-  commands, from how many repositories) before touching anything, and it
-  never overwrites an existing note or command with the same id unless you
-  explicitly choose to. A saved command coming from an import is inert data
-  like any other field — it is never executed automatically.
+  you choose the location for. Import reads a JSON file back in and always
+  validates it first. If the file holds more than one repository's memory
+  (an "Export all" file), Import asks you which ONE of those repositories
+  to bring into the repository you currently have open — it never merges
+  every repository in the file together automatically. Either way, Import
+  then shows exactly what it's about to do (how many notes/commands,
+  which ones already exist here) before touching anything, and never
+  overwrites an existing note or command sharing an id unless you
+  explicitly choose to; overwriting keeps this repository's own pinned
+  decision rather than letting the import silently change it. An import
+  containing a note/command over today's size limits is rejected outright
+  with a clear message — never truncated to fit — and importing more
+  entries than this repository's count limit allows is rejected the same
+  way, changing nothing. A saved command coming from an import is inert
+  data like any other field — it is never executed automatically.
+- **Unsaved drafts.** A note you're typing or editing survives an
+  unrelated background refresh (a file save, a branch switch, a routine
+  rescan) without being wiped — it's only cleared once the extension has
+  actually confirmed the save succeeded. If a save is rejected (e.g. over
+  a length limit), your text and the open editor stay exactly as you left
+  them so nothing you typed is lost.
+- **Two windows, one profile.** Repo Memory's per-save-safety guarantees
+  hold within a single VS Code window. If you have the *same* VS Code
+  profile open in two windows at once and edit Repo Memory in both around
+  the same moment, the version saved last can still overwrite the other —
+  this is a limitation of `ExtensionContext.globalState`, the storage API
+  VS Code extensions are given, which has no cross-window change
+  notification or atomic compare-and-swap. Editing the same repository's
+  memory from two windows at once isn't a supported workflow; if you do,
+  treat Export as your safety net.
 
 ## Workspace Trust
 
 Read-only scanning still runs in an untrusted workspace — you'll see an
 honest NOT SAFE with "Workspace is not trusted" rather than nothing at all.
-But **Fix Commit Identity** and running a saved command are both blocked
-until the workspace is trusted, since both execute something in that
-folder.
+Viewing, searching, and exporting Repo Memory all keep working too, since
+none of them change anything. But adding, editing, deleting, or pinning a
+note; adding, deleting, or running a saved command; and importing Repo
+Memory are all blocked until the workspace is trusted, since Repo Identity
+Guard treats a memory mutation the same as any other write or execution in
+that folder. The sidebar disables those specific controls (with a title
+explaining why) rather than letting you click them and then fail.
 
 ## Privacy & Security
 

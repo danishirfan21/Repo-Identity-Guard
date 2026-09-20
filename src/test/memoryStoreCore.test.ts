@@ -13,7 +13,8 @@ import {
   getRepoMemory,
   memoryMutations,
   normalizeLoadedMemory,
-  previewMemoryImport,
+  previewMemoryImportEntry,
+  previewMemoryImportFile,
   reconcileStaleKey,
   sanitizeCommandList,
   sanitizeNoteList,
@@ -54,7 +55,7 @@ test("multiline preservation: a note's internal line breaks survive add, sanitiz
   const exported = buildMemoryExport([{ label: "repo-a", memory: getRepoMemory(state, KEYS) }], now);
   assert.equal(exported.repositories[0].notes[0].text, text);
 
-  const imported = applyMemoryImport(emptyPersistedMemory(), KEYS, exported, { overwriteDuplicates: false });
+  const imported = applyMemoryImport(emptyPersistedMemory(), KEYS, exported, 0, { overwriteDuplicates: false });
   assert.equal(getRepoMemory(imported, KEYS).notes[0].text, text);
 });
 
@@ -116,6 +117,69 @@ test("editing over the length limit is rejected, and the ORIGINAL text is left u
   const noteId = getRepoMemory(state, KEYS).notes[0].id;
   assert.throws(() => memoryMutations.updateNote(state, KEYS.notesKey, noteId, "x".repeat(MAX_NOTE_LENGTH + 1), Date.now()), MemoryLimitError);
   assert.equal(getRepoMemory(state, KEYS).notes[0].text, "original");
+});
+
+// ==================== release blocker: grandfathered data is never truncated ====================
+
+test("release blocker: a legacy note already over MAX_NOTE_LENGTH survives migration with EVERY character intact, never truncated", () => {
+  const legacyText = "x".repeat(6000);
+  const legacy = { "/repo/legacy": { notes: [{ id: "n1", text: legacyText, pinned: false, createdAt: 1 }], commands: [] } };
+  const state = normalizeLoadedMemory(legacy);
+  const memory = getRepoMemory(state, { notesKey: "/repo/legacy", checkoutKey: "/repo/legacy" });
+  assert.equal(memory.notes[0].text.length, 6000);
+  assert.equal(memory.notes[0].text, legacyText);
+});
+
+test("release blocker: a legacy repository with 250 notes (more than today's 200-note limit) keeps ALL 250 through migration", () => {
+  const legacyNotes = Array.from({ length: 250 }, (_, i) => ({ id: `n${i}`, text: `legacy note ${i}`, pinned: false, createdAt: i }));
+  const legacy = { "/repo/many-notes": { notes: legacyNotes, commands: [] } };
+  const state = normalizeLoadedMemory(legacy);
+  const memory = getRepoMemory(state, { notesKey: "/repo/many-notes", checkoutKey: "/repo/many-notes" });
+  assert.equal(memory.notes.length, 250, "no migration path may cap a legacy repository's note count to today's limit");
+});
+
+test("release blocker: a legacy saved command already over MAX_COMMAND_LENGTH survives migration intact", () => {
+  const longCommand = "echo " + "y".repeat(3000);
+  const legacy = { "/repo/long-cmd": { notes: [], commands: [{ id: "c1", label: "long", command: longCommand, createdAt: 1 }] } };
+  const state = normalizeLoadedMemory(legacy);
+  const memory = getRepoMemory(state, { notesKey: "/repo/long-cmd", checkoutKey: "/repo/long-cmd" });
+  assert.equal(memory.commands[0].command, longCommand);
+});
+
+test("release blocker: exporting a grandfathered oversized note/repository is lossless, never truncated to fit today's limits", () => {
+  const legacyText = "z".repeat(5000);
+  const legacyNotes = Array.from({ length: 210 }, (_, i) => (i === 0 ? { id: "n0", text: legacyText, pinned: false, createdAt: 0 } : { id: `n${i}`, text: `note ${i}`, pinned: false, createdAt: i }));
+  const state = { version: 2 as const, notesByRepoKey: { "repo-a": legacyNotes }, commandsByCheckoutKey: {} };
+  const exported = buildMemoryExport([{ label: "repo-a", memory: getRepoMemory(state, KEYS) }], Date.now());
+  assert.equal(exported.repositories[0].notes.length, 210, "export must include every grandfathered note, not just the first 200");
+  assert.equal(exported.repositories[0].notes.find((n) => n.id === "n0")!.text, legacyText);
+});
+
+test("release blocker: saving a grandfathered oversized note UNCHANGED (open editor, save with no edits) is a harmless no-op, never rejected merely for existing", () => {
+  const legacyText = "w".repeat(MAX_NOTE_LENGTH + 500);
+  const legacy = { "/repo/oversized": { notes: [{ id: "n1", text: legacyText, pinned: false, createdAt: 1 }], commands: [] } };
+  const state = normalizeLoadedMemory(legacy);
+  const keys = { notesKey: "/repo/oversized", checkoutKey: "/repo/oversized" };
+  const result = memoryMutations.updateNote(state, keys.notesKey, "n1", legacyText, Date.now());
+  assert.equal(getRepoMemory(result, keys).notes[0].text, legacyText, "a no-op save on an oversized grandfathered note must not throw or alter it");
+});
+
+test("release blocker: shrinking a grandfathered oversized note back under the limit is accepted as a normal edit", () => {
+  const legacyText = "w".repeat(MAX_NOTE_LENGTH + 500);
+  const legacy = { "/repo/oversized": { notes: [{ id: "n1", text: legacyText, pinned: false, createdAt: 1 }], commands: [] } };
+  const state = normalizeLoadedMemory(legacy);
+  const keys = { notesKey: "/repo/oversized", checkoutKey: "/repo/oversized" };
+  const shortened = "shortened text";
+  const result = memoryMutations.updateNote(state, keys.notesKey, "n1", shortened, Date.now());
+  assert.equal(getRepoMemory(result, keys).notes[0].text, shortened);
+});
+
+test("release blocker: no migration/sanitize path ever caps list length to today's count limit — sanitizeNoteList/sanitizeCommandList preserve every structurally valid entry", () => {
+  const manyNotes = Array.from({ length: MAX_NOTES_PER_REPO + 50 }, (_, i) => ({ id: `n${i}`, text: `note ${i}`, pinned: false, createdAt: i }));
+  assert.equal(sanitizeNoteList(manyNotes).length, MAX_NOTES_PER_REPO + 50, "sanitizeNoteList must never truncate to the count limit — that limit is only ever enforced on a NEW add");
+
+  const manyCommands = Array.from({ length: MAX_COMMANDS_PER_REPO + 50 }, (_, i) => ({ id: `c${i}`, label: `cmd ${i}`, command: "echo", createdAt: i }));
+  assert.equal(sanitizeCommandList(manyCommands).length, MAX_COMMANDS_PER_REPO + 50);
 });
 
 // ==================== pin / unpin ====================
@@ -265,7 +329,7 @@ test("reconcileStaleKey is a no-op when the stale key has no data, or already eq
   assert.equal(reconcileStaleKey(state, "notesByRepoKey", "/same", "/same"), state);
 });
 
-// ==================== storage limits ====================
+// ==================== storage limits (new mutations only) ====================
 
 test("maximum-size boundaries: a note exactly at MAX_NOTE_LENGTH is accepted; one character over is rejected", () => {
   const atLimit = "x".repeat(MAX_NOTE_LENGTH);
@@ -299,6 +363,13 @@ test("maximum-size boundaries: saved command label/command length and count limi
   assert.throws(() => memoryMutations.addCommand(state, KEYS.checkoutKey, "one more", "echo hi", Date.now()), MemoryLimitError);
 });
 
+test("a repository already grandfathered ABOVE the note limit still rejects a brand new add (does not silently allow unbounded growth)", () => {
+  const legacyNotes = Array.from({ length: 250 }, (_, i) => ({ id: `n${i}`, text: `note ${i}`, pinned: false, createdAt: i }));
+  const state = { version: 2 as const, notesByRepoKey: { [KEYS.notesKey]: legacyNotes }, commandsByCheckoutKey: {} };
+  assert.throws(() => memoryMutations.addNote(state, KEYS.notesKey, "one more note", false, Date.now()), MemoryLimitError);
+  assert.equal(getRepoMemory(state, KEYS).notes.length, 250, "the rejected add must not touch the existing grandfathered notes");
+});
+
 test("over-limit text is REJECTED, never silently truncated, on the live add path", () => {
   const over = "y".repeat(MAX_NOTE_LENGTH + 500);
   assert.throws(() => memoryMutations.addNote(emptyPersistedMemory(), KEYS.notesKey, over, false, Date.now()), MemoryLimitError);
@@ -317,28 +388,32 @@ test("export: produces a schema-versioned document containing exactly the given 
   assert.equal(exported.repositories[0].notes[0].text, "exportable note");
 });
 
-test("safe import: previewing an import never mutates anything and correctly counts notes/commands", () => {
+test("safe import: previewMemoryImportFile never mutates anything and correctly summarizes entries", () => {
   const source = memoryMutations.addNote(emptyPersistedMemory(), "source", "imported note", false, Date.now());
   const exported = buildMemoryExport([{ label: "source", memory: getRepoMemory(source, { notesKey: "source", checkoutKey: "source" }) }], Date.now());
 
   const target = emptyPersistedMemory();
-  const preview = previewMemoryImport(exported, getRepoMemory(target, KEYS));
-  assert.equal(preview.valid, true);
-  assert.equal(preview.noteCount, 1);
-  assert.equal(preview.repositoryCount, 1);
+  const filePreview = previewMemoryImportFile(exported);
+  assert.equal(filePreview.valid, true);
+  assert.equal(filePreview.entries.length, 1);
+  assert.equal(filePreview.entries[0].noteCount, 1);
+
+  const entryPreview = previewMemoryImportEntry(exported, 0, getRepoMemory(target, KEYS));
+  assert.equal(entryPreview.valid, true);
+  assert.equal(entryPreview.noteCount, 1);
   assert.deepEqual(getRepoMemory(target, KEYS), { notes: [], commands: [] }, "preview must not mutate the target");
 });
 
 test("safe import: a file with the wrong/missing schema version is rejected with a clear error, not imported", () => {
-  const preview = previewMemoryImport({ exportSchemaVersion: 999, repositories: [] }, { notes: [], commands: [] });
+  const preview = previewMemoryImportFile({ exportSchemaVersion: 999, repositories: [] });
   assert.equal(preview.valid, false);
   assert.ok(preview.error);
-  assert.throws(() => applyMemoryImport(emptyPersistedMemory(), KEYS, { exportSchemaVersion: 999, repositories: [] }, { overwriteDuplicates: false }), MemoryLimitError);
+  assert.throws(() => applyMemoryImport(emptyPersistedMemory(), KEYS, { exportSchemaVersion: 999, repositories: [] }, 0, { overwriteDuplicates: false }), MemoryLimitError);
 });
 
 test("safe import: imported notes never arrive pre-pinned, even if the export file has one marked pinned", () => {
   const exported = buildMemoryExport([{ label: "x", memory: { notes: [{ id: "n1", text: "was pinned", pinned: true, createdAt: 1 }], commands: [] } }], Date.now());
-  const imported = applyMemoryImport(emptyPersistedMemory(), KEYS, exported, { overwriteDuplicates: false });
+  const imported = applyMemoryImport(emptyPersistedMemory(), KEYS, exported, 0, { overwriteDuplicates: false });
   assert.equal(getRepoMemory(imported, KEYS).notes[0].pinned, false);
 });
 
@@ -348,10 +423,10 @@ test("duplicate import behavior: a note/command with an id that already exists i
   const originalId = getRepoMemory(target, KEYS).notes[0].id;
 
   const exported = buildMemoryExport([{ label: "x", memory: { notes: [{ id: originalId, text: "conflicting text", pinned: false, createdAt: now }], commands: [] } }], now);
-  const preview = previewMemoryImport(exported, getRepoMemory(target, KEYS));
+  const preview = previewMemoryImportEntry(exported, 0, getRepoMemory(target, KEYS));
   assert.deepEqual(preview.duplicateNoteIds, [originalId]);
 
-  const imported = applyMemoryImport(target, KEYS, exported, { overwriteDuplicates: false });
+  const imported = applyMemoryImport(target, KEYS, exported, 0, { overwriteDuplicates: false });
   assert.equal(getRepoMemory(imported, KEYS).notes.length, 1);
   assert.equal(getRepoMemory(imported, KEYS).notes[0].text, "original text", "must be skipped, not overwritten, without explicit opt-in");
 });
@@ -362,7 +437,7 @@ test("duplicate import behavior: overwriteDuplicates: true replaces the conflict
   const originalId = getRepoMemory(target, KEYS).notes[0].id;
 
   const exported = buildMemoryExport([{ label: "x", memory: { notes: [{ id: originalId, text: "new text", pinned: false, createdAt: now }], commands: [] } }], now);
-  const imported = applyMemoryImport(target, KEYS, exported, { overwriteDuplicates: true });
+  const imported = applyMemoryImport(target, KEYS, exported, 0, { overwriteDuplicates: true });
   assert.equal(getRepoMemory(imported, KEYS).notes.length, 1);
   assert.equal(getRepoMemory(imported, KEYS).notes[0].text, "new text");
 });
@@ -373,7 +448,7 @@ test("duplicate import behavior: overwriting a duplicate note preserves the TARG
   const originalId = getRepoMemory(target, KEYS).notes[0].id;
 
   const exported = buildMemoryExport([{ label: "x", memory: { notes: [{ id: originalId, text: "new text", pinned: false, createdAt: now }], commands: [] } }], now);
-  const imported = applyMemoryImport(target, KEYS, exported, { overwriteDuplicates: true });
+  const imported = applyMemoryImport(target, KEYS, exported, 0, { overwriteDuplicates: true });
   const note = getRepoMemory(imported, KEYS).notes[0];
   assert.equal(note.text, "new text", "the overwrite must still replace content");
   assert.equal(note.pinned, true, "pin state is a local decision, never silently changed by an import overwrite");
@@ -388,7 +463,7 @@ test("adversarial: an import that would push a repository's note count over MAX_
   const exported = buildMemoryExport([{ label: "x", memory: { notes: importedNotes, commands: [] } }], Date.now());
 
   assert.throws(
-    () => applyMemoryImport(state, KEYS, exported, { overwriteDuplicates: false }),
+    () => applyMemoryImport(state, KEYS, exported, 0, { overwriteDuplicates: false }),
     (error: unknown) => error instanceof MemoryLimitError && /over the .* limit/i.test(error.message),
   );
   // Rejected import must leave the target's existing notes completely untouched.
@@ -403,8 +478,75 @@ test("adversarial: an import that would push a checkout's command count over MAX
   const importedCommands = Array.from({ length: 5 }, (_, i) => ({ id: `imported-cmd-${i}`, label: `cmd ${i}`, command: "echo hi", createdAt: Date.now() }));
   const exported = buildMemoryExport([{ label: "x", memory: { notes: [], commands: importedCommands } }], Date.now());
 
-  assert.throws(() => applyMemoryImport(state, KEYS, exported, { overwriteDuplicates: false }), MemoryLimitError);
+  assert.throws(() => applyMemoryImport(state, KEYS, exported, 0, { overwriteDuplicates: false }), MemoryLimitError);
   assert.equal(getRepoMemory(state, KEYS).commands.length, MAX_COMMANDS_PER_REPO - 1);
+});
+
+test("release blocker: an import containing a note over today's length limit is REJECTED outright, never truncated to fit", () => {
+  const oversizedNote = { id: "oversized", text: "q".repeat(MAX_NOTE_LENGTH + 1), pinned: false, createdAt: Date.now() };
+  const exported = buildMemoryExport([{ label: "x", memory: { notes: [oversizedNote], commands: [] } }], Date.now());
+  const target = emptyPersistedMemory();
+
+  const preview = previewMemoryImportEntry(exported, 0, getRepoMemory(target, KEYS));
+  assert.equal(preview.valid, false);
+  assert.equal(preview.oversizedNoteCount, 1);
+
+  assert.throws(() => applyMemoryImport(target, KEYS, exported, 0, { overwriteDuplicates: false }), MemoryLimitError);
+  assert.deepEqual(getRepoMemory(target, KEYS), { notes: [], commands: [] }, "a rejected oversized import must change nothing");
+});
+
+test("release blocker: an import containing a saved command over today's limits is REJECTED outright, never truncated", () => {
+  const oversizedCommand = { id: "oversized-cmd", label: "x".repeat(MAX_COMMAND_LABEL_LENGTH + 1), command: "echo hi", createdAt: Date.now() };
+  const exported = buildMemoryExport([{ label: "x", memory: { notes: [], commands: [oversizedCommand] } }], Date.now());
+  const target = emptyPersistedMemory();
+
+  const preview = previewMemoryImportEntry(exported, 0, getRepoMemory(target, KEYS));
+  assert.equal(preview.valid, false);
+  assert.equal(preview.oversizedCommandCount, 1);
+  assert.throws(() => applyMemoryImport(target, KEYS, exported, 0, { overwriteDuplicates: false }), MemoryLimitError);
+});
+
+test("release blocker: re-importing duplicates-only into an already-grandfathered-over-limit repository does not spuriously throw (nothing is actually growing)", () => {
+  const legacyNotes = Array.from({ length: 205 }, (_, i) => ({ id: `n${i}`, text: `note ${i}`, pinned: false, createdAt: i }));
+  const target: import("../storage/memoryStoreCore").PersistedMemoryV2 = { version: 2, notesByRepoKey: { [KEYS.notesKey]: legacyNotes }, commandsByCheckoutKey: {} };
+  // Export exactly what's already there, then re-import it (overwrite) into the SAME repo -- this must NOT throw, since nothing is being added.
+  const exported = buildMemoryExport([{ label: "x", memory: getRepoMemory(target, KEYS) }], Date.now());
+  const imported = applyMemoryImport(target, KEYS, exported, 0, { overwriteDuplicates: true });
+  assert.equal(getRepoMemory(imported, KEYS).notes.length, 205, "re-importing duplicates-only must not throw or drop entries just because the repo is already over today's limit");
+});
+
+// ==================== multi-repository import semantics ====================
+
+test("multi-repository import: previewMemoryImportFile summarizes every repository entry without merging them", () => {
+  const exported = buildMemoryExport(
+    [
+      { label: "repo-1", memory: { notes: [{ id: "n1", text: "repo 1 note", pinned: false, createdAt: 1 }], commands: [] } },
+      { label: "repo-2", memory: { notes: [{ id: "n2", text: "repo 2 note", pinned: false, createdAt: 1 }, { id: "n3", text: "repo 2 note 2", pinned: false, createdAt: 1 }], commands: [] } },
+    ],
+    Date.now(),
+  );
+  const preview = previewMemoryImportFile(exported);
+  assert.equal(preview.valid, true);
+  assert.equal(preview.entries.length, 2);
+  assert.deepEqual(preview.entries.map((e) => ({ label: e.label, noteCount: e.noteCount })), [
+    { label: "repo-1", noteCount: 1 },
+    { label: "repo-2", noteCount: 2 },
+  ]);
+});
+
+test("multi-repository import: applyMemoryImport with entryIndex imports ONLY that chosen repository's notes, never every entry combined", () => {
+  const exported = buildMemoryExport(
+    [
+      { label: "repo-1", memory: { notes: [{ id: "n1", text: "repo 1 note", pinned: false, createdAt: 1 }], commands: [] } },
+      { label: "repo-2", memory: { notes: [{ id: "n2", text: "repo 2 note", pinned: false, createdAt: 1 }], commands: [] } },
+    ],
+    Date.now(),
+  );
+  const target = emptyPersistedMemory();
+  const imported = applyMemoryImport(target, KEYS, exported, 1, { overwriteDuplicates: false });
+  const notes = getRepoMemory(imported, KEYS).notes;
+  assert.equal(notes.length, 1, "must import only entry index 1, never combine both entries");
+  assert.equal(notes[0].text, "repo 2 note");
 });
 
 test("imported saved commands are NEVER executed — applyMemoryImport only ever reads/copies the `command` string as data", () => {
@@ -423,7 +565,7 @@ test("imported saved commands are NEVER executed — applyMemoryImport only ever
       [{ label: "x", memory: { notes: [], commands: [{ id: "c1", label: "dangerous", command: "throw new Error('should never run')", createdAt: 1 }] } }],
       Date.now(),
     );
-    const imported = applyMemoryImport(emptyPersistedMemory(), KEYS, exported, { overwriteDuplicates: false });
+    const imported = applyMemoryImport(emptyPersistedMemory(), KEYS, exported, 0, { overwriteDuplicates: false });
     assert.equal(getRepoMemory(imported, KEYS).commands[0].command, "throw new Error('should never run')");
   } finally {
     globalThis.eval = originalExec;
@@ -431,10 +573,9 @@ test("imported saved commands are NEVER executed — applyMemoryImport only ever
   assert.equal(executed, false);
 });
 
-test("sanitizeNoteList and sanitizeCommandList cap results at their respective per-repo maximums", () => {
-  const manyNotes = Array.from({ length: MAX_NOTES_PER_REPO + 50 }, (_, i) => ({ id: `n${i}`, text: `note ${i}`, pinned: false, createdAt: i }));
-  assert.equal(sanitizeNoteList(manyNotes).length, MAX_NOTES_PER_REPO);
-
-  const manyCommands = Array.from({ length: MAX_COMMANDS_PER_REPO + 50 }, (_, i) => ({ id: `c${i}`, label: `cmd ${i}`, command: "echo", createdAt: i }));
-  assert.equal(sanitizeCommandList(manyCommands).length, MAX_COMMANDS_PER_REPO);
+test("sanitizeNoteList and sanitizeCommandList discard structurally invalid entries but never cap valid-list length", () => {
+  const mixed = [{ id: "n1", text: "valid", pinned: false, createdAt: 1 }, "garbage", { id: "n1", text: "duplicate id, skipped", pinned: false, createdAt: 2 }];
+  const sanitized = sanitizeNoteList(mixed);
+  assert.equal(sanitized.length, 1, "invalid entries and duplicate ids are still filtered");
+  assert.equal(sanitized[0].text, "valid");
 });

@@ -2,6 +2,74 @@
 
 ## Unreleased
 
+### Fixed — Repo Memory release-blocker review: no more silent truncation, and no more lost drafts
+
+An independent review of the Repo Memory round above found two
+release-blocking data-loss bugs and several smaller correctness/UX gaps,
+all fixed here without touching Shield, Git destination security, or
+profile resolution.
+
+- **Release blocker: grandfathered data was silently truncated.**
+  `sanitizeNote`/`sanitizeCommand` used to `.slice()` text to today's
+  length limit, and `sanitizeNoteList`/`sanitizeCommandList` used to
+  `.slice()` lists to today's count limit — on EVERY load, not just new
+  writes. A note or repository that predated these limits (there were
+  none before the previous round) would have been silently mutilated the
+  first time it loaded under the new code. Fixed by splitting "is this
+  valid data?" (structural sanitation — never truncates, never caps
+  length) from "may this NEW mutation be created?" (the only place a
+  limit can ever reject something, always outright via
+  `MemoryLimitError`, never by truncating). Editing a grandfathered
+  oversized note unchanged is a no-op; shrinking it under the limit is a
+  normal edit.
+- **Release blocker: unsaved drafts could disappear.** A new note draft
+  or an in-progress edit lived only as DOM state, so any backend `state`
+  push (a routine rescan, a file save, a branch switch) that triggered a
+  re-render could wipe it — and Add/Save cleared the draft/exit-edited
+  immediately on SEND, before the backend had actually accepted the
+  mutation, so a rejected (over-limit/empty) submission lost the user's
+  text outright. Fixed with client-held draft state that every render
+  reads from (never `note.text`/empty-string), plus a minimal
+  request/ack protocol between the webview and extension host: a
+  draft/edit-mode is cleared/exited ONLY once the specific mutation is
+  confirmed to have succeeded, never optimistically on send.
+- **Multi-repository import no longer silently merges everything.**
+  Importing an "Export all" file used to merge every repository's notes/
+  commands into whichever repository was currently open. It now shows a
+  picker (label, note count, command count) when a file holds more than
+  one repository's memory, and imports only the chosen one.
+- **Workspace Trust UX now matches reality.** The sidebar previously only
+  said "saved commands can't run" in an untrusted workspace. It now
+  visibly disables (with an explanatory title) every Repo Memory control
+  that actually mutates or executes something — add/edit/delete/pin
+  notes, add/delete/run saved commands, import — while keeping view,
+  search, and export (all read-only) enabled, and the backend warning now
+  names the specific action that was blocked.
+- **Concurrency claim narrowed to what's actually true.** `MemoryStore`'s
+  promise-queue mutex is real and tested, but only within one Extension
+  Host / VS Code window; it cannot and does not coordinate two windows on
+  the same profile editing Repo Memory at once (`globalState` has no
+  cross-window change notification or atomic compare-and-swap). This is
+  now documented explicitly, with a regression test demonstrating the
+  actual mechanism, instead of an unqualified "concurrency-safe" claim.
+- **Reliability.** `togglePinMemoryNote`/`removeMemoryNote`/
+  `removeSavedCommand`/writing an export file now surface a clear error
+  instead of risking an unhandled rejected promise if the underlying
+  write fails. Import now checks the file's size before parsing it.
+- **Import still never truncates.** An import containing a note/command
+  over today's size limits, or that would push a repository over its
+  count limit, is rejected outright with a clear message — never
+  silently truncated to fit, and re-importing duplicates-only into an
+  already-grandfathered-over-limit repository no longer spuriously fails.
+
+New/updated tests across `memoryStoreCore.test.ts`, `memoryStore.test.ts`,
+and `webviewMemory.test.ts` reproduce each bug above before asserting the
+fix (grandfathered 6,000-character note and 250-note repository surviving
+migration/export intact; a draft surviving an unrelated `state` push; a
+rejected add/edit leaving the draft and edit mode untouched; multi-entry
+import choosing exactly one repository; the two-`MemoryStore`-instance
+cross-window race; write-failure rejection).
+
 ### Added — Repo Memory: editing, multiline notes, search, export/import, and storage hardening
 
 Repo Memory moves from a basic scratchpad to a finished local feature,

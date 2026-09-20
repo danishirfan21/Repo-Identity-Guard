@@ -168,10 +168,33 @@ A separate "Other Notes" section below the checklist shows info notes
 12. **Export/Import**: click Export — confirm a native save dialog appears
     and the resulting JSON file contains the current repo's notes/commands
     plus a schema version. Click Export all — confirm it includes every
-    detected repository. Click Import and pick that file — confirm a
-    preview/confirmation appears (counts, duplicate handling) BEFORE
-    anything changes, that re-importing the same file doesn't duplicate
-    entries, and that an imported saved command never runs on its own.
+    detected repository. Click Import and pick a single-repository export
+    file — confirm a preview/confirmation appears (counts, duplicate
+    handling) BEFORE anything changes, that re-importing the same file
+    doesn't duplicate entries, and that an imported saved command never
+    runs on its own.
+13. **Multi-repository import**: import an "Export all" file (containing
+    more than one repository's memory) — confirm a picker appears listing
+    each source repository by label with its note/command counts, and that
+    choosing one imports ONLY that repository's memory into the currently
+    open repository, never merging every repository in the file together.
+14. **Unsaved drafts survive backend refresh**: start typing a new note (or
+    click Edit on an existing note and start changing its text), then
+    trigger an unrelated backend refresh while NOT submitting — e.g. save
+    any file in the workspace, or switch branches in the integrated
+    terminal, so a rescan fires. Confirm your unsubmitted note/edit text is
+    still there afterward, not cleared.
+15. **Rejected mutations never lose text**: type a note far over the length
+    limit (or, while editing an existing note, change it to be far over
+    the limit) and submit — confirm the rejection message appears AND the
+    composer/editor still contains your full typed text and stays open, so
+    nothing needs to be retyped. Confirm a normal, under-limit add/edit
+    still clears the composer / exits edit mode as usual once accepted.
+16. **Workspace Trust UX**: with an untrusted workspace open, confirm notes
+    and saved commands are still visible and searchable, Export/Export all
+    still work, but Add/Edit/Delete/Pin (notes), Add/Delete/Run (saved
+    commands), and Import are all visibly disabled (not just silently
+    failing when clicked) with a title explaining why.
 
 ### Copy Context for AI
 

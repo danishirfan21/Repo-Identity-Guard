@@ -12,6 +12,20 @@ import { MEMORY_VIEW_JS } from "../webview/client/memoryView";
 import { SETTINGS_VIEW_JS } from "../webview/client/settingsView";
 import { NAVIGATION_JS } from "../webview/client/navigation";
 
+/**
+ * Result of a Repo Memory mutation the webview needs to react to
+ * synchronously — specifically, whether it's now safe to clear an unsaved
+ * draft or exit edit mode. `addMemoryNote`/`updateMemoryNote`/
+ * `addSavedCommand` are the only actions the webview optimistically holds
+ * draft text for, so they're the only ones that return this instead of
+ * `void`: on `ok: false` the webview must keep the draft/edit mode exactly
+ * as the user left it, never clear it just because the message was sent.
+ */
+export interface MemoryMutationResult {
+  ok: boolean;
+  error?: string;
+}
+
 export interface SidebarActions {
   rescan(): Promise<void>;
   fixCommitIdentity(): Promise<void>;
@@ -24,11 +38,11 @@ export interface SidebarActions {
   resolveProfileConflict(): Promise<void>;
   selectRepo(repoId: string): Promise<void>;
 
-  addMemoryNote(text: string, pinned: boolean): Promise<void>;
-  updateMemoryNote(id: string, text: string): Promise<void>;
+  addMemoryNote(text: string, pinned: boolean): Promise<MemoryMutationResult>;
+  updateMemoryNote(id: string, text: string): Promise<MemoryMutationResult>;
   removeMemoryNote(id: string): Promise<void>;
   togglePinMemoryNote(id: string): Promise<void>;
-  addSavedCommand(label: string, command: string): Promise<void>;
+  addSavedCommand(label: string, command: string): Promise<MemoryMutationResult>;
   removeSavedCommand(id: string): Promise<void>;
   runSavedCommand(id: string): Promise<void>;
   copySavedCommand(id: string): Promise<void>;
@@ -83,6 +97,19 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Replies to ONE specific mutation request so the webview can decide
+   * whether it's safe to clear a draft or exit edit mode — see
+   * `MemoryMutationResult`'s doc comment. `requestId` is opaque,
+   * client-generated, and round-tripped unchanged; a missing/malformed
+   * one (a stale or hand-crafted message) is simply dropped rather than
+   * guessed at.
+   */
+  private postMemoryResult(requestId: unknown, result: MemoryMutationResult): void {
+    if (!this.view || typeof requestId !== "string" || !requestId) return;
+    this.view.webview.postMessage({ type: "memoryMutationResult", requestId, ok: result.ok, error: result.error });
+  }
+
+  /**
    * The webview is a trust boundary (see `../validation`): even though its
    * only content today is this extension's own script, nothing here may
    * assume a message has the shape a TypeScript cast claims. A message that
@@ -126,10 +153,18 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
         if (isNonEmptyString(message.id)) await a.selectRepo(message.id);
         break;
       case "addMemoryNote":
-        if (isNonEmptyString(message.text)) await a.addMemoryNote(message.text, message.pinned === true);
+        if (isNonEmptyString(message.text)) {
+          this.postMemoryResult(message.requestId, await a.addMemoryNote(message.text, message.pinned === true));
+        } else {
+          this.postMemoryResult(message.requestId, { ok: false, error: "A note can't be empty." });
+        }
         break;
       case "updateMemoryNote":
-        if (isNonEmptyString(message.id) && typeof message.text === "string") await a.updateMemoryNote(message.id, message.text);
+        if (isNonEmptyString(message.id) && typeof message.text === "string") {
+          this.postMemoryResult(message.requestId, await a.updateMemoryNote(message.id, message.text));
+        } else {
+          this.postMemoryResult(message.requestId, { ok: false, error: "A note can't be empty." });
+        }
         break;
       case "removeMemoryNote":
         if (isNonEmptyString(message.id)) await a.removeMemoryNote(message.id);
@@ -139,7 +174,9 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
         break;
       case "addSavedCommand":
         if (isNonEmptyString(message.label) && isNonEmptyString(message.command)) {
-          await a.addSavedCommand(message.label, message.command);
+          this.postMemoryResult(message.requestId, await a.addSavedCommand(message.label, message.command));
+        } else {
+          this.postMemoryResult(message.requestId, { ok: false, error: "A saved command needs both a label and a command." });
         }
         break;
       case "removeSavedCommand":

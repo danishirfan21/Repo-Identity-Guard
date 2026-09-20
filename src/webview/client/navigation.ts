@@ -17,6 +17,48 @@ const backButton = document.getElementById("backButton");
 let state = null;
 let view = "main";
 
+// ---- Repo Memory mutation acks ----
+// Each in-flight addMemoryNote/updateMemoryNote/addSavedCommand carries a
+// client-generated requestId; the draft it was built from is deliberately
+// NOT cleared until the extension host acks it (see
+// handleMemoryMutationResult below) — sending a message is not the same
+// as the backend having accepted it, and clearing a draft optimistically
+// would lose the user's text on a rejected over-limit/empty/invalid
+// mutation. Keyed by requestId rather than assuming only one is ever in
+// flight, since a fast typist could in principle fire more than one
+// before either resolves.
+let memoryRequestSeq = 0;
+const memoryPendingRequests = {};
+
+function nextMemoryRequestId() {
+  memoryRequestSeq += 1;
+  return "mem-" + memoryRequestSeq;
+}
+
+function handleMemoryMutationResult(message) {
+  const pending = memoryPendingRequests[message.requestId];
+  if (!pending) return;
+  delete memoryPendingRequests[message.requestId];
+  if (message.ok) {
+    if (pending.kind === "addNote") {
+      memoryNewNoteDraft = "";
+    } else if (pending.kind === "editNote" && memoryEditingNoteId === pending.noteId) {
+      memoryEditingNoteId = null;
+      memoryEditDraft = "";
+    } else if (pending.kind === "addCommand") {
+      memoryNewCommandLabelDraft = "";
+      memoryNewCommandDraft = "";
+    }
+  }
+  // On failure, everything (draft text, edit mode) is already exactly as
+  // the user left it — nothing was cleared optimistically — so there's
+  // nothing to restore here; a native warning dialog from the extension
+  // host already explains what went wrong. Re-render either way so a
+  // successful add/edit/save is reflected immediately rather than waiting
+  // for the next unrelated state push.
+  render();
+}
+
 function headerFor(v) {
   if (v === "onboarding") return ["Repo Identity Guard", "Quick setup"];
   if (v === "shieldDiscovery") return ["Repo Identity Guard", "Quick setup"];
@@ -82,22 +124,39 @@ document.addEventListener("click", (event) => {
   if (selectRepoBtn) { send("selectRepo", { id: selectRepoBtn.dataset.selectRepo }); navigate("details"); return; }
 
   // ---- Repo Memory ----
+  // Drafts are updated live by the "input" listener below; these handlers
+  // only ever READ the current draft and send it — they never clear it
+  // themselves. Clearing happens exclusively in handleMemoryMutationResult
+  // once the extension host confirms the mutation actually succeeded, so
+  // a rejected (over-limit/empty) submission always leaves the user's
+  // text exactly where they left it.
   if (target.closest("#addNoteButton")) { document.getElementById("newNoteText").focus(); return; }
   if (target.closest("#addNoteSubmit")) {
-    const input = document.getElementById("newNoteText");
-    const text = input.value.trim();
-    if (text) { send("addMemoryNote", { text, pinned: false }); input.value = ""; }
+    const text = memoryNewNoteDraft.trim();
+    if (text) {
+      const requestId = nextMemoryRequestId();
+      memoryPendingRequests[requestId] = { kind: "addNote" };
+      send("addMemoryNote", { text, pinned: false, requestId });
+    }
     return;
   }
   const editBtn = target.closest("[data-edit-note]");
-  if (editBtn) { memoryEditingNoteId = editBtn.dataset.editNote; render(); return; }
-  if (target.closest("#editNoteCancel")) { memoryEditingNoteId = null; render(); return; }
+  if (editBtn) {
+    const id = editBtn.dataset.editNote;
+    memoryEditingNoteId = id;
+    const note = (state.memory.notes || []).find((n) => n.id === id);
+    memoryEditDraft = note ? note.text : "";
+    render();
+    return;
+  }
+  if (target.closest("#editNoteCancel")) { memoryEditingNoteId = null; memoryEditDraft = ""; render(); return; }
   const saveBtn = target.closest("[data-save-note]");
   if (saveBtn) {
-    const text = document.getElementById("editNoteText").value;
-    send("updateMemoryNote", { id: saveBtn.dataset.saveNote, text });
-    memoryEditingNoteId = null;
-    render();
+    const noteId = saveBtn.dataset.saveNote;
+    const text = memoryEditDraft;
+    const requestId = nextMemoryRequestId();
+    memoryPendingRequests[requestId] = { kind: "editNote", noteId };
+    send("updateMemoryNote", { id: noteId, text, requestId });
     return;
   }
   const pinBtn = target.closest("[data-pin-note]");
@@ -111,12 +170,12 @@ document.addEventListener("click", (event) => {
 
   if (target.closest("#addCommandToggle")) { document.getElementById("newCommandLabel").focus(); return; }
   if (target.closest("#addCommandButton")) {
-    const label = document.getElementById("newCommandLabel").value.trim();
-    const command = document.getElementById("newCommandText").value.trim();
+    const label = memoryNewCommandLabelDraft.trim();
+    const command = memoryNewCommandDraft.trim();
     if (label && command) {
-      send("addSavedCommand", { label, command });
-      document.getElementById("newCommandLabel").value = "";
-      document.getElementById("newCommandText").value = "";
+      const requestId = nextMemoryRequestId();
+      memoryPendingRequests[requestId] = { kind: "addCommand" };
+      send("addSavedCommand", { label, command, requestId });
     }
     return;
   }
@@ -258,7 +317,18 @@ document.addEventListener("input", (event) => {
     // is persisted.
     memorySearchQuery = target.value;
     document.getElementById("notesListContainer").innerHTML = renderNotesList();
+    return;
   }
+  // These four just update the in-memory draft variable that renderMemory()
+  // reads from — deliberately NOT re-rendering here (a full render() on
+  // every keystroke would replace the very textarea/input being typed
+  // into, same focus-loss problem as the search box above). The draft
+  // survives any LATER unrelated re-render precisely because renderMemory()
+  // always reads these variables rather than note.text/empty-string.
+  if (target.id === "newNoteText") { memoryNewNoteDraft = target.value; return; }
+  if (target.id === "editNoteText") { memoryEditDraft = target.value; return; }
+  if (target.id === "newCommandLabel") { memoryNewCommandLabelDraft = target.value; return; }
+  if (target.id === "newCommandText") { memoryNewCommandDraft = target.value; return; }
 });
 
 window.addEventListener("message", (event) => {
@@ -268,6 +338,8 @@ window.addEventListener("message", (event) => {
     state = message.payload;
     if (hadNoState && shouldShowOnboarding()) view = "onboarding";
     render();
+  } else if (message.type === "memoryMutationResult") {
+    handleMemoryMutationResult(message);
   }
 });
 

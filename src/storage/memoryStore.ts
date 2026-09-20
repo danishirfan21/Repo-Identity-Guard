@@ -2,8 +2,9 @@ import * as vscode from "vscode";
 import { canonicalizeRepoPath } from "../services/gitService";
 import { MemoryNote, RepoMemory } from "../types";
 import {
+  ImportEntryPreview,
+  ImportFilePreview,
   ImportOptions,
-  ImportPreview,
   MemoryExport,
   PersistedMemoryV2,
   applyMemoryImport,
@@ -12,12 +13,21 @@ import {
   makeId,
   memoryMutations,
   normalizeLoadedMemory,
-  previewMemoryImport,
+  previewMemoryImportEntry,
+  previewMemoryImportFile,
   reconcileStaleKey,
 } from "./memoryStoreCore";
 
-export { MemoryLimitError, MAX_NOTE_LENGTH, MAX_NOTES_PER_REPO, MAX_COMMAND_LABEL_LENGTH, MAX_COMMAND_LENGTH, MAX_COMMANDS_PER_REPO } from "./memoryStoreCore";
-export type { ImportOptions, ImportPreview, MemoryExport } from "./memoryStoreCore";
+export {
+  MemoryLimitError,
+  MAX_NOTE_LENGTH,
+  MAX_NOTES_PER_REPO,
+  MAX_COMMAND_LABEL_LENGTH,
+  MAX_COMMAND_LENGTH,
+  MAX_COMMANDS_PER_REPO,
+  MAX_IMPORT_FILE_BYTES,
+} from "./memoryStoreCore";
+export type { ImportEntryPreview, ImportEntrySummary, ImportFilePreview, ImportOptions, MemoryExport } from "./memoryStoreCore";
 
 const STORAGE_KEY = "repoIdentityGuard.memoryByRepo";
 
@@ -40,6 +50,28 @@ export interface MemoryKeys {
  * (`this.queue`) always resolves, even when the mutation it ran rejected —
  * see `enqueue`'s doc comment — so one failed mutation can never
  * permanently wedge every mutation after it.
+ *
+ * SCOPE OF THIS GUARANTEE — read before assuming more than it says: the
+ * queue serializes mutations WITHIN ONE `MemoryStore` INSTANCE, i.e.
+ * within one running Extension Host / one VS Code window. It does NOT,
+ * and cannot, coordinate across two separate windows that have the same
+ * profile open at once, each running its own Extension Host with its own
+ * `MemoryStore` and its own independent in-memory `globalState` snapshot.
+ * `vscode.ExtensionContext.globalState` exposes no cross-window change
+ * notification and no atomic compare-and-swap; each window's `.update()`
+ * does a read-modify-write against ITS OWN last-known snapshot, not a
+ * fresh read of whatever another window most recently persisted to disk.
+ * Two windows editing Repo Memory around the same moment can therefore
+ * still lose an update to each other — see
+ * `src/test/memoryStore.test.ts`'s "documented limitation" test, which
+ * demonstrates the actual mechanism, and README.md's Repo Memory section,
+ * which states this limitation to users. This is a real constraint of the
+ * VS Code extension API this feature is built on, not something this
+ * class's own design can close without either a cross-process lock file
+ * (real added complexity, and still no atomicity guarantee VS Code itself
+ * would honor) or moving off `globalState` entirely — both rejected here
+ * as disproportionate to a local notes feature. Within a single window,
+ * the guarantee above is real and tested.
  */
 export class MemoryStore {
   private queue: Promise<void> = Promise.resolve();
@@ -169,14 +201,19 @@ export class MemoryStore {
     );
   }
 
-  /** Read-only: validates and summarizes what an import would do, without changing anything. */
-  public previewImport(keys: MemoryKeys, raw: unknown): ImportPreview {
-    return previewMemoryImport(raw, this.getMemory(keys));
+  /** Read-only, target-independent: is this a Repo Memory export file this version understands, and what repository entries does it contain? Used to decide whether the caller needs to show a picker (more than one entry) before importing. */
+  public previewImportFile(raw: unknown): ImportFilePreview {
+    return previewMemoryImportFile(raw);
   }
 
-  /** Merges an already-previewed-valid import into ONE target repository (the currently open one) — never a multi-repo silent restore. Duplicate ids are skipped unless `options.overwriteDuplicates` is set. */
-  public async importMemory(keys: MemoryKeys, raw: unknown, options: ImportOptions): Promise<RepoMemory> {
-    const next = await this.mutate((state) => applyMemoryImport(state, keys, raw, options));
+  /** Read-only, target-aware: validates and summarizes importing ONE chosen repository entry into this target, without changing anything. */
+  public previewImportEntry(keys: MemoryKeys, raw: unknown, entryIndex: number): ImportEntryPreview {
+    return previewMemoryImportEntry(raw, entryIndex, this.getMemory(keys));
+  }
+
+  /** Merges ONE chosen repository entry from the import file into ONE target repository (the currently open one) — never a multi-repo silent restore. Duplicate ids are skipped unless `options.overwriteDuplicates` is set. */
+  public async importMemory(keys: MemoryKeys, raw: unknown, entryIndex: number, options: ImportOptions): Promise<RepoMemory> {
+    const next = await this.mutate((state) => applyMemoryImport(state, keys, raw, entryIndex, options));
     return getRepoMemory(next, keys);
   }
 }

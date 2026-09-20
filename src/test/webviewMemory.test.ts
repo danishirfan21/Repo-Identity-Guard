@@ -21,6 +21,9 @@ import { SETTINGS_VIEW_JS } from "../webview/client/settingsView";
  */
 const RENDER_BRIDGE_JS = `
 function __setMemoryEditing(id) { memoryEditingNoteId = id; }
+function __setMemoryEditDraft(text) { memoryEditDraft = text; }
+function __setMemoryNewNoteDraft(text) { memoryNewNoteDraft = text; }
+function __setMemoryNewCommandDrafts(label, command) { memoryNewCommandLabelDraft = label; memoryNewCommandDraft = command; }
 function __setMemorySearch(q) { memorySearchQuery = q; }
 `;
 
@@ -79,7 +82,7 @@ test("multiline notes: the edit textarea also contains the full unmangled multil
   const sandbox = loadRenderSandbox();
   const text = "first line\nsecond line";
   run(sandbox, "state = " + JSON.stringify(baseState({ memory: { notes: [{ id: "n1", text, pinned: false, createdAt: 1 }], commands: [] } })) + ";");
-  run(sandbox, '__setMemoryEditing("n1");');
+  run(sandbox, '__setMemoryEditing("n1"); __setMemoryEditDraft(' + JSON.stringify(text) + ");");
   const html = run(sandbox, "renderMemory()") as string;
   assert.match(html, /<textarea[^>]*id="editNoteText"[^>]*>first line\nsecond line<\/textarea>/);
 });
@@ -89,7 +92,7 @@ test("multiline notes: the edit textarea also contains the full unmangled multil
 test("edit mode: the note being edited renders a textarea + Save/Cancel instead of its normal view", () => {
   const sandbox = loadRenderSandbox();
   run(sandbox, "state = " + JSON.stringify(baseState({ memory: { notes: [{ id: "n1", text: "editable", pinned: false, createdAt: 1 }], commands: [] } })) + ";");
-  run(sandbox, '__setMemoryEditing("n1");');
+  run(sandbox, '__setMemoryEditing("n1"); __setMemoryEditDraft("editable");');
   const html = run(sandbox, "renderMemory()") as string;
   assert.match(html, /id="editNoteText"/);
   assert.match(html, /id="editNoteSave"/);
@@ -108,7 +111,7 @@ test("edit mode: a note NOT being edited still renders normally even while anoth
       commands: [],
     },
   })) + ";");
-  run(sandbox, '__setMemoryEditing("n1");');
+  run(sandbox, '__setMemoryEditing("n1"); __setMemoryEditDraft("being edited");');
   const html = run(sandbox, "renderMemory()") as string;
   assert.match(html, /data-edit-note="n2"/);
   assert.match(html, /not being edited/);
@@ -117,7 +120,7 @@ test("edit mode: a note NOT being edited still renders normally even while anoth
 test("edit mode: a pinned note being edited still shows its pinned styling context, not the plain list editor markup", () => {
   const sandbox = loadRenderSandbox();
   run(sandbox, "state = " + JSON.stringify(baseState({ memory: { notes: [{ id: "n1", text: "pinned + editing", pinned: true, createdAt: 1 }], commands: [] } })) + ";");
-  run(sandbox, '__setMemoryEditing("n1");');
+  run(sandbox, '__setMemoryEditing("n1"); __setMemoryEditDraft("pinned + editing");');
   const html = run(sandbox, "renderMemory()") as string;
   assert.match(html, /border-left-color:var\(--rig-warning\)/);
   assert.match(html, /id="editNoteText"/);
@@ -255,7 +258,15 @@ interface FakeElement {
   click: () => void;
 }
 
-function loadInteractiveSandbox(): { sandbox: Record<string, unknown>; sent: Array<{ type: string; extra?: Record<string, unknown> }>; dispatchClick: (selector: string, dataset?: Record<string, string>) => void; dispatchKeydown: (targetId: string, key: string, modifiers?: { metaKey?: boolean; ctrlKey?: boolean }) => void; dispatchInput: (targetId: string, value: string) => void; el: (id: string) => FakeElement } {
+function loadInteractiveSandbox(): {
+  sandbox: Record<string, unknown>;
+  sent: Array<{ type: string; extra?: Record<string, unknown> }>;
+  dispatchClick: (selector: string, dataset?: Record<string, string>) => void;
+  dispatchKeydown: (targetId: string, key: string, modifiers?: { metaKey?: boolean; ctrlKey?: boolean }) => void;
+  dispatchInput: (targetId: string, value: string) => void;
+  dispatchMessage: (payload: Record<string, unknown>) => void;
+  el: (id: string) => FakeElement;
+} {
   const sent: Array<{ type: string; extra?: Record<string, unknown> }> = [];
   const elements = new Map<string, FakeElement>();
 
@@ -276,6 +287,7 @@ function loadInteractiveSandbox(): { sandbox: Record<string, unknown>; sent: Arr
   }
 
   const listeners: Record<string, Array<(event: unknown) => void>> = { click: [], keydown: [], input: [], change: [] };
+  const windowListeners: Record<string, Array<(event: unknown) => void>> = { message: [] };
 
   const sandbox: Record<string, unknown> = {
     console,
@@ -286,7 +298,11 @@ function loadInteractiveSandbox(): { sandbox: Record<string, unknown>; sent: Arr
         (listeners[type] ??= []).push(handler);
       },
     },
-    window: { addEventListener: () => undefined },
+    window: {
+      addEventListener: (type: string, handler: (event: unknown) => void) => {
+        (windowListeners[type] ??= []).push(handler);
+      },
+    },
     Element: function Element(this: unknown) {},
   };
   vm.createContext(sandbox);
@@ -321,11 +337,15 @@ function loadInteractiveSandbox(): { sandbox: Record<string, unknown>; sent: Arr
     for (const handler of listeners.input) handler({ target });
   }
 
-  return { sandbox, sent, dispatchClick, dispatchKeydown, dispatchInput, el: elementFor };
+  function dispatchMessage(payload: Record<string, unknown>): void {
+    for (const handler of windowListeners.message) handler({ data: payload });
+  }
+
+  return { sandbox, sent, dispatchClick, dispatchKeydown, dispatchInput, dispatchMessage, el: elementFor };
 }
 
-test("webview wiring: clicking Edit sets edit mode, then Save sends updateMemoryNote with the textarea's current value", () => {
-  const { sandbox, sent, dispatchClick, el } = loadInteractiveSandbox();
+test("webview wiring: clicking Edit sets edit mode, then Save sends updateMemoryNote with the draft's current value, and edit mode EXITS ONLY once the extension host acks success", () => {
+  const { sandbox, sent, dispatchClick, dispatchInput, dispatchMessage } = loadInteractiveSandbox();
   vm.runInContext(
     'state = ' + JSON.stringify({
       memory: { notes: [{ id: "n1", text: "original", pinned: false, createdAt: 1 }], commands: [] },
@@ -338,14 +358,39 @@ test("webview wiring: clicking Edit sets edit mode, then Save sends updateMemory
 
   dispatchClick("[data-edit-note]", { editNote: "n1" });
   assert.equal(vm.runInContext("memoryEditingNoteId", sandbox as never), "n1");
+  assert.equal(vm.runInContext("memoryEditDraft", sandbox as never), "original", "entering edit mode must seed the draft from the note's current text");
 
-  el("editNoteText").value = "edited via textarea";
+  dispatchInput("editNoteText", "edited via textarea");
   dispatchClick("[data-save-note]", { saveNote: "n1" });
 
   assert.equal(sent.length, 1);
   assert.equal(sent[0].type, "updateMemoryNote");
-  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].extra)), { type: "updateMemoryNote", id: "n1", text: "edited via textarea" });
-  assert.equal(vm.runInContext("memoryEditingNoteId", sandbox as never), null, "saving must exit edit mode");
+  const payload = JSON.parse(JSON.stringify(sent[0].extra)) as { id: string; text: string; requestId: string };
+  assert.equal(payload.id, "n1");
+  assert.equal(payload.text, "edited via textarea");
+  assert.ok(payload.requestId, "a requestId must be sent so the ack can be matched back to this specific save");
+  assert.equal(vm.runInContext("memoryEditingNoteId", sandbox as never), "n1", "must stay in edit mode until the backend confirms success — sending the message is not the same as it being accepted");
+
+  dispatchMessage({ type: "memoryMutationResult", requestId: payload.requestId, ok: true });
+  assert.equal(vm.runInContext("memoryEditingNoteId", sandbox as never), null, "a successful ack must exit edit mode");
+  assert.equal(vm.runInContext("memoryEditDraft", sandbox as never), "", "a successful ack must clear the draft");
+});
+
+test("webview wiring: a REJECTED save keeps edit mode open and the draft text exactly as the user left it", () => {
+  const { sandbox, sent, dispatchClick, dispatchInput, dispatchMessage } = loadInteractiveSandbox();
+  vm.runInContext(
+    'state = ' + JSON.stringify({ memory: { notes: [{ id: "n1", text: "original", pinned: false, createdAt: 1 }], commands: [] }, isWorkspaceTrusted: true, summary: { level: "safe", capabilityResults: [] }, workspace: { repos: [] } }) + '; navigate("memory");',
+    sandbox as never,
+  );
+  dispatchClick("[data-edit-note]", { editNote: "n1" });
+  dispatchInput("editNoteText", "a very long edit that will be rejected");
+  dispatchClick("[data-save-note]", { saveNote: "n1" });
+  const requestId = (JSON.parse(JSON.stringify(sent[0].extra)) as { requestId: string }).requestId;
+
+  dispatchMessage({ type: "memoryMutationResult", requestId, ok: false, error: "Notes are limited to 4,000 characters." });
+
+  assert.equal(vm.runInContext("memoryEditingNoteId", sandbox as never), "n1", "a rejected save must NOT exit edit mode");
+  assert.equal(vm.runInContext("memoryEditDraft", sandbox as never), "a very long edit that will be rejected", "a rejected save must NOT lose the user's unsaved edit");
 });
 
 test("webview wiring: Cancel exits edit mode WITHOUT sending any message", () => {
@@ -383,6 +428,35 @@ test("webview wiring: Ctrl+Enter in the edit textarea triggers Save; plain Enter
   assert.equal(sent[0].type, "updateMemoryNote");
 });
 
+test("webview wiring: an unrelated backend state push while editing preserves the unsaved edit draft and edit mode", () => {
+  const { sandbox, dispatchClick, dispatchInput } = loadInteractiveSandbox();
+  const baseMemoryState = { memory: { notes: [{ id: "n1", text: "original", pinned: false, createdAt: 1 }], commands: [] }, isWorkspaceTrusted: true, summary: { level: "safe", capabilityResults: [] }, workspace: { repos: [] } };
+  vm.runInContext('state = ' + JSON.stringify(baseMemoryState) + '; navigate("memory");', sandbox as never);
+
+  dispatchClick("[data-edit-note]", { editNote: "n1" });
+  dispatchInput("editNoteText", "typed but not yet saved");
+
+  // Simulate a routine, UNRELATED backend push (a rescan/file-save/branch
+  // switch) causing a fresh "state" assignment and a full re-render —
+  // exactly what render() does on every real "state" message, and
+  // deliberately not a mutation ack.
+  vm.runInContext(`state = ${JSON.stringify(baseMemoryState)}; render();`, sandbox as never);
+
+  assert.equal(vm.runInContext("memoryEditingNoteId", sandbox as never), "n1", "an unrelated state push/re-render must not exit edit mode");
+  assert.equal(vm.runInContext("memoryEditDraft", sandbox as never), "typed but not yet saved", "an unrelated state push/re-render must not erase the unsaved draft");
+});
+
+test("webview wiring: an unrelated backend state push while composing a new note preserves the new-note draft", () => {
+  const { sandbox, dispatchInput } = loadInteractiveSandbox();
+  const baseMemoryState = { memory: { notes: [], commands: [] }, isWorkspaceTrusted: true, summary: { level: "safe", capabilityResults: [] }, workspace: { repos: [] } };
+  vm.runInContext('state = ' + JSON.stringify(baseMemoryState) + '; navigate("memory");', sandbox as never);
+
+  dispatchInput("newNoteText", "a draft note the user hasn't submitted yet");
+  vm.runInContext(`state = ${JSON.stringify(baseMemoryState)}; render();`, sandbox as never);
+
+  assert.equal(vm.runInContext("memoryNewNoteDraft", sandbox as never), "a draft note the user hasn't submitted yet", "an unrelated re-render must not erase an in-progress new-note draft");
+});
+
 test("webview wiring: typing in the search box updates only the notes list, never the search input's own value/focus", () => {
   const { sandbox, dispatchInput, el } = loadInteractiveSandbox();
   vm.runInContext(
@@ -401,16 +475,19 @@ test("webview wiring: typing in the search box updates only the notes list, neve
 });
 
 test("webview wiring: removeMemoryNote/togglePinMemoryNote/addMemoryNote messages carry the expected payload shape", () => {
-  const { sandbox, sent, dispatchClick, el } = loadInteractiveSandbox();
+  const { sandbox, sent, dispatchClick, dispatchInput } = loadInteractiveSandbox();
   vm.runInContext(
     'state = ' + JSON.stringify({ memory: { notes: [], commands: [] }, isWorkspaceTrusted: true, summary: { level: "safe", capabilityResults: [] }, workspace: { repos: [] } }) + '; navigate("memory");',
     sandbox as never,
   );
 
-  el("newNoteText").value = "a brand new note";
+  dispatchInput("newNoteText", "a brand new note");
   dispatchClick("#addNoteSubmit");
   assert.equal(sent[0].type, "addMemoryNote");
-  assert.deepEqual(JSON.parse(JSON.stringify(sent[0].extra)), { type: "addMemoryNote", text: "a brand new note", pinned: false });
+  const addPayload = JSON.parse(JSON.stringify(sent[0].extra)) as { text: string; pinned: boolean; requestId: string };
+  assert.equal(addPayload.text, "a brand new note");
+  assert.equal(addPayload.pinned, false);
+  assert.ok(addPayload.requestId);
 
   dispatchClick("[data-pin-note]", { pinNote: "n1" });
   assert.deepEqual(JSON.parse(JSON.stringify(sent[1].extra)), { type: "togglePinMemoryNote", id: "n1" });
@@ -429,4 +506,103 @@ test("webview wiring: export/export-all/import buttons send parameterless reques
   dispatchClick("#exportAllMemoryButton");
   dispatchClick("#importMemoryButton");
   assert.deepEqual(JSON.parse(JSON.stringify(sent.map((s) => s.type))), ["exportMemory", "exportAllMemory", "importMemory"]);
+});
+
+// ==================== release blocker: drafts survive rejection, clear only on confirmed success ====================
+
+test("release blocker: a REJECTED new note (e.g. over-limit) leaves the full draft in place — the composer does not clear on send, only on confirmed success", () => {
+  const { sandbox, sent, dispatchInput, dispatchClick, dispatchMessage } = loadInteractiveSandbox();
+  vm.runInContext(
+    'state = ' + JSON.stringify({ memory: { notes: [], commands: [] }, isWorkspaceTrusted: true, summary: { level: "safe", capabilityResults: [] }, workspace: { repos: [] } }) + '; navigate("memory");',
+    sandbox as never,
+  );
+  dispatchInput("newNoteText", "a note that will be rejected");
+  dispatchClick("#addNoteSubmit");
+  assert.equal(vm.runInContext("memoryNewNoteDraft", sandbox as never), "a note that will be rejected", "the draft must still be there right after sending — sending is not the same as being accepted");
+
+  const requestId = (JSON.parse(JSON.stringify(sent[0].extra)) as { requestId: string }).requestId;
+  dispatchMessage({ type: "memoryMutationResult", requestId, ok: false, error: "Notes are limited to 4,000 characters." });
+  assert.equal(vm.runInContext("memoryNewNoteDraft", sandbox as never), "a note that will be rejected", "a rejected add must NEVER lose the user's typed text");
+});
+
+test("release blocker: a SUCCESSFUL new note clears the composer only once acked, never optimistically on send", () => {
+  const { sandbox, sent, dispatchInput, dispatchClick, dispatchMessage } = loadInteractiveSandbox();
+  vm.runInContext(
+    'state = ' + JSON.stringify({ memory: { notes: [], commands: [] }, isWorkspaceTrusted: true, summary: { level: "safe", capabilityResults: [] }, workspace: { repos: [] } }) + '; navigate("memory");',
+    sandbox as never,
+  );
+  dispatchInput("newNoteText", "a note that will succeed");
+  dispatchClick("#addNoteSubmit");
+  assert.equal(vm.runInContext("memoryNewNoteDraft", sandbox as never), "a note that will succeed", "must not clear before the ack arrives");
+
+  const requestId = (JSON.parse(JSON.stringify(sent[0].extra)) as { requestId: string }).requestId;
+  dispatchMessage({ type: "memoryMutationResult", requestId, ok: true });
+  assert.equal(vm.runInContext("memoryNewNoteDraft", sandbox as never), "", "a successful ack clears the composer");
+});
+
+test("release blocker: a REJECTED saved command leaves both the label and command drafts intact", () => {
+  const { sandbox, sent, dispatchInput, dispatchClick, dispatchMessage } = loadInteractiveSandbox();
+  vm.runInContext(
+    'state = ' + JSON.stringify({ memory: { notes: [], commands: [] }, isWorkspaceTrusted: true, summary: { level: "safe", capabilityResults: [] }, workspace: { repos: [] } }) + '; navigate("memory");',
+    sandbox as never,
+  );
+  dispatchInput("newCommandLabel", "Start dev server");
+  dispatchInput("newCommandText", "pnpm dev");
+  dispatchClick("#addCommandButton");
+  const requestId = (JSON.parse(JSON.stringify(sent[0].extra)) as { requestId: string }).requestId;
+
+  dispatchMessage({ type: "memoryMutationResult", requestId, ok: false, error: "Something went wrong saving to Repo Memory." });
+  assert.equal(vm.runInContext("memoryNewCommandLabelDraft", sandbox as never), "Start dev server");
+  assert.equal(vm.runInContext("memoryNewCommandDraft", sandbox as never), "pnpm dev");
+});
+
+test("release blocker: a SUCCESSFUL saved command clears both drafts only once acked", () => {
+  const { sandbox, sent, dispatchInput, dispatchClick, dispatchMessage } = loadInteractiveSandbox();
+  vm.runInContext(
+    'state = ' + JSON.stringify({ memory: { notes: [], commands: [] }, isWorkspaceTrusted: true, summary: { level: "safe", capabilityResults: [] }, workspace: { repos: [] } }) + '; navigate("memory");',
+    sandbox as never,
+  );
+  dispatchInput("newCommandLabel", "Start dev server");
+  dispatchInput("newCommandText", "pnpm dev");
+  dispatchClick("#addCommandButton");
+  const requestId = (JSON.parse(JSON.stringify(sent[0].extra)) as { requestId: string }).requestId;
+
+  dispatchMessage({ type: "memoryMutationResult", requestId, ok: true });
+  assert.equal(vm.runInContext("memoryNewCommandLabelDraft", sandbox as never), "");
+  assert.equal(vm.runInContext("memoryNewCommandDraft", sandbox as never), "");
+});
+
+// ==================== workspace trust UX ====================
+
+test("workspace trust UX: an untrusted workspace disables add/edit/delete/pin/run/import controls but leaves search and export enabled", () => {
+  const sandbox = loadRenderSandbox();
+  run(sandbox, "state = " + JSON.stringify(baseState({
+    isWorkspaceTrusted: false,
+    memory: { notes: [{ id: "n1", text: "a note", pinned: false, createdAt: 1 }], commands: [{ id: "c1", label: "cmd", command: "echo hi", createdAt: 1 }] },
+  })) + ";");
+  const html = run(sandbox, "renderMemory()") as string;
+
+  assert.match(html, /id="addNoteSubmit"[^>]*disabled/);
+  assert.match(html, /data-edit-note="n1"[^>]*disabled/);
+  assert.match(html, /data-pin-note="n1"[^>]*disabled/);
+  assert.match(html, /data-remove-note="n1"[^>]*disabled/);
+  assert.match(html, /data-run-command="c1"[^>]*disabled/);
+  assert.match(html, /data-remove-command="c1"[^>]*disabled/);
+  assert.match(html, /id="importMemoryButton"[^>]*disabled/);
+
+  // Read-only actions must remain fully usable in an untrusted workspace.
+  assert.doesNotMatch(html, /id="exportMemoryButton"[^>]*disabled/);
+  assert.doesNotMatch(html, /id="exportAllMemoryButton"[^>]*disabled/);
+  assert.doesNotMatch(html, /id="memorySearchInput"[^>]*disabled/);
+  assert.doesNotMatch(html, /data-copy-command="c1"[^>]*disabled/);
+});
+
+test("workspace trust UX: a trusted workspace disables nothing", () => {
+  const sandbox = loadRenderSandbox();
+  run(sandbox, "state = " + JSON.stringify(baseState({
+    isWorkspaceTrusted: true,
+    memory: { notes: [{ id: "n1", text: "a note", pinned: false, createdAt: 1 }], commands: [] },
+  })) + ";");
+  const html = run(sandbox, "renderMemory()") as string;
+  assert.doesNotMatch(html, /disabled/);
 });
