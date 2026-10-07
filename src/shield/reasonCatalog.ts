@@ -3,7 +3,7 @@ import { ShieldReasonId } from "./types";
 /**
  * Human-readable description and the short machine code printed on the
  * `REASON:` line of a hook's block message (see `resources/shield/
- * shield-evaluate.sh`'s `report_block`). Declared as `Record<ShieldReasonId,
+ * shield-evaluate.sh`'s `block`). Declared as `Record<ShieldReasonId,
  * …>` on purpose: adding a new `ShieldReasonId` without an entry here is a
  * TypeScript compile error, so the catalog can never silently drift out of
  * sync with the id union. `src/test/identityLockOutput.test.ts` asserts the
