@@ -1,67 +1,77 @@
 import * as vscode from "vscode";
-import { Profile, SafetyPreferences } from "../types";
-import { sanitizeBranchList, sanitizeProfileList } from "../validation";
+import { IdentityListResult, identitiesFromLegacyProfiles, validateIdentityList } from "../identity/identityConfig";
+import { Identity } from "../identity/types";
 
 const SECTION = "repoIdentityGuard";
-const DEFAULT_PROTECTED_BRANCHES = ["main", "master"];
+
+/**
+ * Settings this version still reads or writes:
+ *
+ *  - `repoIdentityGuard.identities` — the reusable identity definitions.
+ *    Contributed with `"scope": "application"`, and read ONLY from the
+ *    user (global) value: a repository's own `.vscode/settings.json` can
+ *    never define or override an identity, so opening an untrusted
+ *    repository can never change what a lock enforces.
+ *
+ *  - `repoIdentityGuard.profiles` (RETIRED, read-only) — the old profile
+ *    list. Read only from the user (global) value, only for the one-time
+ *    identity migration and for the narrow legacy-Shield binding proof in
+ *    `src/identity/legacyMigration.ts`. Never written, never matched
+ *    against remotes.
+ *
+ * Obsolete and deterministically IGNORED (never read, never written, no
+ * longer contributed; any value left in settings.json has no effect):
+ * `repoIdentityGuard.protectedBranches`, `repoIdentityGuard.requireLocalIdentity`
+ * (a locked repository is always checked against the EFFECTIVE identity,
+ * wherever Git took it from, so "require local config" has no meaning),
+ * and `repoIdentityGuard.includeMemoryInAiContext` (the AI-context feature
+ * was removed).
+ */
 
 function config(): vscode.WorkspaceConfiguration {
   return vscode.workspace.getConfiguration(SECTION);
 }
 
+function globalValue(key: string): unknown {
+  return config().inspect<unknown>(key)?.globalValue;
+}
+
+/** The validated identity list, plus any entries that were rejected (for display — never silently dropped). */
+export function getIdentityList(): IdentityListResult {
+  return validateIdentityList(globalValue("identities"));
+}
+
+export function getIdentities(): Identity[] {
+  return getIdentityList().identities;
+}
+
+export async function saveIdentities(identities: Identity[]): Promise<void> {
+  await config().update("identities", identities, vscode.ConfigurationTarget.Global);
+}
+
+/** The retired profile list, raw (user scope only). Only legacy migration reads it. */
+export function getLegacyProfilesRaw(): unknown {
+  return globalValue("profiles");
+}
+
 /**
- * Persisted settings are a trust boundary, not just a typed getter: nothing
- * stops `settings.json` (hand-edited, synced from another machine, written
- * by another extension) from holding a value that doesn't match the
- * `configuration` schema at all — a string instead of an array, an object
- * instead of a string, a missing required field. `.get<Profile[]>` only
- * asserts the TypeScript type; it performs no runtime check. Every array
- * field on every profile is sanitized here so a single malformed entry
- * can't make a downstream `.map`/`.some`/`.filter` throw and take scanning
- * down with it — see `../validation`.
+ * One-time, deterministic identity migration: when no identities have been
+ * configured yet but legacy profiles exist, derive identities from them
+ * (see `identitiesFromLegacyProfiles`) and save them. A no-op once
+ * `identities` has any user value (even an empty list the user chose), so
+ * running it on every activation is safe. Never creates an assignment.
  */
-export function getProfiles(): Profile[] {
-  const configured = config().get("profiles", []);
-  return sanitizeProfileList(configured);
-}
-
-export async function saveProfiles(profiles: Profile[]): Promise<void> {
-  await config().update("profiles", profiles, vscode.ConfigurationTarget.Global);
-}
-
-export function getProtectedBranches(): string[] {
-  const configured = config().get("protectedBranches", DEFAULT_PROTECTED_BRANCHES);
-  return sanitizeBranchList(configured, DEFAULT_PROTECTED_BRANCHES);
-}
-
-export async function saveProtectedBranches(branches: string[]): Promise<void> {
-  await config().update("protectedBranches", branches, vscode.ConfigurationTarget.Global);
-}
-
-function sanitizeBoolean(value: unknown, fallback: boolean): boolean {
-  return typeof value === "boolean" ? value : fallback;
-}
-
-export function getSafetyPreferences(): SafetyPreferences {
-  return {
-    requireLocalIdentity: sanitizeBoolean(config().get("requireLocalIdentity", false), false),
-    includeMemoryInAiContext: sanitizeBoolean(config().get("includeMemoryInAiContext", false), false),
-  };
-}
-
-export async function saveRequireLocalIdentity(value: boolean): Promise<void> {
-  await config().update("requireLocalIdentity", value, vscode.ConfigurationTarget.Global);
-}
-
-export async function saveIncludeMemoryInAiContext(value: boolean): Promise<void> {
-  await config().update("includeMemoryInAiContext", value, vscode.ConfigurationTarget.Global);
+export async function migrateLegacyProfilesToIdentities(): Promise<{ migrated: number; rejected: number }> {
+  if (globalValue("identities") !== undefined) return { migrated: 0, rejected: 0 };
+  const legacy = getLegacyProfilesRaw();
+  if (!Array.isArray(legacy) || legacy.length === 0) return { migrated: 0, rejected: 0 };
+  const result = identitiesFromLegacyProfiles(legacy);
+  if (result.identities.length > 0) {
+    await saveIdentities(result.identities);
+  }
+  return { migrated: result.identities.length, rejected: result.rejected.length };
 }
 
 export function affectsRepoIdentityGuardConfig(event: vscode.ConfigurationChangeEvent): boolean {
-  return (
-    event.affectsConfiguration(`${SECTION}.profiles`) ||
-    event.affectsConfiguration(`${SECTION}.protectedBranches`) ||
-    event.affectsConfiguration(`${SECTION}.requireLocalIdentity`) ||
-    event.affectsConfiguration(`${SECTION}.includeMemoryInAiContext`)
-  );
+  return event.affectsConfiguration(`${SECTION}.identities`) || event.affectsConfiguration(`${SECTION}.profiles`);
 }

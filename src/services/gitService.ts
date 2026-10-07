@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { IdentityConfigScope, InProgressOperation, RemoteProtocol, RepoFacts } from "../types";
+import { IdentityConfigScope, RemoteProtocol } from "../types";
 
 const execFileAsync = promisify(execFile);
 
@@ -37,15 +37,6 @@ async function tryGit(cwd: string, args: string[]): Promise<string | null> {
   }
 }
 
-async function pathExists(candidate: string): Promise<boolean> {
-  try {
-    await fs.access(candidate);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export async function getRepoRoot(cwd: string): Promise<string | null> {
   return tryGit(cwd, ["rev-parse", "--show-toplevel"]);
 }
@@ -62,9 +53,9 @@ export async function getRepoRoot(cwd: string): Promise<string | null> {
  * when even that fails, rather than throwing: an unresolvable path is
  * still a valid (if less deduplicated) identity, never a hard error.
  *
- * Shared by multi-root repository deduplication (`extension.ts`) and Repo
- * Memory's repository-identity keys (`src/storage/memoryStore.ts`) — both
- * need the exact same notion of "is this the same repo/checkout as that
+ * Shared by the identity-lock assignment key (`src/identity/assignment.ts`)
+ * and Repo Notes' repository-identity keys (`src/storage/memoryStore.ts`) —
+ * both need the exact same notion of "is this the same repository as that
  * one," and a Windows-casing or symlink difference must not silently split
  * one repository's identity in either place.
  */
@@ -96,61 +87,6 @@ export async function getGitVersionRaw(cwd: string): Promise<string | null> {
 
 export async function getCurrentBranch(repoRoot: string): Promise<string | null> {
   return tryGit(repoRoot, ["branch", "--show-current"]);
-}
-
-export async function isDetachedHead(repoRoot: string): Promise<boolean> {
-  const branch = await tryGit(repoRoot, ["symbolic-ref", "-q", "HEAD"]);
-  return branch === null;
-}
-
-export interface StatusFacts {
-  hasChanges: boolean;
-  hasConflicts: boolean;
-}
-
-/** Parses `status --porcelain=v2 --branch` output. `u ` entries are unmerged (conflicted). */
-export function parseStatusPorcelain(status: string): StatusFacts {
-  let hasChanges = false;
-  let hasConflicts = false;
-
-  for (const line of status.split("\n")) {
-    if (!line || line.startsWith("#")) {
-      continue;
-    }
-    hasChanges = true;
-    if (line.startsWith("u ")) {
-      hasConflicts = true;
-    }
-  }
-
-  return { hasChanges, hasConflicts };
-}
-
-/**
- * Deliberately uses `runGit`, not `tryGit`: unlike `config --get` or
- * `remote get-url` (where a nonzero exit is a normal "value doesn't
- * exist"), `git status` failing means something is actually wrong with the
- * repo. Swallowing that as "missing" would report a clean working tree
- * when the truth is unknown — a failing status must surface as an
- * inspection failure, not a false "safe."
- */
-export async function getStatusFacts(repoRoot: string): Promise<StatusFacts> {
-  const status = await runGit(repoRoot, ["status", "--porcelain=v2", "--branch"]);
-  return parseStatusPorcelain(status);
-}
-
-/**
- * Detects an unfinished merge/rebase/cherry-pick/revert by checking for the
- * marker files Git itself uses — these live per-worktree in `--git-dir`, not
- * the shared `--git-common-dir`.
- */
-export async function detectInProgressOperation(gitDir: string): Promise<InProgressOperation | undefined> {
-  if (await pathExists(path.join(gitDir, "MERGE_HEAD"))) return "merge";
-  if (await pathExists(path.join(gitDir, "CHERRY_PICK_HEAD"))) return "cherry-pick";
-  if (await pathExists(path.join(gitDir, "REVERT_HEAD"))) return "revert";
-  if (await pathExists(path.join(gitDir, "rebase-merge"))) return "rebase";
-  if (await pathExists(path.join(gitDir, "rebase-apply"))) return "rebase";
-  return undefined;
 }
 
 async function resolveGitPath(repoRoot: string, args: string[]): Promise<string | null> {
@@ -227,31 +163,14 @@ export async function getWorktreeConfigEnabled(repoRoot: string): Promise<boolea
 }
 
 /**
- * How many worktrees (main + linked) are attached to this repository, via
- * `git worktree list --porcelain`. A repo can have other worktrees attached
- * while itself being the main one (`isLinkedWorktree` false) — that alone
- * doesn't mean a config write here is safely worktree-scoped.
- *
- * Uses `runGit`, not `tryGit`: a failing `worktree list` must surface as an
- * inspection failure, not silently collapse to "1 worktree" — that would
- * hide a real error behind an unremarkable-looking default.
- */
-export async function getWorktreeCount(repoRoot: string): Promise<number> {
-  const output = await runGit(repoRoot, ["worktree", "list", "--porcelain"]);
-  const count = output.split("\n").filter((line) => line.startsWith("worktree ")).length;
-  return count > 0 ? count : 1;
-}
-
-/**
- * Whether `Fix Commit Identity` should write to `--local` or `--worktree`.
+ * Whether "Use Assigned Identity in Git Config" should write to `--local`
+ * or `--worktree`.
  * This depends only on whether `extensions.worktreeConfig` is on — *not*
  * on how many worktrees currently exist. When it's on, Git reads
  * `config.worktree` *after* the shared repo config and lets it override,
  * even with only one worktree attached right now: if that file already
  * holds a stale value, writing the fix to `--local` would succeed as a
- * command while leaving the effective identity wrong. Worktree count only
- * affects how the confirmation message explains the blast radius — see
- * the caller's warning text — never whether `--worktree` is used.
+ * command while leaving the effective identity wrong.
  */
 export function resolveIdentityConfigScope(worktreeConfigEnabled: boolean | null | undefined): IdentityConfigScope {
   return worktreeConfigEnabled === true ? "worktree" : "local";
@@ -259,17 +178,6 @@ export function resolveIdentityConfigScope(worktreeConfigEnabled: boolean | null
 
 export async function getOriginRemote(repoRoot: string): Promise<string | null> {
   return tryGit(repoRoot, ["remote", "get-url", "origin"]);
-}
-
-/**
- * The `upstream` remote, if one exists — the conventional name for the repo
- * a fork was created from. This is purely a naming convention (there's no
- * reliable way to detect a fork relationship from Git alone), so callers
- * must treat it as evidence to cross-check against `origin`, never as an
- * automatic profile winner.
- */
-export async function getUpstreamRemote(repoRoot: string): Promise<string | null> {
-  return tryGit(repoRoot, ["remote", "get-url", "upstream"]);
 }
 
 /**
@@ -302,39 +210,6 @@ export async function getPushUrl(repoRoot: string, remoteName: string): Promise<
   return tryGit(repoRoot, ["remote", "get-url", "--push", remoteName]);
 }
 
-export async function getLocalGitUserName(repoRoot: string): Promise<string | null> {
-  return tryGit(repoRoot, ["config", "--local", "user.name"]);
-}
-
-export async function getLocalGitUserEmail(repoRoot: string): Promise<string | null> {
-  return tryGit(repoRoot, ["config", "--local", "user.email"]);
-}
-
-/**
- * The worktree-scoped value, if any (`config.worktree`, only actually
- * distinct from `--local` when `extensions.worktreeConfig` is on — Git
- * itself falls back to treating `--worktree` as `--local` otherwise, so
- * this is safe to query unconditionally). Needed because Fix Commit
- * Identity may have written here instead of `--local` — see
- * `resolveIdentityConfigScope` — and a strict "is this locked outside
- * global config" check must recognize either.
- */
-export async function getWorktreeGitUserName(repoRoot: string): Promise<string | null> {
-  return tryGit(repoRoot, ["config", "--worktree", "user.name"]);
-}
-
-export async function getWorktreeGitUserEmail(repoRoot: string): Promise<string | null> {
-  return tryGit(repoRoot, ["config", "--worktree", "user.email"]);
-}
-
-export async function getGlobalGitUserName(): Promise<string | null> {
-  return tryGit(process.cwd(), ["config", "--global", "user.name"]);
-}
-
-export async function getGlobalGitUserEmail(): Promise<string | null> {
-  return tryGit(process.cwd(), ["config", "--global", "user.email"]);
-}
-
 export interface ParsedIdent {
   name?: string;
   email?: string;
@@ -362,11 +237,9 @@ export function parseGitIdent(raw: string): ParsedIdent {
  * Scope of this guarantee: `git var` runs as a child process of the VS
  * Code extension host, so this reflects *that process's* environment at
  * the moment of the call — not every process that could create a commit
- * in this repo. A separate integrated terminal, an external agent
- * process, a shell profile sourced only interactively, or an explicit
- * `git commit --author=...`/`-c user.email=...` can each see a different
- * environment or override this scan never observed. Do not read a
- * "confirmed" result here as a guarantee about every future commit.
+ * in this repo. That is exactly why the identity lock is enforced by Git
+ * hooks at commit time (which see the committing process's own
+ * environment and `-c`/`--author` overrides), never by this read.
  */
 export async function getEffectiveAuthorIdent(repoRoot: string): Promise<ParsedIdent> {
   const raw = await tryGit(repoRoot, ["var", "GIT_AUTHOR_IDENT"]);
@@ -380,27 +253,23 @@ export async function getEffectiveCommitterIdent(repoRoot: string): Promise<Pars
 }
 
 /**
- * Only allowed mutations: this repo's own `user.name`/`user.email`, written
- * to either `--local` or `--worktree` per `scope` — see
- * `resolveIdentityConfigScope`. Never touches global config, and never
- * writes `--worktree` unless the caller has confirmed
- * `extensions.worktreeConfig` actually makes that scope per-worktree.
+ * The only Git config mutation Repo Identity Guard performs outside its
+ * own lock files: this repo's own `user.name`/`user.email` ("Use Assigned
+ * Identity in Git Config"), written to either `--local` or `--worktree`
+ * per `scope` — see `resolveIdentityConfigScope`. Never touches global
+ * config.
  */
 export async function setLocalGitIdentity(
   repoRoot: string,
-  name: string,
+  name: string | undefined,
   email: string,
   scope: IdentityConfigScope = "local",
 ): Promise<void> {
   const flag = scope === "worktree" ? "--worktree" : "--local";
-  await runGit(repoRoot, ["config", flag, "user.name", name]);
+  // An identity without a gitName only constrains the email, so only the
+  // email is written — an existing user.name is left as it is.
+  if (name) await runGit(repoRoot, ["config", flag, "user.name", name]);
   await runGit(repoRoot, ["config", flag, "user.email", email]);
-}
-
-export async function unsetLocalGitIdentity(repoRoot: string, scope: IdentityConfigScope = "local"): Promise<void> {
-  const flag = scope === "worktree" ? "--worktree" : "--local";
-  await tryGit(repoRoot, ["config", flag, "--unset", "user.name"]);
-  await tryGit(repoRoot, ["config", flag, "--unset", "user.email"]);
 }
 
 export interface ParsedRemote {
@@ -436,9 +305,10 @@ export interface ParsedRemote {
 }
 
 /**
- * Parses a normalized owner/repo out of common SSH, SSH-alias, and HTTPS
- * remote URL shapes. Returns "unknown" protocol/parts rather than throwing
- * so a malformed remote never blocks the rest of the scan.
+ * Parses common SSH, SSH-alias, and HTTPS remote URL shapes. Returns
+ * "unknown" protocol/parts rather than throwing. The identity lock uses the
+ * protocol/host/port/user (which decide the push's authentication route);
+ * owner/repo are only used by legacy-migration evidence (`exactRepos`).
  */
 export function parseRemoteUrl(remoteUrl: string): ParsedRemote {
   const trimmed = remoteUrl.trim();
@@ -481,132 +351,4 @@ export function parseRemoteUrl(remoteUrl: string): ParsedRemote {
   }
 
   return { protocol: "unknown" };
-}
-
-function getRepoNameFromRoot(repoRoot: string): string {
-  return path.basename(repoRoot);
-}
-
-export async function collectRepoFacts(cwd: string | undefined): Promise<RepoFacts> {
-  if (!cwd) {
-    return { isGitRepo: false };
-  }
-
-  let repoRoot: string | null;
-  try {
-    repoRoot = await getRepoRoot(cwd);
-  } catch (error) {
-    return { isGitRepo: false, gitError: getErrorMessage(error) };
-  }
-
-  if (!repoRoot) {
-    return { isGitRepo: false };
-  }
-
-  try {
-    const [
-      currentBranch,
-      detached,
-      statusFacts,
-      remoteUrl,
-      upstreamUrl,
-      authorIdent,
-      committerIdent,
-      localName,
-      localEmail,
-      worktreeName,
-      worktreeEmail,
-      globalName,
-      globalEmail,
-      gitDir,
-      gitCommonDir,
-      worktreeConfigEnabled,
-      worktreeCount,
-    ] = await Promise.all([
-      getCurrentBranch(repoRoot),
-      isDetachedHead(repoRoot),
-      getStatusFacts(repoRoot),
-      getOriginRemote(repoRoot),
-      getUpstreamRemote(repoRoot),
-      getEffectiveAuthorIdent(repoRoot),
-      getEffectiveCommitterIdent(repoRoot),
-      getLocalGitUserName(repoRoot),
-      getLocalGitUserEmail(repoRoot),
-      getWorktreeGitUserName(repoRoot),
-      getWorktreeGitUserEmail(repoRoot),
-      getGlobalGitUserName(),
-      getGlobalGitUserEmail(),
-      getGitDir(repoRoot),
-      getGitCommonDir(repoRoot),
-      getWorktreeConfigEnabled(repoRoot),
-      getWorktreeCount(repoRoot),
-    ]);
-
-    const inProgressOperation = gitDir ? await detectInProgressOperation(gitDir) : undefined;
-
-    const pushRemoteName = await getPushRemoteName(repoRoot, currentBranch);
-    const pushRemoteUrl = pushRemoteName ? await getPushUrl(repoRoot, pushRemoteName) : null;
-    const parsedPushRemote = pushRemoteUrl ? parseRemoteUrl(pushRemoteUrl) : undefined;
-
-    const parsedRemote = remoteUrl ? parseRemoteUrl(remoteUrl) : undefined;
-    const parsedUpstream = upstreamUrl ? parseRemoteUrl(upstreamUrl) : undefined;
-
-    return {
-      isGitRepo: true,
-      repoRoot,
-      repoName: getRepoNameFromRoot(repoRoot),
-      currentBranch: currentBranch ?? undefined,
-      isDetachedHead: detached,
-      hasUncommittedChanges: statusFacts.hasChanges,
-      hasMergeConflicts: statusFacts.hasConflicts,
-      inProgressOperation,
-      isLinkedWorktree: isLinkedWorktree(gitDir, gitCommonDir),
-      worktreeConfigEnabled: worktreeConfigEnabled ?? undefined,
-      worktreeCount,
-      gitDir: gitDir ?? undefined,
-      gitCommonDir: gitCommonDir ?? undefined,
-
-      effectiveGitName: authorIdent.name,
-      effectiveGitEmail: authorIdent.email,
-      effectiveCommitterName: committerIdent.name,
-      effectiveCommitterEmail: committerIdent.email,
-      localGitName: localName ?? undefined,
-      localGitEmail: localEmail ?? undefined,
-      worktreeGitName: worktreeName ?? undefined,
-      worktreeGitEmail: worktreeEmail ?? undefined,
-      globalGitName: globalName ?? undefined,
-      globalGitEmail: globalEmail ?? undefined,
-
-      originRemoteUrl: remoteUrl ?? undefined,
-      remoteProtocol: parsedRemote?.protocol,
-      remoteHost: parsedRemote?.host,
-      remoteOwner: parsedRemote?.owner,
-      remoteRepo: parsedRemote?.repo,
-
-      pushRemoteName: pushRemoteName ?? undefined,
-      pushRemoteUrl: pushRemoteUrl ?? undefined,
-      pushRemoteProtocol: parsedPushRemote?.protocol,
-      pushRemoteHost: parsedPushRemote?.host,
-      pushRemoteOwner: parsedPushRemote?.owner,
-      pushRemoteRepo: parsedPushRemote?.repo,
-      pushRemotePort: parsedPushRemote?.port,
-      pushRemoteUser: parsedPushRemote?.sshUser,
-
-      upstreamRemoteUrl: upstreamUrl ?? undefined,
-      upstreamHost: parsedUpstream?.host,
-      upstreamOwner: parsedUpstream?.owner,
-      upstreamRepo: parsedUpstream?.repo,
-    };
-  } catch (error) {
-    return {
-      isGitRepo: true,
-      repoRoot,
-      repoName: getRepoNameFromRoot(repoRoot),
-      gitError: getErrorMessage(error),
-    };
-  }
-}
-
-function getErrorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

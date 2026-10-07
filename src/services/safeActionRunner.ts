@@ -1,34 +1,21 @@
 import { IdentityConfigScope } from "../types";
-import {
-  setLocalGitIdentity,
-  unsetLocalGitIdentity,
-} from "./gitService";
+import { setLocalGitIdentity } from "./gitService";
 
 /**
- * The only mutating Git actions Repo Identity Guard is allowed to perform:
- * setting or unsetting this repo's own `user.name`/`user.email`, to either
+ * The only Git config write Repo Identity Guard performs outside its own
+ * identity-lock files: "Use Assigned Identity in Git Config" — setting this
+ * repository's own `user.name`/`user.email` to the assigned identity, in
  * `--local` or `--worktree` per the caller's resolved scope (see
- * `resolveIdentityConfigScope`). Nothing here ever touches global Git
- * config, remotes, SSH config, credential managers, or runs
- * push/reset/rebase/merge/clean — those must always go through the user's
- * own terminal.
+ * `resolveIdentityConfigScope`). Never touches global Git config, remotes,
+ * SSH config, credential managers, and never runs push/reset/rebase/merge.
  */
 export class SafeActionRunner {
-  public async setLocalIdentity(
-    repoRoot: string,
-    name: string,
-    email: string,
-    scope: IdentityConfigScope = "local",
-  ): Promise<void> {
-    const trimmedName = name.trim();
+  public async setLocalIdentity(repoRoot: string, name: string | undefined, email: string, scope: IdentityConfigScope = "local"): Promise<void> {
+    const trimmedName = name?.trim();
     const trimmedEmail = email.trim();
-    if (!trimmedName || !trimmedEmail) {
-      throw new Error("Name and email are required to set a local Git identity.");
+    if (!trimmedEmail) {
+      throw new Error("An email is required to set a local Git identity.");
     }
-    await setLocalGitIdentity(repoRoot, trimmedName, trimmedEmail, scope);
-  }
-
-  public async unsetLocalIdentity(repoRoot: string, scope: IdentityConfigScope = "local"): Promise<void> {
-    await unsetLocalGitIdentity(repoRoot, scope);
+    await setLocalGitIdentity(repoRoot, trimmedName || undefined, trimmedEmail, scope);
   }
 }

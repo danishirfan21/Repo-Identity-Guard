@@ -4,7 +4,6 @@ import {
   isLinkedWorktree,
   parseGitIdent,
   parseRemoteUrl,
-  parseStatusPorcelain,
   resolveIdentityConfigScope,
 } from "../services/gitService";
 
@@ -59,27 +58,6 @@ test("parseGitIdent handles names containing angle-bracket-adjacent characters",
 
 test("parseGitIdent returns empty on unrecognized input rather than throwing", () => {
   assert.deepEqual(parseGitIdent("garbage"), {});
-});
-
-test("parseStatusPorcelain detects ordinary changes without conflicts", () => {
-  const status = "# branch.oid abc123\n# branch.head main\n1 .M N... 100644 100644 100644 abc abc file.ts\n";
-  const facts = parseStatusPorcelain(status);
-  assert.equal(facts.hasChanges, true);
-  assert.equal(facts.hasConflicts, false);
-});
-
-test("parseStatusPorcelain detects unmerged conflict entries", () => {
-  const status = "# branch.oid abc123\nu UU N... 100644 100644 100644 100644 aaa bbb ccc file.ts\n";
-  const facts = parseStatusPorcelain(status);
-  assert.equal(facts.hasChanges, true);
-  assert.equal(facts.hasConflicts, true);
-});
-
-test("parseStatusPorcelain reports a clean tree as no changes", () => {
-  const status = "# branch.oid abc123\n# branch.head main\n";
-  const facts = parseStatusPorcelain(status);
-  assert.equal(facts.hasChanges, false);
-  assert.equal(facts.hasConflicts, false);
 });
 
 test("isLinkedWorktree compares git-dir against git-common-dir", () => {
