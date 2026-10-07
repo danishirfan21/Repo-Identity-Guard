@@ -5,31 +5,32 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ShieldManager } from "../shield/manager";
-import { Profile, RepoFacts } from "../types";
+import { IdentityLockService } from "../identity/identityLockService";
+import { WORK_IDENTITY } from "./testUtil/lockFixtures";
 
 /**
  * PART 11 — package a real VSIX and inspect what is actually inside it.
  *
- * Shield is the reason this matters more than usual. `src/extension.ts`
- * resolves its evaluator as
+ * The identity lock is the reason this matters more than usual.
+ * `src/extension.ts` resolves its evaluator as
  * `path.join(context.extensionPath, "resources", "shield",
- * "shield-evaluate.sh")` and copies it into every repository Shield
- * guards. A `.vscodeignore` rule that swallowed `resources/**` would
- * produce an extension that compiles, tests green, installs cleanly, and
- * then fails at the exact moment a user turns Shield on — on a machine
- * that has no way to get the missing file back.
+ * "shield-evaluate.sh")` and copies it into every repository an identity
+ * is assigned to. A `.vscodeignore` rule that swallowed `resources/**`
+ * would produce an extension that compiles, tests green, installs
+ * cleanly, and then fails at the exact moment a user assigns an identity —
+ * on a machine that has no way to get the missing file back.
  *
  * So this builds a real VSIX with the real `@vscode/vsce`, extracts it, and
  * checks both directions:
  *
- *  - everything Shield and the UI need IS there;
+ *  - everything the identity lock, notes and the UI need IS there;
  *  - nothing that should not ship IS there (sources, compiled tests, source
  *    maps, .git, node_modules, temp test repositories, env files, keys).
  *
  * Then it runs a genuine smoke test: the extracted `extension/` directory
- * is treated as `extensionPath` and handed to the real `ShieldManager`,
- * which must be able to enable Shield in a real repository from it. That is
+ * is treated as `extensionPath` and handed to the real
+ * `IdentityLockService`, which must be able to assign (and unlock) an
+ * identity in a real repository from it. That is
  * the only check that proves the packaged evaluator is not merely present
  * but readable and usable the way the extension uses it.
  *
@@ -133,7 +134,7 @@ async function extractZip(zipPath: string, destDir: string): Promise<void> {
   }
 }
 
-test("PART 11 — the packaged VSIX contains everything Shield and the UI need, and nothing that should not ship", { timeout: 600_000 }, async (t) => {
+test("PART 11 — the packaged VSIX contains everything the lock, notes and the UI need, and nothing that should not ship", { timeout: 600_000 }, async (t) => {
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-vsix-"));
   try {
     const packaged = await packageVsix(workDir);
@@ -145,19 +146,24 @@ test("PART 11 — the packaged VSIX contains everything Shield and the UI need, 
 
     // ---- must be present ----
     const required = [
-      // THE Shield file. Its absence would make "Enable Shield" fail at the
-      // point of use, with no way for the user to recover it.
+      // THE enforcement file. Its absence would make "Assign Identity" fail
+      // at the point of use, with no way for the user to recover it.
       "extension/resources/shield/shield-evaluate.sh",
-      // Compiled extension entry point + the Shield implementation.
+      // Compiled extension entry point, the identity lock and its engine.
       "extension/out/extension.js",
+      "extension/out/identity/identityLockService.js",
+      "extension/out/identity/legacyMigration.js",
       "extension/out/shield/manager.js",
       "extension/out/shield/evaluator.js",
       "extension/out/shield/policy.js",
       "extension/out/shield/installRecord.js",
+      // Notes storage.
+      "extension/out/storage/memoryStore.js",
+      "extension/out/storage/memoryStoreCore.js",
       // Webview assets and the activity-bar icon.
       "extension/media/sidebar.css",
       "extension/resources/repo-id.svg",
-      "extension/out/webview/client/settingsView.js",
+      "extension/out/webview/client/placeholderView.js",
       // Package metadata.
       "extension/package.json",
     ];
@@ -180,6 +186,9 @@ test("PART 11 — the packaged VSIX contains everything Shield and the UI need, 
       [/\.(pem|key|p12)$/, "keys or certificates"],
       [/\.vsix$/, "a nested VSIX"],
       [/(^|\/)package-lock\.json$/, "the lockfile"],
+      // Removed features must not linger as stale compiled output.
+      [/^extension\/out\/core\//, "the removed safety-status engine"],
+      [/^extension\/out\/services\/commandRunner\.js$/, "the removed saved-command runner"],
     ];
     for (const [pattern, description] of forbidden) {
       const hits = files.filter((f) => pattern.test(f));
@@ -195,7 +204,7 @@ test("PART 11 — the packaged VSIX contains everything Shield and the UI need, 
   }
 });
 
-test("PART 11 — smoke test: Shield can be enabled from an extracted VSIX treated as extensionPath", { timeout: 600_000 }, async (t) => {
+test("PART 11 — smoke test: an identity can be assigned and unlocked from an extracted VSIX treated as extensionPath", { timeout: 600_000 }, async (t) => {
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-vsix-smoke-"));
   try {
     const packaged = await packageVsix(workDir);
@@ -208,7 +217,7 @@ test("PART 11 — smoke test: Shield can be enabled from an extracted VSIX treat
     const evaluatorSource = path.join(packaged.extensionDir, "resources", "shield", "shield-evaluate.sh");
     const contents = await fs.readFile(evaluatorSource, "utf8");
     assert.match(contents, /^#!\/bin\/sh/, "the packaged evaluator is not a POSIX shell script");
-    assert.match(contents, /repo-identity-guard-shield-artifact/, "the packaged evaluator has no Shield ownership marker");
+    assert.match(contents, /repo-identity-guard-shield-artifact/, "the packaged evaluator has no ownership marker");
 
     // ...and it genuinely works as the source for a real installation.
     const repo = await fs.mkdtemp(path.join(workDir, "repo-"));
@@ -221,37 +230,22 @@ test("PART 11 — smoke test: Shield can be enabled from an extracted VSIX treat
     await git(["config", "user.email", "work@example.com"]);
     await git(["remote", "add", "origin", "git@github.com:AcmeSoftware/thing.git"]);
 
-    const profile: Profile = {
-      id: "work",
-      label: "Work",
-      gitName: "Danish Irfan",
-      gitEmail: "work@example.com",
-      expectedRemoteOwners: ["AcmeSoftware"],
-      strictPushSetup: false,
-    };
-    const facts: RepoFacts = {
-      isGitRepo: true,
-      repoRoot: repo,
-      currentBranch: "main",
-      remoteHost: "github.com",
-      remoteOwner: "AcmeSoftware",
-      remoteRepo: "thing",
-      pushRemoteHost: "github.com",
-      pushRemoteOwner: "AcmeSoftware",
-      pushRemoteRepo: "thing",
-    };
-
-    const manager = new ShieldManager();
-    const result = await manager.enable(repo, evaluatorSource, { facts, profiles: [profile], protectedBranches: ["main"] });
-    assert.equal(result.inspection.state, "active", result.inspection.reasons.join(" | "));
+    const service = new IdentityLockService({ evaluatorScriptSource: evaluatorSource });
+    const repoRef = await service.resolveRepository(repo);
+    assert.ok(repoRef, "the temporary repository must resolve");
+    const assigned = await service.assign(repoRef, WORK_IDENTITY);
+    assert.equal(assigned.ok, true, `${assigned.message} ${assigned.details.join(" | ")}`);
+    assert.equal(assigned.status?.enforcement.state, "active");
 
     // The installed copy is byte-identical to the packaged one, and
     // inspect() — given the packaged file as the comparison source, exactly
     // as the extension does — sees no modification.
-    const healthy = await manager.inspect(repo, { evaluatorScriptSource: evaluatorSource });
-    assert.equal(healthy.state, "active", healthy.reasons.join(" | "));
-    assert.equal(healthy.evaluatorModified, false);
-    assert.equal((await manager.disable(repo)).state, "off");
+    const healthy = await service.getStatus(repoRef, [WORK_IDENTITY]);
+    assert.equal(healthy.inspection.state, "active", healthy.inspection.reasons.join(" | "));
+    assert.equal(healthy.inspection.evaluatorModified, false);
+    const unlocked = await service.unlock(repoRef, [WORK_IDENTITY]);
+    assert.equal(unlocked.ok, true, unlocked.message);
+    assert.equal(unlocked.status?.enforcement.state, "unassigned");
   } finally {
     await fs.rm(workDir, { recursive: true, force: true }).catch(() => undefined);
   }
@@ -259,7 +253,7 @@ test("PART 11 — smoke test: Shield can be enabled from an extracted VSIX treat
 
 test("PART 11 — .vscodeignore never excludes resources/, out/ (non-test), or media/", async () => {
   // Dependency-free backstop for the single most damaging packaging
-  // regression: excluding the directory Shield's evaluator lives in. This
+  // regression: excluding the directory the lock's evaluator lives in. This
   // runs even where `vsce` cannot.
   const ignore = await fs.readFile(path.join(REPO_ROOT, ".vscodeignore"), "utf8");
   const rules = ignore
@@ -268,7 +262,7 @@ test("PART 11 — .vscodeignore never excludes resources/, out/ (non-test), or m
     .filter((line) => line.length > 0 && !line.startsWith("#"));
 
   for (const rule of rules) {
-    assert.ok(!/^resources(\/|$)/.test(rule), `.vscodeignore excludes Shield's evaluator directory: "${rule}"`);
+    assert.ok(!/^resources(\/|$)/.test(rule), `.vscodeignore excludes the lock's evaluator directory: "${rule}"`);
     assert.ok(!/^media(\/|$)/.test(rule), `.vscodeignore excludes the webview assets: "${rule}"`);
     assert.ok(!/^out(\/\*\*)?$/.test(rule), `.vscodeignore excludes the entire compiled output: "${rule}"`);
     assert.ok(!/^package\.json$/.test(rule), `.vscodeignore excludes package.json: "${rule}"`);

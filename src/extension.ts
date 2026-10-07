@@ -1,1266 +1,689 @@
-import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { buildAiContext, buildWorkspaceSafetySummary } from "./core/aiContext";
-import { canonicalRepoKey, findOverlappingProfiles, resolveProfiles } from "./core/profileResolver";
-import { computeStatus } from "./core/statusEngine";
-import { computeWorkspaceSafetyState, workspaceProblemCount } from "./core/workspaceAggregate";
-import { canonicalizeRepoPath, collectRepoFacts, resolveIdentityConfigScope } from "./services/gitService";
-import { copyToClipboard, runSavedCommand } from "./services/commandRunner";
+import { RepositoryRef } from "./identity/assignment";
+import { IdentityLockService, LockOperationResult, LockStatus } from "./identity/identityLockService";
+import { Identity, RepoIdentityState } from "./identity/types";
+import {
+  canonicalizeRepoPath,
+  getEffectiveAuthorIdent,
+  getGitDir,
+  getWorktreeConfigEnabled,
+  resolveIdentityConfigScope,
+} from "./services/gitService";
 import { SafeActionRunner } from "./services/safeActionRunner";
-import { ShieldManager } from "./shield";
+import { IdentityStatusBar } from "./statusBar";
 import {
   affectsRepoIdentityGuardConfig,
-  getProfiles,
-  getProtectedBranches,
-  getSafetyPreferences,
-  saveIncludeMemoryInAiContext,
-  saveProfiles,
-  saveProtectedBranches,
-  saveRequireLocalIdentity,
+  getIdentities,
+  getIdentityList,
+  getLegacyProfilesRaw,
+  migrateLegacyProfilesToIdentities,
 } from "./storage/configStore";
-import { MAX_IMPORT_FILE_BYTES, MemoryExport, MemoryLimitError, MemoryStore } from "./storage/memoryStore";
-import { RepoIdentitySidebarProvider, SidebarModel } from "./ui/SidebarProvider";
-import { IdentityStatusBar } from "./statusBar";
-import { Profile, RepoFacts, RepositorySafetyState, StatusSummary, WorkspaceSafetyState, emptyRepoMemory } from "./types";
+import { MAX_IMPORT_FILE_BYTES, MemoryExport, MemoryKeys, MemoryLimitError, MemoryStore } from "./storage/memoryStore";
+import { NoteMutationResult, RepoIdentitySidebarProvider } from "./ui/SidebarProvider";
+import { SidebarModel } from "./ui/wireState";
 
-function emptyNotCheckedSummary(gitError?: string): StatusSummary {
-  return {
-    level: "not_checked",
-    capabilityResults: [],
-    infoNotes: [],
-    issueCount: 0,
-    facts: { isGitRepo: false, gitError },
-  };
-}
-
-function emptyWorkspaceState(): WorkspaceSafetyState {
-  return { level: "not_checked", repos: [], safeCount: 0, notSafeCount: 0, uncheckedCount: 0 };
-}
-
-let latestSummary: StatusSummary = emptyNotCheckedSummary();
-/** All repos detected across the workspace this scan, and the derived aggregate — see `computeWorkspaceSafetyState`. */
-let workspaceState: WorkspaceSafetyState = emptyWorkspaceState();
-/** The repo mutating/executing actions apply to. Always a concrete repo from `workspaceState.repos`, never ambiguous. */
-let selectedRepoId: string | undefined;
-let scanSequence = 0;
-/** One or more watchers per repo (its gitDir and, for linked worktrees, gitCommonDir too), reconciled by repoId after every scan — see `reconcileRepoWatchers`. */
-let repoWatchers = new Map<string, vscode.Disposable[]>();
-let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 /**
- * Repo Memory's canonical repository-identity keys, keyed by the RAW
- * `facts.repoRoot` string (what every synchronous call site already has
- * on hand — `latestSummary.facts.repoRoot`, `requireRepoRoot()`) and
- * refreshed every scan. Notes use `notesKey` (the canonicalized
- * `gitCommonDir` when resolvable — see `canonicalizeRepoPath` — shared by
- * every linked worktree of the same repository, since notes are about the
- * REPOSITORY, not which checkout happens to be open); saved commands use
- * `checkoutKey` (the canonicalized `repoRoot` itself, i.e. `repoId`),
- * since cwd/layout can legitimately differ per worktree. `buildModel()`
- * and the message handlers below read this map synchronously; it's
- * populated by the (already async) `buildRepositoryStates()` so no UI
- * code needs to await a filesystem call just to render the Memory tab.
- * `getMemoryKeys()` falls back to the raw repoRoot for both keys when a
- * repo hasn't been through a scan yet (there is always at least one scan
- * on activation before the UI can be interacted with) — briefly keying
- * notes off the checkout instead of the repository, never a data-loss
- * risk, since mutations always use whatever key is resolved AT THE TIME,
- * consistently.
+ * Repo Identity Guard does two things:
+ *  1. explicit per-repository identity locking (`IdentityLockService`), and
+ *  2. private per-repository notes (`MemoryStore`).
+ *
+ * This file only wires those into VS Code: repository discovery, Workspace
+ * Trust gating, confirmations, commands, and the (placeholder) sidebar.
+ * An unassigned repository is never touched — the only automatic Git
+ * mutation is removing/migrating a LEGACY Shield installation, and only in
+ * a trusted workspace.
  */
-const repoMemoryKeys = new Map<string, { notesKey: string; checkoutKey: string }>();
 
-function getMemoryKeys(repoRoot: string): { notesKey: string; checkoutKey: string } {
-  return repoMemoryKeys.get(repoRoot) ?? { notesKey: repoRoot, checkoutKey: repoRoot };
+interface RepoEntry {
+  /** Canonical checkout root — unique per worktree (linked worktrees share `ref.repoKey`). */
+  id: string;
+  ref: RepositoryRef;
+  folderName?: string;
+  repoName: string;
+  memoryKeys: MemoryKeys;
+  status?: LockStatus;
+  statusError?: string;
+  gitDir?: string;
 }
-let globalGitConfigWatchers: vscode.FileSystemWatcher[] = [];
 
-export function activate(context: vscode.ExtensionContext): void {
+let repos: RepoEntry[] = [];
+let selectedId: string | undefined;
+let scanSequence = 0;
+let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+const repoWatchers = new Map<string, vscode.Disposable[]>();
+/** Per-repository serialization of every lock mutation (assign/change/unlock/repair/migrate), so two overlapping triggers can never race on the same hooks. */
+const repoMutationQueues = new Map<string, Promise<unknown>>();
+
+function withRepoLock<T>(repoKey: string, fn: () => Promise<T>): Promise<T> {
+  const previous = repoMutationQueues.get(repoKey) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  repoMutationQueues.set(
+    repoKey,
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  return run;
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const statusBar = new IdentityStatusBar();
   const memoryStore = new MemoryStore(context);
   const safeActionRunner = new SafeActionRunner();
-  const shieldManager = new ShieldManager();
-  const shieldEvaluatorScriptSource = path.join(context.extensionPath, "resources", "shield", "shield-evaluate.sh");
-
-  const buildModel = (): SidebarModel => ({
-    summary: latestSummary,
-    workspace: workspaceState,
-    selectedRepoId,
-    memory: latestSummary.facts.repoRoot ? memoryStore.getMemory(getMemoryKeys(latestSummary.facts.repoRoot)) : emptyRepoMemory(),
-    profiles: getProfiles(),
-    protectedBranches: getProtectedBranches(),
-    preferences: getSafetyPreferences(),
-    isWorkspaceTrusted: vscode.workspace.isTrusted,
+  const lockService = new IdentityLockService({
+    evaluatorScriptSource: path.join(context.extensionPath, "resources", "shield", "shield-evaluate.sh"),
   });
+  const notifiedMigrations = new Set<string>();
 
   const sidebarProvider = new RepoIdentitySidebarProvider(context.extensionUri, {
-    rescan: () => scan(),
-    fixCommitIdentity: () => fixCommitIdentity(),
-    unsetLocalIdentity: () => unsetLocalIdentity(),
-    addProfileForRepo: () => addProfileForRepo(),
-    openSettingsJson: async () => {
-      await vscode.commands.executeCommand("workbench.action.openSettingsJson");
+    selectRepo: async (id) => {
+      if (repos.some((repo) => repo.id === id)) selectedId = id;
+      refreshViews();
     },
-    copyContextForAI: () => copyContextForAI(),
-    copyWorkspaceSafetySummary: () => copyWorkspaceSafetySummary(),
-    enableWorkspaceTrust: async () => {
-      await vscode.commands.executeCommand("workbench.trust.manage");
-    },
-    resolveProfileConflict: () => resolveProfileConflict(),
-    selectRepo: async (repoId: string) => {
-      selectRepo(repoId);
-      refreshSidebar();
-    },
+    assignIdentity: (identityId) => assignIdentity(identityId, "assign"),
+    changeIdentity: (identityId) => assignIdentity(identityId, "change"),
+    unlockRepository: () => unlockRepository(),
+    repairLock: () => repairLock(),
+    checkLock: () => checkLock(),
+    applyIdentityToGitConfig: () => applyIdentityToGitConfig(),
+    editIdentities: () => editIdentities(),
 
-    addMemoryNote: async (text, pinned) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return { ok: false, error: "Open a Git repository first." };
-      if (!(await requireWorkspaceTrust("add a note"))) return { ok: false, error: "This workspace isn't trusted." };
-      try {
-        await memoryStore.addNote(getMemoryKeys(repoRoot), text, pinned);
-      } catch (error) {
-        await showMemoryError(error);
-        return { ok: false, error: memoryErrorMessage(error) };
-      }
-      refreshSidebar();
-      return { ok: true };
+    addNote: (text) => noteMutation((keys) => memoryStore.addNote(keys, text)),
+    updateNote: (id, text) => noteMutation((keys) => memoryStore.updateNote(keys, id, text)),
+    removeNote: async (id) => {
+      const entry = selectedEntry();
+      if (!entry) return;
+      const choice = await vscode.window.showWarningMessage("Delete this note? This can't be undone.", "Delete", "Cancel");
+      if (choice !== "Delete") return;
+      await noteMutation((keys) => memoryStore.removeNote(keys, id));
     },
-    updateMemoryNote: async (id, text) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return { ok: false, error: "Open a Git repository first." };
-      if (!(await requireWorkspaceTrust("edit this note"))) return { ok: false, error: "This workspace isn't trusted." };
-      try {
-        await memoryStore.updateNote(getMemoryKeys(repoRoot), id, text);
-      } catch (error) {
-        await showMemoryError(error);
-        return { ok: false, error: memoryErrorMessage(error) };
-      }
-      refreshSidebar();
-      return { ok: true };
+    togglePinNote: async (id) => {
+      await noteMutation((keys) => memoryStore.togglePin(keys, id));
     },
-    removeMemoryNote: async (id) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust("delete this note"))) return;
-      if (!(await confirmDelete("note"))) return;
-      try {
-        await memoryStore.removeNote(getMemoryKeys(repoRoot), id);
-      } catch (error) {
-        await showMemoryError(error);
-        return;
-      }
-      refreshSidebar();
+    copyNote: async (id) => {
+      const entry = selectedEntry();
+      if (!entry) return;
+      const text = memoryStore.getNoteText(entry.memoryKeys, id);
+      if (text === undefined) return;
+      await vscode.env.clipboard.writeText(text);
+      await vscode.window.showInformationMessage("Note copied to the clipboard.");
     },
-    togglePinMemoryNote: async (id) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust("pin or unpin this note"))) return;
-      try {
-        await memoryStore.togglePin(getMemoryKeys(repoRoot), id);
-      } catch (error) {
-        await showMemoryError(error);
-        return;
-      }
-      await scan();
-    },
-    addSavedCommand: async (label, command) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return { ok: false, error: "Open a Git repository first." };
-      if (!(await requireWorkspaceTrust("save this command"))) return { ok: false, error: "This workspace isn't trusted." };
-      try {
-        await memoryStore.addCommand(getMemoryKeys(repoRoot), label, command);
-      } catch (error) {
-        await showMemoryError(error);
-        return { ok: false, error: memoryErrorMessage(error) };
-      }
-      refreshSidebar();
-      return { ok: true };
-    },
-    removeSavedCommand: async (id) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust("delete this saved command"))) return;
-      if (!(await confirmDelete("saved command"))) return;
-      try {
-        await memoryStore.removeCommand(getMemoryKeys(repoRoot), id);
-      } catch (error) {
-        await showMemoryError(error);
-        return;
-      }
-      refreshSidebar();
-    },
-    runSavedCommand: async (id) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust("run this saved command"))) return;
-      const saved = memoryStore.getMemory(getMemoryKeys(repoRoot)).commands.find((c) => c.id === id);
-      if (saved) runSavedCommand(repoRoot, saved.command);
-    },
-    copySavedCommand: async (id) => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      const saved = memoryStore.getMemory(getMemoryKeys(repoRoot)).commands.find((c) => c.id === id);
-      if (saved) {
-        await copyToClipboard(saved.command);
-        await vscode.window.showInformationMessage(`Copied: ${saved.command}`);
-      }
-    },
-    exportMemory: async () => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      const label = latestSummary.repoName ?? path.basename(repoRoot);
-      const data = memoryStore.exportMemory(getMemoryKeys(repoRoot), label);
-      await writeMemoryExportToDisk(data, `repo-memory-${sanitizeFileNamePart(label)}.json`);
-    },
-    exportAllMemory: async () => {
-      if (workspaceState.repos.length === 0) {
-        await vscode.window.showInformationMessage("No repositories detected to export.");
-        return;
-      }
-      const entries = workspaceState.repos.map((repo) => ({
-        // Deliberately never falls back to `repo.repoId` — that's a raw,
-        // canonicalized local FILESYSTEM PATH (may reveal the machine's
-        // username/directory layout), and an export is a file the user
-        // may go on to share or paste elsewhere. "(unnamed repository)" is
-        // the only safe fallback when neither a repo name nor a workspace
-        // folder name is available.
-        label: repo.summary.repoName ?? repo.workspaceFolderName ?? "(unnamed repository)",
-        keys: getMemoryKeys(repo.summary.facts.repoRoot ?? repo.repoId),
-      }));
-      const data = memoryStore.exportAllMemory(entries);
-      await writeMemoryExportToDisk(data, "repo-memory-all.json");
-    },
-    importMemory: async () => {
-      const repoRoot = requireRepoRoot();
-      if (!repoRoot) return;
-      if (!(await requireWorkspaceTrust("import Repo Memory"))) return;
-
-      const uris = await vscode.window.showOpenDialog({
-        canSelectMany: false,
-        filters: { "Repo Memory export": ["json"] },
-        title: "Import Repo Memory",
-      });
-      if (!uris || uris.length === 0) return;
-
-      let raw: unknown;
-      try {
-        const stat = await vscode.workspace.fs.stat(uris[0]);
-        if (stat.size > MAX_IMPORT_FILE_BYTES) {
-          await vscode.window.showErrorMessage(
-            `That file is ${(stat.size / (1024 * 1024)).toFixed(1)} MB, larger than the ${(MAX_IMPORT_FILE_BYTES / (1024 * 1024)).toFixed(0)} MB Repo Memory import supports. A real export never gets this large — this is likely the wrong file.`,
-          );
-          return;
-        }
-        const bytes = await vscode.workspace.fs.readFile(uris[0]);
-        raw = JSON.parse(Buffer.from(bytes).toString("utf8"));
-      } catch {
-        await vscode.window.showErrorMessage("Could not read that file as JSON.");
-        return;
-      }
-
-      const filePreview = memoryStore.previewImportFile(raw);
-      if (!filePreview.valid) {
-        await vscode.window.showErrorMessage(filePreview.error ?? "This file isn't a valid Repo Memory export.");
-        return;
-      }
-
-      // A multi-repository export (e.g. from "Export all") is never
-      // silently merged together into whichever repo happens to be open
-      // — that would be a poor, surprising default for a feature labelled
-      // Backup/Export all. Exactly one entry imports directly; more than
-      // one always asks which source repository to bring in, showing
-      // enough (label, note count, command count) to tell them apart.
-      let entryIndex = 0;
-      if (filePreview.entries.length > 1) {
-        const picked = await vscode.window.showQuickPick(
-          filePreview.entries.map((entry) => ({
-            label: entry.label,
-            description: `${entry.noteCount} note${entry.noteCount === 1 ? "" : "s"}, ${entry.commandCount} command${entry.commandCount === 1 ? "" : "s"}`,
-            entryIndex: entry.index,
-          })),
-          {
-            title: "Import Repo Memory",
-            placeHolder: "This file has memory from more than one repository. Which one do you want to import into the currently open repository?",
-          },
-        );
-        if (!picked) return;
-        entryIndex = picked.entryIndex;
-      }
-
-      const keys = getMemoryKeys(repoRoot);
-      const preview = memoryStore.previewImportEntry(keys, raw, entryIndex);
-      if (!preview.valid) {
-        await vscode.window.showErrorMessage(preview.error ?? "This file isn't a valid Repo Memory export.");
-        return;
-      }
-
-      const duplicateCount = preview.duplicateNoteIds.length + preview.duplicateCommandIds.length;
-      const summaryLines = [
-        `This will import ${preview.noteCount} note(s) and ${preview.commandCount} saved command(s) into the currently open repository.`,
-        "Saved commands are imported as inert data only and are never run automatically.",
-      ];
-      if (duplicateCount > 0) {
-        summaryLines.push(`${duplicateCount} item(s) already exist here (matching id) and will be skipped unless you choose to overwrite them.`);
-      }
-
-      const actions = duplicateCount > 0 ? ["Import (skip duplicates)", "Import and overwrite duplicates"] : ["Import"];
-      const choice = await vscode.window.showInformationMessage(summaryLines.join("\n\n"), { modal: true }, ...actions);
-      if (!choice) return;
-
-      try {
-        await memoryStore.importMemory(keys, raw, entryIndex, { overwriteDuplicates: choice === "Import and overwrite duplicates" });
-      } catch (error) {
-        await showMemoryError(error);
-        return;
-      }
-      await scan();
-      await vscode.window.showInformationMessage("Repo Memory import complete.");
-    },
-
-    saveProfile: async (profile: Profile) => {
-      if (!(await requireWorkspaceTrust())) return;
-      const profiles = getProfiles();
-      const index = profiles.findIndex((p) => p.id === profile.id);
-      const next = index >= 0 ? profiles.map((p, i) => (i === index ? profile : p)) : [...profiles, profile];
-      await saveProfiles(next);
-
-      const overlapping = findOverlappingProfiles(profile, next);
-      if (overlapping.length > 0) {
-        await vscode.window.showWarningMessage(
-          `"${profile.label}" shares an owner pattern with ${overlapping.map((p) => p.label).join(", ")}. Any repo matching both will show as Not Safe until you narrow the owners.`,
-        );
-      }
-
-      await scan();
-    },
-    deleteProfile: async (id) => {
-      if (!(await requireWorkspaceTrust())) return;
-      await saveProfiles(getProfiles().filter((p) => p.id !== id));
-      await scan();
-    },
-    saveProtectedBranches: async (branches) => {
-      if (!(await requireWorkspaceTrust())) return;
-      await saveProtectedBranches(branches);
-      await scan();
-    },
-    saveRequireLocalIdentity: async (value) => {
-      if (!(await requireWorkspaceTrust())) return;
-      await saveRequireLocalIdentity(value);
-      await scan();
-    },
-    saveIncludeMemoryInAiContext: async (value) => {
-      if (!(await requireWorkspaceTrust())) return;
-      await saveIncludeMemoryInAiContext(value);
-      await scan();
-    },
-
-    enableShield: async (chainForeignHooks) => {
-      await enableShield(chainForeignHooks);
-      await scan();
-    },
-    disableShield: async () => {
-      await disableShield();
-      await scan();
-    },
-    repairShield: async () => {
-      await repairShield();
-      await scan();
-    },
-    checkShieldHealth: () => checkShieldHealth(),
+    exportNotes: () => exportNotes(false),
+    exportAllNotes: () => exportNotes(true),
+    importNotes: () => importNotes(),
   });
 
   context.subscriptions.push(statusBar);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("repoIdentityGuard.statusView", sidebarProvider),
-  );
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider("repoIdentityGuard.statusView", sidebarProvider));
 
-  function refreshSidebar(): void {
+  // ==================== state ====================
+
+  function selectedEntry(): RepoEntry | undefined {
+    return repos.find((repo) => repo.id === selectedId) ?? repos[0];
+  }
+
+  /** The repository a Command Palette command acts on: the active editor's repository when it has one, else the sidebar's selection. */
+  function commandTarget(): RepoEntry | undefined {
+    const activeFile = vscode.window.activeTextEditor?.document;
+    if (activeFile?.uri.scheme === "file") {
+      const match = repos.find((repo) => isSubpath(activeFile.uri.fsPath, repo.ref.repoRoot));
+      if (match) return match;
+    }
+    return selectedEntry();
+  }
+
+  function toState(entry: RepoEntry): RepoIdentityState {
+    const notes = memoryStore.getMemory(entry.memoryKeys).notes;
+    if (!entry.status) {
+      return {
+        repositoryPresent: true,
+        repoKey: entry.ref.repoKey,
+        repoName: entry.repoName,
+        repoRoot: entry.ref.repoRoot,
+        enforcement: {
+          state: "unavailable",
+          reason: entry.statusError ?? "This repository could not be inspected.",
+          commitEnforced: false,
+          push: "none",
+          repairAvailable: false,
+          unlockAvailable: false,
+        },
+        notes,
+      };
+    }
+    return {
+      repositoryPresent: true,
+      repoKey: entry.ref.repoKey,
+      repoName: entry.repoName,
+      repoRoot: entry.ref.repoRoot,
+      assignment: entry.status.assignmentView,
+      enforcement: entry.status.enforcement,
+      notes,
+    };
+  }
+
+  function buildModel(): SidebarModel {
+    const list = getIdentityList();
+    return {
+      repos: repos.map((entry) => ({ id: entry.id, folderName: entry.folderName, state: toState(entry) })),
+      selectedId: selectedEntry()?.id,
+      identities: list.identities,
+      identityProblems: list.rejected.map((r) => `Identity #${r.index + 1} in settings is ignored: ${r.errors.join(" ")}`),
+      isWorkspaceTrusted: vscode.workspace.isTrusted,
+    };
+  }
+
+  function refreshViews(): void {
     sidebarProvider.update(buildModel());
+    const entry = selectedEntry();
+    statusBar.update(entry ? toState(entry) : undefined);
   }
 
-  function requireRepoRoot(): string | undefined {
-    return latestSummary.facts.repoRoot;
-  }
-
-  /**
-   * Blocks mutating/executing actions when Workspace Trust is off, with a
-   * clear reason. `action`, when given, names the SPECIFIC thing that was
-   * just attempted (e.g. "add a note", "run this saved command") so the
-   * warning matches what the user actually clicked instead of always
-   * saying the same generic "run commands or change Git identity" line —
-   * that line was accurate for Fix Commit Identity and Shield, but wrong
-   * for e.g. deleting a note, which changes neither.
-   */
-  async function requireWorkspaceTrust(action?: string): Promise<boolean> {
+  async function requireTrust(what: string): Promise<boolean> {
     if (vscode.workspace.isTrusted) return true;
-    const what = action ?? "run commands or change Git identity here";
     await vscode.window.showWarningMessage(
-      `This workspace isn't trusted, so Repo Identity Guard won't ${what}. Enable Workspace Trust first.`,
+      `This workspace isn't trusted, so Repo Identity Guard won't ${what}. Locking, changing or unlocking an identity installs or removes Git hooks and needs Workspace Trust; notes work without it.`,
     );
     return false;
   }
 
-  /**
-   * The one lightweight confirmation gate for a destructive Repo Memory
-   * action — a non-modal native VS Code warning with an explicit action
-   * button, the least intrusive built-in mechanism that still requires a
-   * deliberate click (never a bare "OK" that muscle memory could dismiss
-   * without reading). Pin/unpin never calls this — it's reversible with
-   * one more click and isn't destructive.
-   */
-  async function confirmDelete(kind: string): Promise<boolean> {
-    const choice = await vscode.window.showWarningMessage(`Delete this ${kind}? This can't be undone.`, "Delete", "Cancel");
-    return choice === "Delete";
-  }
+  // ==================== scanning ====================
 
-  /** `MemoryLimitError` carries a message meant to be read as-is (empty text, over a length/count limit); anything else is an unexpected failure that shouldn't leak internals into a user-facing toast. */
-  function memoryErrorMessage(error: unknown): string {
-    return error instanceof MemoryLimitError ? error.message : "Something went wrong saving to Repo Memory.";
-  }
-
-  async function showMemoryError(error: unknown): Promise<void> {
-    await vscode.window.showWarningMessage(memoryErrorMessage(error));
+  function getScanTargets(): { path: string; folderName?: string }[] {
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders && folders.length > 0) return folders.map((folder) => ({ path: folder.uri.fsPath, folderName: folder.name }));
+    const activeFile = vscode.window.activeTextEditor?.document;
+    return activeFile?.uri.scheme === "file" ? [{ path: path.dirname(activeFile.uri.fsPath) }] : [];
   }
 
   /**
-   * Writing the export file (a disk I/O call, same as any other) can fail
-   * — a full disk, a permissions error, a path that vanished between
-   * picking the save dialog and the write. That must surface as a clear,
-   * user-facing error rather than an unhandled rejected promise; nothing
-   * about the extension's own in-memory state changes either way, since
-   * exporting never mutates Repo Memory.
+   * Passive refresh — cheap and read-only for every repository (no network,
+   * no `ssh`). The single exception, in a trusted workspace only: a legacy
+   * Shield installation is migrated or removed, because an unassigned
+   * repository must not keep hooks that block Git.
    */
-  async function writeMemoryExportToDisk(data: MemoryExport, defaultFileName: string): Promise<void> {
-    const uri = await vscode.window.showSaveDialog({
-      defaultUri: vscode.Uri.file(defaultFileName),
-      filters: { "Repo Memory export": ["json"] },
-      title: "Export Repo Memory",
-    });
-    if (!uri) return;
-    try {
-      await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(data, null, 2), "utf8"));
-    } catch (error) {
-      await vscode.window.showErrorMessage(`Could not write the export file: ${getErrorMessage(error)}`);
-      return;
-    }
-    await vscode.window.showInformationMessage(`Exported Repo Memory to ${uri.fsPath}`);
-  }
-
-  function sanitizeFileNamePart(label: string): string {
-    return label.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 60) || "repo";
-  }
-
-  /**
-   * cwdOverride is only meaningful for the no-workspace-folder fallback (a
-   * single loose file/folder). When real workspace folders exist, every
-   * scan re-evaluates all of them — that's the only way to keep the
-   * aggregate honest after acting on any one repo.
-   */
-  async function scan(cwdOverride?: string): Promise<void> {
+  async function scan(): Promise<void> {
     const sequence = ++scanSequence;
+    const identities = getIdentities();
+    const next: RepoEntry[] = [];
+    const seen = new Set<string>();
 
-    try {
-      const targets = getScanTargets(cwdOverride);
-      const repos = await buildRepositoryStates(targets);
-      if (sequence !== scanSequence) return;
+    for (const target of getScanTargets()) {
+      try {
+        const ref = await lockService.resolveRepository(target.path);
+        if (!ref) continue;
+        const id = await canonicalizeRepoPath(ref.repoRoot);
+        if (seen.has(id)) continue;
+        seen.add(id);
 
-      workspaceState = computeWorkspaceSafetyState(repos);
+        const memoryKeys = await memoryStore.resolveKeys(ref.repoRoot, ref.gitCommonDir);
+        await memoryStore.reconcileLegacyKeys(ref.repoRoot, memoryKeys);
 
-      if (!selectedRepoId || !repos.some((r) => r.repoId === selectedRepoId)) {
-        selectedRepoId = pickDefaultRepoId(repos);
+        const entry: RepoEntry = { id, ref, folderName: target.folderName, repoName: path.basename(ref.repoRoot), memoryKeys };
+        try {
+          entry.status = await lockService.getStatus(ref, identities);
+          if (entry.status.legacy && vscode.workspace.isTrusted) {
+            entry.status = await migrateLegacyInstallation(ref, identities, entry.status);
+          }
+        } catch (error) {
+          entry.statusError = errorMessage(error);
+        }
+        entry.gitDir = (await getGitDir(ref.repoRoot).catch(() => null)) ?? undefined;
+        next.push(entry);
+      } catch {
+        // One unreadable folder must never hide every other repository.
       }
-      const selected = repos.find((r) => r.repoId === selectedRepoId);
-      latestSummary = selected?.summary ?? emptyNotCheckedSummary();
-
-      statusBar.update(workspaceState);
-      refreshSidebar();
-      reconcileRepoWatchers(repos);
-    } catch (error) {
-      if (sequence !== scanSequence) return;
-      workspaceState = emptyWorkspaceState();
-      selectedRepoId = undefined;
-      latestSummary = emptyNotCheckedSummary(getErrorMessage(error));
-      statusBar.update(workspaceState);
-      refreshSidebar();
-      reconcileRepoWatchers([]);
     }
+
+    if (sequence !== scanSequence) return;
+    repos = next;
+    if (!repos.some((repo) => repo.id === selectedId)) {
+      selectedId = commandTargetFrom(next)?.id;
+    }
+    refreshViews();
+    reconcileWatchers();
   }
 
-  function scheduleDebouncedScan(): void {
+  function commandTargetFrom(list: RepoEntry[]): RepoEntry | undefined {
+    const activeFile = vscode.window.activeTextEditor?.document;
+    if (activeFile?.uri.scheme === "file") {
+      const match = list.find((repo) => isSubpath(activeFile.uri.fsPath, repo.ref.repoRoot));
+      if (match) return match;
+    }
+    return list[0];
+  }
+
+  async function migrateLegacyInstallation(ref: RepositoryRef, identities: Identity[], current: LockStatus): Promise<LockStatus> {
+    const outcome = await withRepoLock(ref.repoKey, () =>
+      lockService.migrateLegacy(ref, { legacyProfiles: getLegacyProfilesRaw(), identities }),
+    );
+    if (outcome.kind === "none") return current;
+    const name = path.basename(ref.repoRoot);
+    if (!notifiedMigrations.has(ref.repoKey)) {
+      notifiedMigrations.add(ref.repoKey);
+      if (outcome.kind === "failed") {
+        void vscode.window.showWarningMessage(`Repo Identity Guard (${name}): ${outcome.message} ${outcome.details.join(" ")}`);
+      } else {
+        void vscode.window.showInformationMessage(`Repo Identity Guard (${name}): ${outcome.message}`);
+      }
+    }
+    return outcome.status ?? current;
+  }
+
+  function scheduleScan(): void {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => void scan(), 300);
   }
 
   /**
-   * Keeps one set of Git-state watchers per repo in sync with what the last
-   * scan actually found — added for newly discovered repos, disposed for
-   * repos that dropped out (closed folder, no longer a Git repo). Every
-   * in-scope repo gets watched, not just the currently selected one, so a
-   * non-selected repo going unsafe (branch switch, new conflict, identity
-   * change) still triggers a rescan and the aggregate can't go stale.
-   *
-   * Watches the resolved `gitDir`/`gitCommonDir` (not a guessed
-   * `<repoRoot>/.git`, which is wrong for linked worktrees) for the files
-   * that drive Commit Identity, Branch Policy, and Repo State: HEAD,
-   * config, config.worktree (an external `git config --worktree` edit must
-   * also trigger a rescan, not just `--local`), the index, the
-   * merge/cherry-pick/revert markers, and the rebase-in-progress
-   * directories. This does not watch the working tree
-   * itself (recursively watching every file in every repo would be
-   * expensive); `onDidSaveTextDocument` below gives ordinary edits a
-   * lighter-weight nudge instead.
+   * Watches only what can change a lock's state: Git config (identity,
+   * core.hooksPath), the lock's own storage directory, and the hook files
+   * themselves (e.g. a hook deleted or replaced by another tool).
    */
-  function reconcileRepoWatchers(repos: RepositorySafetyState[]): void {
-    const currentIds = new Set(repos.map((r) => r.repoId));
-
-    for (const [repoId, disposables] of repoWatchers) {
-      if (!currentIds.has(repoId)) {
+  function reconcileWatchers(): void {
+    const ids = new Set(repos.map((repo) => repo.id));
+    for (const [id, disposables] of repoWatchers) {
+      if (!ids.has(id)) {
         disposables.forEach((d) => d.dispose());
-        repoWatchers.delete(repoId);
+        repoWatchers.delete(id);
       }
     }
-
     for (const repo of repos) {
-      if (repoWatchers.has(repo.repoId)) continue;
-
-      const facts = repo.summary.facts;
-      const dirs = new Set([facts.gitDir, facts.gitCommonDir].filter((d): d is string => !!d));
-      if (dirs.size === 0) continue;
-
-      const disposables: vscode.Disposable[] = [];
-      for (const dir of dirs) {
-        const stateWatcher = vscode.workspace.createFileSystemWatcher(
-          new vscode.RelativePattern(vscode.Uri.file(dir), "{HEAD,config,config.worktree,index,MERGE_HEAD,CHERRY_PICK_HEAD,REVERT_HEAD}"),
-        );
-        const operationWatcher = vscode.workspace.createFileSystemWatcher(
-          new vscode.RelativePattern(vscode.Uri.file(dir), "{rebase-merge,rebase-apply}/**"),
-        );
-        for (const watcher of [stateWatcher, operationWatcher]) {
-          watcher.onDidChange(() => scheduleDebouncedScan());
-          watcher.onDidCreate(() => scheduleDebouncedScan());
-          watcher.onDidDelete(() => scheduleDebouncedScan());
-          disposables.push(watcher);
-        }
+      if (repoWatchers.has(repo.id)) continue;
+      const patterns: vscode.RelativePattern[] = [];
+      for (const dir of new Set([repo.gitDir, repo.ref.gitCommonDir].filter((d): d is string => !!d))) {
+        patterns.push(new vscode.RelativePattern(vscode.Uri.file(dir), "{config,config.worktree}"));
       }
-      repoWatchers.set(repo.repoId, disposables);
+      patterns.push(new vscode.RelativePattern(vscode.Uri.file(repo.ref.gitCommonDir), "repo-identity-guard/**"));
+      const hooksDir = repo.status?.inspection.gitContext?.hooksDir;
+      if (hooksDir) patterns.push(new vscode.RelativePattern(vscode.Uri.file(hooksDir), "{pre-commit,pre-merge-commit,pre-push}*"));
+      const disposables = patterns.map((pattern) => {
+        const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+        watcher.onDidChange(scheduleScan);
+        watcher.onDidCreate(scheduleScan);
+        watcher.onDidDelete(scheduleScan);
+        return watcher;
+      });
+      repoWatchers.set(repo.id, disposables);
     }
   }
 
-  function disposeRepoWatchers(): void {
-    for (const disposables of repoWatchers.values()) disposables.forEach((d) => d.dispose());
-    repoWatchers.clear();
+  // ==================== identity lock actions ====================
+
+  function showOperationResult(result: LockOperationResult): void {
+    const text = [result.message, ...result.details].filter(Boolean).join(" ");
+    if (result.ok) void vscode.window.showInformationMessage(text);
+    else void vscode.window.showErrorMessage(text);
   }
 
-  /** Workspace folders to scan, or a single ad hoc folder when the window has none open as a workspace. */
-  function getScanTargets(cwdOverride?: string): { path: string; folderName?: string }[] {
-    const folders = vscode.workspace.workspaceFolders;
-    if (folders && folders.length > 0) {
-      return folders.map((folder) => ({ path: folder.uri.fsPath, folderName: folder.name }));
+  async function pickIdentity(excludeId?: string): Promise<Identity | undefined> {
+    const identities = getIdentities().filter((identity) => identity.id !== excludeId);
+    if (identities.length === 0) {
+      const choice = await vscode.window.showInformationMessage(
+        "No identities are configured yet. Add one (label, Git name/email, and optionally the GitHub login pushes must use) in settings first.",
+        "Edit Identities",
+      );
+      if (choice) await editIdentities();
+      return undefined;
     }
-    const cwd = cwdOverride ?? getActiveCwd();
-    return cwd ? [{ path: cwd }] : [];
+    const picked = await vscode.window.showQuickPick(
+      identities.map((identity) => ({
+        label: identity.label,
+        description: `${identity.gitName ? `${identity.gitName} ` : ""}<${identity.gitEmail}>`,
+        detail: identity.expectedGitHubLogin ? `Pushes must authenticate as GitHub user ${identity.expectedGitHubLogin}` : "Commits only (no GitHub login)",
+        identity,
+      })),
+      { title: "Repo Identity Guard: choose the identity to lock this repository to" },
+    );
+    return picked?.identity;
+  }
+
+  async function assignIdentity(identityId: string | undefined, mode: "assign" | "change"): Promise<void> {
+    const entry = commandTarget();
+    if (!entry) {
+      await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
+      return;
+    }
+    const current = entry.status?.assignmentView;
+    if (mode === "change" && !current) {
+      await vscode.window.showInformationMessage("This repository has no assigned identity yet — use Assign Identity instead.");
+      return;
+    }
+    const identity = identityId ? getIdentities().find((candidate) => candidate.id === identityId) : await pickIdentity(current?.identityId);
+    if (!identity) {
+      if (identityId) await vscode.window.showErrorMessage("That identity no longer exists in settings.");
+      return;
+    }
+    if (!(await requireTrust("lock this repository"))) return;
+
+    const pushLine = identity.expectedGitHubLogin
+      ? (identity.trustedSshHostAliases ?? []).length > 0
+        ? ` Pushes must authenticate to GitHub as ${identity.expectedGitHubLogin} through one of: ${(identity.trustedSshHostAliases ?? []).join(", ")}.`
+        : ` WARNING: ${identity.label} expects GitHub user ${identity.expectedGitHubLogin} but lists no trusted SSH host alias, so every push will be blocked until one is added.`
+      : " Pushes are not account-checked (this identity has no GitHub login).";
+    const confirm = await vscode.window.showWarningMessage(
+      `${current ? `Change ${entry.repoName} from "${current.identityLabel}" to` : `Lock ${entry.repoName} to`} "${identity.label}"?\n\nCommits whose author or committer is not ${identity.gitName ? `${identity.gitName} ` : ""}<${identity.gitEmail}> will be blocked.${pushLine}\n\nThis uses local Git hooks, so it applies in every terminal, Git GUI and AI agent, even with VS Code closed. Repository: ${entry.ref.repoRoot}`,
+      { modal: true },
+      current ? "Change Identity" : "Lock Repository",
+    );
+    if (!confirm) return;
+
+    // A foreign hook already in a slot the lock needs is never touched
+    // silently: chaining it is an explicit choice.
+    let chainForeignHooks = false;
+    const governedForeign = (entry.status?.inspection.hooks ?? []).filter(
+      (hook) => hook.ownership === "foreign" && (hook.action === "commit" || !!identity.expectedGitHubLogin),
+    );
+    if (governedForeign.length > 0) {
+      const chain = await vscode.window.showWarningMessage(
+        `This repository already has its own ${governedForeign.map((hook) => hook.fileName).join(", ")} hook. Repo Identity Guard can keep it: the identity check runs first, then your hook runs exactly as before (and is restored byte-for-byte on unlock).`,
+        { modal: true },
+        "Keep My Hook (Chain It)",
+      );
+      if (!chain) return;
+      chainForeignHooks = true;
+    }
+
+    const result = await withRepoLock(entry.ref.repoKey, () =>
+      lockService.assign(entry.ref, identity, { chainForeignHooks, identities: getIdentities() }),
+    );
+    showOperationResult(result);
+    await scan();
+    if (!result.ok) return;
+
+    const effective = await getEffectiveAuthorIdent(entry.ref.repoRoot).catch(() => ({ email: undefined }));
+    if ((effective.email ?? "").trim().toLowerCase() !== identity.gitEmail.trim().toLowerCase()) {
+      const choice = await vscode.window.showWarningMessage(
+        `Git currently commits here as ${effective.email ?? "an unknown identity"}, so commits will be blocked until this repository uses ${identity.gitEmail}.`,
+        "Use Assigned Identity in Git Config",
+      );
+      if (choice) await applyIdentityToGitConfig();
+    }
+    if (identity.expectedGitHubLogin && (identity.trustedSshHostAliases ?? []).length > 0) {
+      await checkLock({ quietWhenVerified: true });
+    }
+  }
+
+  async function unlockRepository(): Promise<void> {
+    const entry = commandTarget();
+    if (!entry) {
+      await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
+      return;
+    }
+    if (!entry.status?.enforcement.unlockAvailable) {
+      await vscode.window.showInformationMessage(`${entry.repoName} is not locked.`);
+      return;
+    }
+    if (!(await requireTrust("unlock this repository"))) return;
+    const label = entry.status.assignmentView?.identityLabel;
+    const confirm = await vscode.window.showWarningMessage(
+      `Unlock ${entry.repoName}${label ? ` (currently locked to "${label}")` : ""}?\n\nRepo Identity Guard removes its hooks (restoring any hook it chained), and Git is no longer restricted in this repository. Your notes are kept.`,
+      { modal: true },
+      "Unlock",
+    );
+    if (!confirm) return;
+    const result = await withRepoLock(entry.ref.repoKey, () => lockService.unlock(entry.ref, getIdentities()));
+    showOperationResult(result);
+    await scan();
+  }
+
+  async function repairLock(): Promise<void> {
+    const entry = commandTarget();
+    if (!entry) {
+      await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
+      return;
+    }
+    if (!(await requireTrust("repair the identity lock"))) return;
+    const identities = getIdentities();
+    if (entry.status?.legacy) {
+      notifiedMigrations.delete(entry.ref.repoKey);
+      await migrateLegacyInstallation(entry.ref, identities, entry.status);
+      await scan();
+      return;
+    }
+    const result = await withRepoLock(entry.ref.repoKey, () => lockService.repair(entry.ref, identities));
+    showOperationResult(result);
+    await scan();
   }
 
   /**
-   * Scans every target and returns one entry per unique repo root — folders
-   * that resolve to the same repo (a multi-folder workspace opened inside
-   * one repo, or symlinked paths) collapse to a single entry via the
-   * realpath-canonicalized root; linked worktrees have their own distinct
-   * root and are always kept separate, since their branch/working-tree
-   * state can differ. A folder that isn't a Git repo is excluded entirely —
-   * it never counts toward "no repositories detected."
+   * Explicit health check. The ONLY place (besides right after assigning)
+   * that makes a network connection: it verifies the push account over the
+   * real SSH route, exactly as the pre-push hook would.
    */
-  async function buildRepositoryStates(
-    targets: { path: string; folderName?: string }[],
-  ): Promise<RepositorySafetyState[]> {
-    // Promise.allSettled, not Promise.all: one target must never be able to
-    // take the rest of the workspace down with it. collectRepoFacts already
-    // catches its own expected failures, but this is defense in depth
-    // against an unanticipated exception from any step below.
-    const outcomes = await Promise.allSettled(
-      targets.map(async (target) => ({ target, facts: await collectRepoFacts(target.path) })),
-    );
-
-    const byRepoId = new Map<string, RepositorySafetyState>();
-    for (let i = 0; i < outcomes.length; i++) {
-      const outcome = outcomes[i];
-      const target = targets[i];
-
-      try {
-        if (outcome.status === "rejected") {
-          addInspectionFailedRepo(byRepoId, target, getErrorMessage(outcome.reason));
-          continue;
-        }
-
-        const { facts } = outcome.value;
-        if (!facts.isGitRepo || !facts.repoRoot) continue;
-
-        const repoId = await canonicalizeRepoPath(facts.repoRoot);
-        if (byRepoId.has(repoId)) continue;
-
-        // Notes are about the REPOSITORY (shared across every linked
-        // worktree via the common git dir); saved commands stay
-        // checkout-local (repoId itself) since cwd/layout can legitimately
-        // differ per worktree. See the `repoMemoryKeys` doc comment above.
-        const notesKey = facts.gitCommonDir ? await canonicalizeRepoPath(facts.gitCommonDir) : repoId;
-        repoMemoryKeys.set(facts.repoRoot, { notesKey, checkoutKey: repoId });
-        // Opportunistic, lossless migration of any data still stored under
-        // the raw (pre-canonicalization) repoRoot from an older release —
-        // a no-op once this repo's data already lives under its canonical
-        // keys. See `MemoryStore.reconcileLegacyKeys`'s doc comment.
-        await memoryStore.reconcileLegacyKeys(facts.repoRoot, { notesKey, checkoutKey: repoId });
-
-        const pinnedNote = memoryStore.getPinnedNote(notesKey)?.text;
-        const summary = computeStatus({
-          facts,
-          profiles: getProfiles(),
-          protectedBranches: getProtectedBranches(),
-          preferences: getSafetyPreferences(),
-          pinnedMemoryNote: pinnedNote,
-          isWorkspaceTrusted: vscode.workspace.isTrusted,
-        });
-
-        // Shield's own state, independent of the safety verdict above — read
-        // only, no writes, no network. Per-repo: a multi-root workspace never
-        // gets one workspace-wide Shield state (see docs/SHIELD_MODE.md and
-        // the FINAL Multi-Repository Workspace design).
-        const shieldInspection = await shieldManager
-          .inspect(facts.repoRoot, {
-            evaluatorScriptSource: shieldEvaluatorScriptSource,
-            currentProfiles: getProfiles(),
-            currentPushDestination: {
-              host: facts.pushRemoteHost,
-              owner: facts.pushRemoteOwner,
-              repo: facts.pushRemoteRepo,
-              protocol: facts.pushRemoteProtocol,
-              port: facts.pushRemotePort,
-              sshUser: facts.pushRemoteUser,
-            },
-            // Deliberately NOT set here: this runs on every routine scan
-            // (file-watcher events, workspace-folder switches, ...), and a
-            // real "ssh -G" call on every one of those would be a real
-            // performance cost for a check nobody explicitly asked for in
-            // the moment. See ShieldInspectOptions.resolveCanonicalDestinationDrift
-            // and "Check Shield Health" below, which does set it.
-            resolveCanonicalDestinationDrift: false,
-          })
-          .catch(() => undefined);
-
-        byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary, shieldInspection });
-      } catch (error) {
-        // Same guarantee for the synchronous half of the pipeline
-        // (canonicalization, computeStatus): a bug evaluating one repo
-        // must not hide every other repo in the workspace.
-        addInspectionFailedRepo(byRepoId, target, getErrorMessage(error));
-      }
+  async function checkLock(options: { quietWhenVerified?: boolean } = {}): Promise<void> {
+    const entry = commandTarget();
+    if (!entry) {
+      await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
+      return;
     }
-
-    return [...byRepoId.values()];
-  }
-
-  function addInspectionFailedRepo(
-    byRepoId: Map<string, RepositorySafetyState>,
-    target: { path: string; folderName?: string },
-    errorMessage: string,
-  ): void {
-    const repoId = target.path;
-    if (byRepoId.has(repoId)) return;
-    const summary = computeStatus({
-      facts: { isGitRepo: true, repoRoot: repoId, gitError: errorMessage },
-      profiles: getProfiles(),
-      protectedBranches: getProtectedBranches(),
-      preferences: getSafetyPreferences(),
-      isWorkspaceTrusted: vscode.workspace.isTrusted,
-    });
-    byRepoId.set(repoId, { repoId, workspaceFolderName: target.folderName, summary });
-  }
-
-  /** Prefers the repo the active editor's file lives in, then the first workspace folder's repo. */
-  function pickDefaultRepoId(repos: RepositorySafetyState[]): string | undefined {
-    if (repos.length === 0) return undefined;
-    const activeCwd = getActiveCwd();
-    if (activeCwd) {
-      const match = repos.find((r) => r.summary.facts.repoRoot && isSubpath(activeCwd, r.summary.facts.repoRoot));
-      if (match) return match.repoId;
-    }
-    return repos[0].repoId;
-  }
-
-  function isSubpath(candidate: string, repoRoot: string): boolean {
-    const rel = path.relative(repoRoot, candidate);
-    return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-  }
-
-  /** Explicit repo selection for multi-root workspaces — every mutating/executing action reads the repo this points at, never an ambiguous mix. */
-  function selectRepo(repoId: string): void {
-    const repo = workspaceState.repos.find((r) => r.repoId === repoId);
-    if (!repo) return;
-    selectedRepoId = repoId;
-    latestSummary = repo.summary;
-  }
-
-  /** Repo/profile identity for a mutation confirmation dialog — never leave "this repo" ambiguous once more than one is open. */
-  function repoIdentityLines(facts: RepoFacts, profile: Profile): string {
-    return `\n\nRepository: ${facts.repoName ?? "Unknown"}\nLocal path: ${facts.repoRoot}\nProfile: ${profile.label}`;
-  }
-
-  function worktreeWarning(facts: RepoFacts, scope: "local" | "worktree"): string {
-    const hasMultipleWorktrees = (facts.worktreeCount ?? 1) > 1;
-
-    if (scope === "worktree") {
-      return hasMultipleWorktrees
-        ? " This repo has other worktrees attached; per-worktree config is enabled, so this is written with `git config --worktree` and affects only this worktree."
-        : " Per-worktree config is enabled for this repo, so this is written with `git config --worktree` (this worktree's own config) rather than the shared repo config — that matters even with only one worktree right now, since a worktree-scoped value always overrides `--local`.";
-    }
-
-    if (!hasMultipleWorktrees) return "";
-    return " This repo has other worktrees attached, and per-worktree config isn't enabled, so this is written with `git config --local` and will be shared by every worktree attached to this repository, not just this one.";
-  }
-
-  async function fixCommitIdentity(): Promise<void> {
-    const { facts, matchedProfile } = latestSummary;
-    if (!facts.repoRoot || !matchedProfile) {
+    const identities = getIdentities();
+    const status = await lockService.getStatus(entry.ref, identities);
+    const view = status.assignmentView;
+    if (!view) {
       await vscode.window.showInformationMessage(
-        "No matched profile for this repo yet. Add one from Settings first.",
+        status.enforcement.state === "unassigned"
+          ? `${entry.repoName} is not locked; Repo Identity Guard does not restrict Git here.`
+          : `${entry.repoName}: ${status.enforcement.reason ?? "the identity lock needs attention."}`,
       );
       return;
     }
-    if (!(await requireWorkspaceTrust())) return;
-
-    const scope = resolveIdentityConfigScope(facts.worktreeConfigEnabled);
-
-    const confirmation = await vscode.window.showWarningMessage(
-      `Set this repo's Git identity to ${matchedProfile.label} (${matchedProfile.gitName ?? ""} <${matchedProfile.gitEmail}>)? Your global Git identity is never touched.${worktreeWarning(facts, scope)}${repoIdentityLines(facts, matchedProfile)}`,
-      { modal: true },
-      "Set Local Identity",
-    );
-    if (confirmation !== "Set Local Identity") return;
-
-    try {
-      await safeActionRunner.setLocalIdentity(
-        facts.repoRoot,
-        matchedProfile.gitName ?? matchedProfile.label,
-        matchedProfile.gitEmail,
-        scope,
-      );
-
-      // Outcome-based, not just "the write didn't throw": an environment
-      // variable (GIT_AUTHOR_EMAIL, etc.) or command-line override can
-      // still win over the config this just wrote, in which case saying
-      // "fixed" would be false. This check is deliberately independent of
-      // the shared scan()/latestSummary path: a watcher-triggered scan
-      // (possibly fired by this very config write) can supersede scan()'s
-      // own sequence guard and return without publishing, which would let
-      // this read stale global state and report a false "still overridden"
-      // warning. Re-collecting and re-computing this one repo directly
-      // sidesteps that race entirely.
-      const freshFacts = await collectRepoFacts(facts.repoRoot);
-      const freshSummary = computeStatus({
-        facts: freshFacts,
-        profiles: getProfiles(),
-        protectedBranches: getProtectedBranches(),
-        preferences: getSafetyPreferences(),
-        pinnedMemoryNote: freshFacts.repoRoot ? memoryStore.getPinnedNote(getMemoryKeys(freshFacts.repoRoot).notesKey)?.text : undefined,
-        isWorkspaceTrusted: vscode.workspace.isTrusted,
-      });
-      const commitIdentity = freshSummary.capabilityResults.find((r) => r.capability === "commit_identity");
-
-      await scan(facts.repoRoot); // still refresh the shared sidebar/workspace state
-
-      if (commitIdentity?.state === "confirmed") {
-        await vscode.window.showInformationMessage("Commit identity fixed for this repo.");
-      } else {
-        await vscode.window.showWarningMessage(
-          "Git config was updated, but this repo's effective commit identity is still not correct — likely an environment variable (GIT_AUTHOR_EMAIL/GIT_COMMITTER_EMAIL) or command-line override winning over config. Repo Identity Guard can only change Git config, not your shell environment or a command's own arguments.",
-        );
-      }
-    } catch (error) {
-      await vscode.window.showErrorMessage(`Could not fix commit identity: ${getErrorMessage(error)}`);
-    }
-  }
-
-  async function unsetLocalIdentity(): Promise<void> {
-    const { facts } = latestSummary;
-    if (!facts.repoRoot) return;
-    if (!(await requireWorkspaceTrust())) return;
-    const scope = resolveIdentityConfigScope(facts.worktreeConfigEnabled);
-    await safeActionRunner.unsetLocalIdentity(facts.repoRoot, scope);
-    await scan(facts.repoRoot);
-  }
-
-  async function addProfileForRepo(): Promise<void> {
-    if (!(await requireWorkspaceTrust())) return;
-    const { facts } = latestSummary;
-
-    const label = await vscode.window.showInputBox({
-      title: "Add Profile for This Repo",
-      prompt: "Profile label",
-      value: facts.remoteOwner ? `${facts.remoteOwner}` : "Work",
-    });
-    if (!label) return;
-
-    const gitName = await vscode.window.showInputBox({
-      title: "Add Profile for This Repo",
-      prompt: "Git name for this profile",
-      value: facts.effectiveGitName ?? "",
-    });
-
-    const gitEmail = await vscode.window.showInputBox({
-      title: "Add Profile for This Repo",
-      prompt: "Git email for this profile",
-      value: facts.effectiveGitEmail ?? "",
-    });
-    if (!gitEmail) return;
-
-    const owners = await vscode.window.showInputBox({
-      title: "Add Profile for This Repo",
-      prompt: "Expected remote owners (comma separated, e.g. github org or username)",
-      value: facts.remoteOwner ?? "",
-    });
-
-    const profile: Profile = {
-      id: `profile-${Date.now().toString(36)}`,
-      label,
-      gitName: gitName || undefined,
-      gitEmail,
-      expectedRemoteOwners: (owners ?? "").split(",").map((s) => s.trim()).filter(Boolean),
-      expectedBranchPatterns: [],
-      strictPushSetup: false,
+    const snapshot = status.inspection.policySnapshot;
+    const identity: Identity = {
+      id: view.identityId,
+      label: view.identityLabel,
+      gitName: view.gitName,
+      gitEmail: view.gitEmail,
+      expectedGitHubLogin: view.expectedGitHubLogin,
+      trustedSshHostAliases: snapshot?.trustedSshHostAliases,
     };
-
-    const nextProfiles = [...getProfiles(), profile];
-    await saveProfiles(nextProfiles);
-
-    const overlapping = findOverlappingProfiles(profile, nextProfiles);
-    if (overlapping.length > 0) {
-      await vscode.window.showWarningMessage(
-        `"${label}" shares an owner pattern with ${overlapping.map((p) => p.label).join(", ")}. Any repo matching both will show as Not Safe until you narrow the owners.`,
-      );
+    const push = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "Repo Identity Guard: checking the push account…" },
+      () => lockService.checkPushAccount(entry.ref, identity),
+    );
+    const lockLine =
+      status.enforcement.state === "active"
+        ? `${entry.repoName} is locked to "${view.identityLabel}".`
+        : `${entry.repoName} (locked to "${view.identityLabel}") needs attention: ${status.enforcement.reason ?? ""}`;
+    const message = `${lockLine} ${push.message}`;
+    if (status.enforcement.state === "active" && (push.status === "verified" || push.status === "not_configured")) {
+      if (!options.quietWhenVerified) await vscode.window.showInformationMessage(message);
     } else {
-      await vscode.window.showInformationMessage(`Added profile "${label}".`);
-    }
-
-    await scan(facts.repoRoot);
-  }
-
-  async function resolveProfileConflict(): Promise<void> {
-    if (!(await requireWorkspaceTrust())) return;
-    const { facts } = latestSummary;
-    const resolution = resolveProfiles(facts, getProfiles());
-    const conflict = resolution.forkConflict;
-    if (!conflict) {
-      await vscode.window.showInformationMessage("No origin/upstream profile conflict to resolve for this repo.");
-      return;
-    }
-
-    const originKey = canonicalRepoKey(facts.remoteHost, facts.remoteOwner, facts.remoteRepo);
-    if (!originKey) {
-      await vscode.window.showInformationMessage("Could not determine this repo's canonical host/owner/repo.");
-      return;
-    }
-
-    const choice = await vscode.window.showQuickPick(
-      [
-        { label: conflict.originProfile.label, description: "Matches this repo's origin remote", profile: conflict.originProfile },
-        { label: conflict.upstreamProfile.label, description: "Matches this repo's upstream remote", profile: conflict.upstreamProfile },
-      ],
-      {
-        title: "Assign This Repo to a Profile",
-        placeHolder: `Which profile should ${originKey} always use?`,
-      },
-    );
-    if (!choice) return;
-
-    const profiles = getProfiles();
-    const next = profiles.map((profile) =>
-      profile.id === choice.profile.id
-        ? { ...profile, exactRepos: [...(profile.exactRepos ?? []), originKey] }
-        : profile,
-    );
-    await saveProfiles(next);
-    await vscode.window.showInformationMessage(
-      `Assigned ${originKey} to ${choice.profile.label}. This overrides owner-pattern matching for this exact repo.`,
-    );
-    await scan(facts.repoRoot);
-  }
-
-  async function copyContextForAI(): Promise<void> {
-    const repoRoot = latestSummary.facts.repoRoot;
-    const memory = repoRoot ? memoryStore.getMemory(getMemoryKeys(repoRoot)) : emptyRepoMemory();
-    const { includeMemoryInAiContext } = getSafetyPreferences();
-    const text = buildAiContext(latestSummary, memory, { includeMemory: includeMemoryInAiContext });
-
-    await copyToClipboard(text);
-
-    // Always show the exact text before it's used — this is the trust experience, not an afterthought.
-    const previewDoc = await vscode.workspace.openTextDocument({ content: text, language: "plaintext" });
-    await vscode.window.showTextDocument(previewDoc, { preview: true });
-    await vscode.window.showInformationMessage(
-      "Copied to clipboard. Review the preview before pasting it into your AI agent.",
-    );
-  }
-
-  async function copyWorkspaceSafetySummary(): Promise<void> {
-    const text = buildWorkspaceSafetySummary(workspaceState);
-    await copyToClipboard(text);
-
-    const previewDoc = await vscode.workspace.openTextDocument({ content: text, language: "plaintext" });
-    await vscode.window.showTextDocument(previewDoc, { preview: true });
-    await vscode.window.showInformationMessage(
-      "Copied to clipboard. Review the preview before pasting it into your AI agent.",
-    );
-  }
-
-  /**
-   * Shield's install/repair/disable/health-check lifecycle. These are the
-   * same functions both the Command Palette commands (registered below)
-   * and the sidebar's dedicated Shield screen call — the sidebar is not a
-   * separate implementation. Every write goes through
-   * `requireWorkspaceTrust()` first, same as Fix Commit Identity, since
-   * installing a Git hook is exactly the kind of mutating action Workspace
-   * Trust exists to gate; a plain health check is read-only and works
-   * regardless.
-   */
-  /**
-   * Re-collects everything a durable Shield policy is built from, right
-   * now, immediately before the write that persists it.
-   *
-   * Phase 8 finding: `enableShield`/`repairShield` used to build a policy
-   * out of `latestSummary.facts` — the shared module-level snapshot that a
-   * background file watcher, a sidebar scan, or a workspace-folder switch
-   * writes to, and which can therefore be arbitrarily old (or belong to a
-   * *different* repository) by the time the command runs. That snapshot is
-   * fine for painting UI, which is refreshed constantly and costs nothing
-   * when wrong. It is not fine for `approvedPushDestination`,
-   * `approvedRepositoryKey`, `expectedGitEmail`, or the matched profile:
-   * those get written to disk and then enforced by hooks, with VS Code
-   * closed, until someone explicitly repairs them. A stale fact there is a
-   * silently wrong enforcement rule with a long lifetime.
-   *
-   * `collectRepoFacts` re-runs every underlying `git` invocation
-   * (including the full `branch.<name>.pushRemote` → `remote.pushDefault`
-   * → `branch.<name>.remote` → `origin` push-remote resolution and
-   * `remote get-url --push`), and profiles/protected branches are re-read
-   * from Settings, so the profile match and the push destination are both
-   * resolved from live state rather than inherited from the scan.
-   *
-   * `repoRoot` is passed in from the summary only as a *starting
-   * directory* — the freshly collected facts' own `repoRoot` is what is
-   * then used, so even a repo-root change is picked up rather than
-   * assumed.
-   */
-  async function collectFreshShieldInputs(startDir: string): Promise<
-    { ok: true; facts: RepoFacts; profiles: Profile[]; protectedBranches: string[] } | { ok: false; message: string }
-  > {
-    const facts = await collectRepoFacts(startDir);
-    if (!facts.isGitRepo || !facts.repoRoot) {
-      return { ok: false, message: "This folder is no longer a Git repository. Nothing was changed." };
-    }
-    if (facts.gitError) {
-      return {
-        ok: false,
-        message: `Shield refused to act because this repository's current state could not be read: ${facts.gitError}. Nothing was changed.`,
-      };
-    }
-    return { ok: true, facts, profiles: getProfiles(), protectedBranches: getProtectedBranches() };
-  }
-
-  /**
-   * `chainForeignHooks` defaults false — reproducing the pre-sidebar
-   * command-palette behavior exactly for that entry point. The sidebar's
-   * Enable Shield confirmation screen (src/webview/client/shieldView.ts)
-   * shows the actual foreign-hook decision (leave unchanged / chain) up
-   * front, from the same `ShieldInspection` the last scan already
-   * computed, and passes the user's real choice here — never a silent
-   * default once a conflict is known.
-   */
-  async function enableShield(chainForeignHooks = false): Promise<void> {
-    const startDir = latestSummary.facts.repoRoot;
-    if (!startDir) {
-      await vscode.window.showInformationMessage("Open a Git repository first.");
-      return;
-    }
-    if (!(await requireWorkspaceTrust())) return;
-
-    const fresh = await collectFreshShieldInputs(startDir);
-    if (!fresh.ok) {
-      await vscode.window.showWarningMessage(`Could not enable Shield: ${fresh.message}`);
-      return;
-    }
-    const { facts } = fresh;
-
-    try {
-      const result = await shieldManager.enable(facts.repoRoot as string, shieldEvaluatorScriptSource, {
-        facts,
-        profiles: fresh.profiles,
-        protectedBranches: fresh.protectedBranches,
-        chainForeignHooks,
-      });
-      if (result.ok) {
-        await vscode.window.showInformationMessage(
-          `Shield enabled for ${facts.repoName ?? facts.repoRoot} (${result.inspection.policyProfileLabel ?? "matched profile"}).`,
-        );
-      } else {
-        await vscode.window.showWarningMessage(
-          `Shield could not be fully enabled: ${result.inspection.reasons[0] ?? "see Shield health check for details."}`,
-        );
-      }
-    } catch (error) {
-      await vscode.window.showErrorMessage(`Could not enable Shield: ${getErrorMessage(error)}`);
+      await vscode.window.showWarningMessage(message);
     }
   }
 
-  async function repairShield(): Promise<void> {
-    const startDir = latestSummary.facts.repoRoot;
-    if (!startDir) {
-      await vscode.window.showInformationMessage("Open a Git repository first.");
+  async function applyIdentityToGitConfig(): Promise<void> {
+    const entry = commandTarget();
+    const view = entry?.status?.assignmentView;
+    if (!entry || !view) {
+      await vscode.window.showInformationMessage("This repository has no assigned identity.");
       return;
     }
-    if (!(await requireWorkspaceTrust())) return;
-
-    // Same fresh-facts rule as enableShield: a repair rewrites the durable
-    // policy, so it must never be built from a cached scan either. Repair
-    // is in fact the more important of the two — it exists precisely to
-    // re-sync a policy after something changed, and reading a stale
-    // snapshot would re-persist the very drift the user is repairing.
-    const fresh = await collectFreshShieldInputs(startDir);
-    if (!fresh.ok) {
-      await vscode.window.showWarningMessage(`Could not repair Shield: ${fresh.message}`);
-      return;
-    }
-    const { facts } = fresh;
-
-    try {
-      const result = await shieldManager.repair(facts.repoRoot as string, shieldEvaluatorScriptSource, {
-        facts,
-        profiles: fresh.profiles,
-        protectedBranches: fresh.protectedBranches,
-      });
-      if (result.ok) {
-        await vscode.window.showInformationMessage(`Shield repaired for ${facts.repoName ?? facts.repoRoot}.`);
-      } else {
-        await vscode.window.showWarningMessage(
-          `Shield is still not fully active: ${result.inspection.reasons[0] ?? "see Shield health check for details."}`,
-        );
-      }
-    } catch (error) {
-      await vscode.window.showErrorMessage(`Could not repair Shield: ${getErrorMessage(error)}`);
-    }
-  }
-
-  async function disableShield(): Promise<void> {
-    const { facts } = latestSummary;
-    if (!facts.repoRoot) {
-      await vscode.window.showInformationMessage("Open a Git repository first.");
-      return;
-    }
-    if (!(await requireWorkspaceTrust())) return;
-
-    const confirmation = await vscode.window.showWarningMessage(
-      `Disable Shield for ${facts.repoName ?? facts.repoRoot}? This removes Shield's own pre-commit hook and policy for this repository only — no other Git config, hooks, or credentials are touched.`,
+    if (!(await requireTrust("change this repository's Git config"))) return;
+    const scope = resolveIdentityConfigScope(await getWorktreeConfigEnabled(entry.ref.repoRoot).catch(() => null));
+    const confirm = await vscode.window.showWarningMessage(
+      `Set ${entry.repoName}'s Git identity to ${view.gitName ? `${view.gitName} ` : ""}<${view.gitEmail}>? This writes user.${view.gitName ? "name/user." : ""}email with "git config --${scope}" for this repository only; your global Git config is never touched.`,
       { modal: true },
-      "Disable Shield",
+      "Set Git Identity",
     );
-    if (confirmation !== "Disable Shield") return;
-
+    if (!confirm) return;
     try {
-      await shieldManager.disable(facts.repoRoot);
-      await vscode.window.showInformationMessage(`Shield disabled for ${facts.repoName ?? facts.repoRoot}.`);
+      await safeActionRunner.setLocalIdentity(entry.ref.repoRoot, view.gitName, view.gitEmail, scope);
     } catch (error) {
-      await vscode.window.showErrorMessage(`Could not disable Shield: ${getErrorMessage(error)}`);
-    }
-  }
-
-  /**
-   * Shield health check — a FULL integrity check, not a file-presence
-   * check.
-   *
-   * Phase 8 finding: this command called `healthCheck(repoRoot)` with no
-   * options at all. `ShieldManager.inspect` supports three drift checks,
-   * and every one of them is opt-in via an input the caller must supply —
-   * so with none supplied, all three were silently skipped and a Shield
-   * whose evaluator had been hand-edited (marker and version comment left
-   * intact), whose profile had since changed `trustedSshHostAliases` /
-   * `expectedGitHubLogin` / `strictPushSetup` / Git identity, or whose
-   * push destination had moved, reported a confident "Shield is active."
-   * The checks existed and were tested at the manager level; nothing in
-   * the product ever turned them on.
-   *
-   * All three inputs are gathered live here, for the same reason
-   * `collectFreshShieldInputs` exists: a drift check against a cached
-   * snapshot can only detect drift that the snapshot already happens to
-   * know about.
-   *
-   * `inspect()` remains strictly read-only — this reports drift, it never
-   * repairs it. Turning degraded back into active stays an explicit
-   * "Repair Shield".
-   */
-  async function checkShieldHealth(): Promise<void> {
-    const startDir = latestSummary.facts.repoRoot;
-    if (!startDir) {
-      await vscode.window.showInformationMessage("Open a Git repository first.");
+      await vscode.window.showErrorMessage(`Could not set the Git identity: ${errorMessage(error)}`);
       return;
     }
+    const effective = await getEffectiveAuthorIdent(entry.ref.repoRoot).catch(() => ({ email: undefined }));
+    if ((effective.email ?? "").trim().toLowerCase() === view.gitEmail.trim().toLowerCase()) {
+      await vscode.window.showInformationMessage(`${entry.repoName} now commits as ${view.gitEmail}.`);
+    } else {
+      await vscode.window.showWarningMessage(
+        `Git config was updated, but Git still resolves ${effective.email ?? "a different identity"} here — an environment variable (GIT_AUTHOR_EMAIL, GIT_COMMITTER_EMAIL, EMAIL) is overriding it in VS Code's environment.`,
+      );
+    }
+    await scan();
+  }
+
+  async function editIdentities(): Promise<void> {
+    await vscode.commands.executeCommand("workbench.action.openSettings", "repoIdentityGuard.identities");
+  }
+
+  // ==================== notes actions (no Workspace Trust needed: local data only, never executed) ====================
+
+  async function noteMutation(mutate: (keys: MemoryKeys) => Promise<unknown>): Promise<NoteMutationResult> {
+    const entry = selectedEntry();
+    if (!entry) return { ok: false, error: "Open a Git repository first." };
     try {
-      const facts = await collectRepoFacts(startDir);
-      if (!facts.isGitRepo || !facts.repoRoot) {
-        await vscode.window.showInformationMessage("Open a Git repository first.");
+      await mutate(entry.memoryKeys);
+    } catch (error) {
+      const message = error instanceof MemoryLimitError ? error.message : "Something went wrong saving the note.";
+      await vscode.window.showWarningMessage(message);
+      return { ok: false, error: message };
+    }
+    refreshViews();
+    return { ok: true };
+  }
+
+  async function writeExport(data: MemoryExport, defaultFileName: string): Promise<void> {
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(defaultFileName),
+      filters: { "Repo Notes export": ["json"] },
+      title: "Export Repo Notes",
+    });
+    if (!uri) return;
+    try {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(data, null, 2), "utf8"));
+    } catch (error) {
+      await vscode.window.showErrorMessage(`Could not write the export file: ${errorMessage(error)}`);
+      return;
+    }
+    await vscode.window.showInformationMessage(`Exported notes to ${uri.fsPath}`);
+  }
+
+  async function exportNotes(all: boolean): Promise<void> {
+    if (all) {
+      if (repos.length === 0) {
+        await vscode.window.showInformationMessage("No repositories detected to export.");
         return;
       }
-      const { summary, state } = await shieldManager.healthCheck(facts.repoRoot, {
-        // Content drift of Shield's own evaluator copy: compared
-        // byte-for-byte against the bundled source, which is the only way
-        // to catch a hand edit that kept the ownership/version marker.
-        evaluatorScriptSource: shieldEvaluatorScriptSource,
-        // Profile drift: the live profile list from Settings, so an
-        // `expectedGitHubLogin`/`trustedSshHostAliases`/`strictPushSetup`/
-        // identity change made after Shield was enabled is reported.
-        currentProfiles: getProfiles(),
-        // Push-destination drift: the freshly resolved plain-push
-        // destination (branch.<name>.pushRemote / remote.pushDefault /
-        // pushurl all honoured by collectRepoFacts), not origin's fetch
-        // URL — the same fact Shield's policy approves.
-        currentPushDestination: {
-          host: facts.pushRemoteHost,
-          owner: facts.pushRemoteOwner,
-          repo: facts.pushRemoteRepo,
-          protocol: facts.pushRemoteProtocol,
-          port: facts.pushRemotePort,
-          sshUser: facts.pushRemoteUser,
-        },
-        // This IS the explicit, on-demand check: worth a real "ssh -G"
-        // call to catch an SSH alias silently repointed since Shield was
-        // last enabled/repaired — see
-        // ShieldInspectOptions.resolveCanonicalDestinationDrift.
-        resolveCanonicalDestinationDrift: true,
-      });
-      if (state === "active") {
-        await vscode.window.showInformationMessage(summary);
-      } else {
-        await vscode.window.showWarningMessage(summary);
-      }
-    } catch (error) {
-      await vscode.window.showErrorMessage(`Could not check Shield health: ${getErrorMessage(error)}`);
+      // Labels are repository/folder names only — never a local path, since
+      // an export is a file the user may share.
+      await writeExport(
+        memoryStore.exportAllMemory(repos.map((repo) => ({ label: repo.repoName || repo.folderName || "(unnamed repository)", keys: repo.memoryKeys }))),
+        "repo-notes-all.json",
+      );
+      return;
     }
+    const entry = selectedEntry();
+    if (!entry) return;
+    await writeExport(memoryStore.exportMemory(entry.memoryKeys, entry.repoName), `repo-notes-${entry.repoName.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 60) || "repo"}.json`);
   }
 
+  async function importNotes(): Promise<void> {
+    const entry = selectedEntry();
+    if (!entry) return;
+    const uris = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { "Repo Notes export": ["json"] }, title: "Import Repo Notes" });
+    if (!uris || uris.length === 0) return;
+
+    let raw: unknown;
+    try {
+      const stat = await vscode.workspace.fs.stat(uris[0]);
+      if (stat.size > MAX_IMPORT_FILE_BYTES) {
+        await vscode.window.showErrorMessage("That file is larger than a Repo Notes export can be — it is likely the wrong file.");
+        return;
+      }
+      raw = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(uris[0])).toString("utf8"));
+    } catch {
+      await vscode.window.showErrorMessage("Could not read that file as JSON.");
+      return;
+    }
+
+    const filePreview = memoryStore.previewImportFile(raw);
+    if (!filePreview.valid) {
+      await vscode.window.showErrorMessage(filePreview.error ?? "This file isn't a valid Repo Notes export.");
+      return;
+    }
+    let entryIndex = 0;
+    if (filePreview.entries.length > 1) {
+      const picked = await vscode.window.showQuickPick(
+        filePreview.entries.map((e) => ({ label: e.label, description: `${e.noteCount} note${e.noteCount === 1 ? "" : "s"}`, entryIndex: e.index })),
+        { title: "Import Repo Notes", placeHolder: "This file has notes from more than one repository. Which one should be imported into the current repository?" },
+      );
+      if (!picked) return;
+      entryIndex = picked.entryIndex;
+    }
+    const preview = memoryStore.previewImportEntry(entry.memoryKeys, raw, entryIndex);
+    if (!preview.valid) {
+      await vscode.window.showErrorMessage(preview.error ?? "This file isn't a valid Repo Notes export.");
+      return;
+    }
+    const lines = [`This will import ${preview.noteCount} note(s) into ${entry.repoName}. Imported notes are plain text and are never run.`];
+    if (preview.duplicateNoteIds.length > 0) lines.push(`${preview.duplicateNoteIds.length} note(s) already exist here and will be skipped unless you choose to overwrite them.`);
+    const actions = preview.duplicateNoteIds.length > 0 ? ["Import (skip duplicates)", "Import and overwrite duplicates"] : ["Import"];
+    const choice = await vscode.window.showInformationMessage(lines.join("\n\n"), { modal: true }, ...actions);
+    if (!choice) return;
+    try {
+      await memoryStore.importMemory(entry.memoryKeys, raw, entryIndex, { overwriteDuplicates: choice === "Import and overwrite duplicates" });
+    } catch (error) {
+      await vscode.window.showWarningMessage(error instanceof MemoryLimitError ? error.message : "Something went wrong importing notes.");
+      return;
+    }
+    refreshViews();
+    await vscode.window.showInformationMessage("Notes imported.");
+  }
+
+  // ==================== registration ====================
+
   context.subscriptions.push(
-    vscode.commands.registerCommand("repoIdentityGuard.scan", () => scan()),
-    vscode.commands.registerCommand("repoIdentityGuard.showStatus", () => showStatus()),
-    vscode.commands.registerCommand("repoIdentityGuard.fixIdentity", () => fixCommitIdentity()),
-    vscode.commands.registerCommand("repoIdentityGuard.addRuleForCurrentRepo", () => addProfileForRepo()),
-    vscode.commands.registerCommand("repoIdentityGuard.copyDiagnosticReport", () => copyContextForAI()),
-    vscode.commands.registerCommand("repoIdentityGuard.copyWorkspaceSafetySummary", () => copyWorkspaceSafetySummary()),
-    vscode.commands.registerCommand("repoIdentityGuard.openSettings", () =>
-      vscode.commands.executeCommand("workbench.action.openSettingsJson"),
-    ),
-    vscode.commands.registerCommand("repoIdentityGuard.enableShield", () => enableShield()),
-    vscode.commands.registerCommand("repoIdentityGuard.disableShield", () => disableShield()),
-    vscode.commands.registerCommand("repoIdentityGuard.repairShield", () => repairShield()),
-    vscode.commands.registerCommand("repoIdentityGuard.checkShieldHealth", () => checkShieldHealth()),
-    vscode.window.onDidChangeActiveTextEditor(() => void scan()),
+    vscode.commands.registerCommand("repoIdentityGuard.open", () => vscode.commands.executeCommand("workbench.view.extension.repoIdentityGuard")),
+    vscode.commands.registerCommand("repoIdentityGuard.assignIdentity", () => assignIdentity(undefined, "assign")),
+    vscode.commands.registerCommand("repoIdentityGuard.changeIdentity", () => assignIdentity(undefined, "change")),
+    vscode.commands.registerCommand("repoIdentityGuard.unlockRepository", () => unlockRepository()),
+    vscode.commands.registerCommand("repoIdentityGuard.repairLock", () => repairLock()),
+    vscode.commands.registerCommand("repoIdentityGuard.checkLock", () => checkLock()),
+    vscode.commands.registerCommand("repoIdentityGuard.applyIdentityToGitConfig", () => applyIdentityToGitConfig()),
+    vscode.commands.registerCommand("repoIdentityGuard.editIdentities", () => editIdentities()),
+    vscode.window.onDidChangeActiveTextEditor(() => scheduleScan()),
     vscode.workspace.onDidChangeWorkspaceFolders(() => void scan()),
     vscode.workspace.onDidGrantWorkspaceTrust(() => void scan()),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (affectsRepoIdentityGuardConfig(event)) void scan();
     }),
-    // A lighter-weight nudge for ordinary working-tree edits, which the
-    // Git-dir watchers above don't cover (see reconcileRepoWatchers).
-    vscode.workspace.onDidSaveTextDocument(() => scheduleDebouncedScan()),
     {
       dispose: () => {
         if (debounceTimer) clearTimeout(debounceTimer);
-        disposeRepoWatchers();
-        disposeGlobalGitConfigWatchers();
+        for (const disposables of repoWatchers.values()) disposables.forEach((d) => d.dispose());
+        repoWatchers.clear();
       },
     },
   );
 
-  /**
-   * In a multi-root workspace, this reflects `workspaceState` — the same
-   * thing the status bar badge shows — never just the selected repo. A
-   * status bar reading "Not Safe (1/2 repos)" whose click says "Safe to
-   * work here" would be a trust-breaking contradiction.
-   */
-  async function showStatus(): Promise<void> {
-    if (workspaceState.repos.length > 1) {
-      const problems = workspaceProblemCount(workspaceState);
-      const message =
-        workspaceState.level === "safe"
-          ? `Workspace is safe: all ${workspaceState.repos.length} repositories checked and safe.`
-          : `Workspace is not safe: ${problems} of ${workspaceState.repos.length} repositories need attention.`;
-
-      const choice = await (workspaceState.level === "safe"
-        ? vscode.window.showInformationMessage(message, "Show Repositories")
-        : vscode.window.showWarningMessage(message, "Show Repositories"));
-
-      if (choice === "Show Repositories") {
-        await vscode.commands.executeCommand("workbench.view.extension.repoIdentityGuard");
-      }
-      return;
-    }
-
-    const summary = latestSummary;
-    const message =
-      summary.level === "safe"
-        ? `Safe to work here${summary.matchedProfile ? ` as ${summary.matchedProfile.label}` : ""}.`
-        : summary.level === "not_safe"
-          ? `Not safe: ${summary.nextFix?.title ?? "see Review Details"}.`
-          : "This folder isn't a Git repository yet.";
-
-    const choice = await (summary.level === "not_safe"
-      ? vscode.window.showWarningMessage(message, "Review Details", "Repo Memory")
-      : vscode.window.showInformationMessage(message, "Review Details", "Repo Memory"));
-
-    if (choice === "Review Details") {
-      await vscode.commands.executeCommand("workbench.view.extension.repoIdentityGuard");
-    } else if (choice === "Repo Memory") {
-      await vscode.commands.executeCommand("workbench.view.extension.repoIdentityGuard");
-    }
+  // One-time, idempotent data migrations: saved commands → notes (schema
+  // v3), and legacy profiles → identities. Neither ever creates an
+  // assignment or executes anything.
+  await memoryStore.migrateStorage().catch(() => false);
+  const identityMigration = await migrateLegacyProfilesToIdentities().catch(() => ({ migrated: 0, rejected: 0 }));
+  if (identityMigration.migrated > 0 || identityMigration.rejected > 0) {
+    void vscode.window.showInformationMessage(
+      `Repo Identity Guard converted ${identityMigration.migrated} legacy profile(s) into identities${identityMigration.rejected > 0 ? ` (${identityMigration.rejected} could not be converted)` : ""}. Profiles no longer match repositories automatically: assign an identity to each repository you want locked.`,
+    );
   }
-
-  updateGlobalGitConfigWatchers(scan);
   void scan();
 }
 
 export function deactivate(): void {
   for (const disposables of repoWatchers.values()) disposables.forEach((d) => d.dispose());
   repoWatchers.clear();
-  disposeGlobalGitConfigWatchers();
 }
 
-function getActiveCwd(): string | undefined {
-  const activeDocument = vscode.window.activeTextEditor?.document;
-  if (activeDocument?.uri.scheme === "file") {
-    return path.dirname(activeDocument.uri.fsPath);
-  }
-  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+function isSubpath(candidate: string, root: string): boolean {
+  const rel = path.relative(root, candidate);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
-function updateGlobalGitConfigWatchers(scan: (cwdOverride?: string) => Promise<void>): void {
-  disposeGlobalGitConfigWatchers();
-
-  const home = os.homedir();
-  const configPaths = [path.join(home, ".gitconfig"), path.join(home, ".config", "git", "config")];
-
-  globalGitConfigWatchers = configPaths.map((configPath) => {
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(path.dirname(configPath), path.basename(configPath)),
-    );
-    watcher.onDidChange(() => void scan());
-    watcher.onDidCreate(() => void scan());
-    watcher.onDidDelete(() => void scan());
-    return watcher;
-  });
-}
-
-function disposeGlobalGitConfigWatchers(): void {
-  for (const watcher of globalGitConfigWatchers) watcher.dispose();
-  globalGitConfigWatchers = [];
-}
-
-function getErrorMessage(error: unknown): string {
+function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
-// Re-exported for tests / type-only consumers.
-export type { RepoFacts };

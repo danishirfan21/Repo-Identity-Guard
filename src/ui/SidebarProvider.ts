@@ -1,69 +1,11 @@
 import * as vscode from "vscode";
-import { Profile } from "../types";
-import { isNonEmptyString, sanitizeProfile, sanitizeStringArray } from "../validation";
+import { NoteMutationResult, SidebarActions, dispatchSidebarMessage } from "./sidebarMessages";
+import { PLACEHOLDER_VIEW_JS } from "../webview/client/placeholderView";
 import { SidebarModel, toWireState } from "./wireState";
-import { ICONS_JS } from "../webview/client/icons";
-import { COMPONENTS_JS } from "../webview/client/components";
-import { ONBOARDING_VIEW_JS } from "../webview/client/onboardingView";
-import { MAIN_VIEW_JS } from "../webview/client/mainView";
-import { DETAILS_VIEW_JS } from "../webview/client/detailsView";
-import { SHIELD_VIEW_JS } from "../webview/client/shieldView";
-import { MEMORY_VIEW_JS } from "../webview/client/memoryView";
-import { SETTINGS_VIEW_JS } from "../webview/client/settingsView";
-import { NAVIGATION_JS } from "../webview/client/navigation";
 
-/**
- * Result of a Repo Memory mutation the webview needs to react to
- * synchronously — specifically, whether it's now safe to clear an unsaved
- * draft or exit edit mode. `addMemoryNote`/`updateMemoryNote`/
- * `addSavedCommand` are the only actions the webview optimistically holds
- * draft text for, so they're the only ones that return this instead of
- * `void`: on `ok: false` the webview must keep the draft/edit mode exactly
- * as the user left it, never clear it just because the message was sent.
- */
-export interface MemoryMutationResult {
-  ok: boolean;
-  error?: string;
-}
+export type { NoteMutationResult, SidebarActions } from "./sidebarMessages";
 
-export interface SidebarActions {
-  rescan(): Promise<void>;
-  fixCommitIdentity(): Promise<void>;
-  unsetLocalIdentity(): Promise<void>;
-  addProfileForRepo(): Promise<void>;
-  openSettingsJson(): Promise<void>;
-  copyContextForAI(): Promise<void>;
-  copyWorkspaceSafetySummary(): Promise<void>;
-  enableWorkspaceTrust(): Promise<void>;
-  resolveProfileConflict(): Promise<void>;
-  selectRepo(repoId: string): Promise<void>;
-
-  addMemoryNote(text: string, pinned: boolean): Promise<MemoryMutationResult>;
-  updateMemoryNote(id: string, text: string): Promise<MemoryMutationResult>;
-  removeMemoryNote(id: string): Promise<void>;
-  togglePinMemoryNote(id: string): Promise<void>;
-  addSavedCommand(label: string, command: string): Promise<MemoryMutationResult>;
-  removeSavedCommand(id: string): Promise<void>;
-  runSavedCommand(id: string): Promise<void>;
-  copySavedCommand(id: string): Promise<void>;
-  exportMemory(): Promise<void>;
-  exportAllMemory(): Promise<void>;
-  importMemory(): Promise<void>;
-
-  saveProfile(profile: Profile): Promise<void>;
-  deleteProfile(id: string): Promise<void>;
-  saveProtectedBranches(branches: string[]): Promise<void>;
-  saveRequireLocalIdentity(value: boolean): Promise<void>;
-  saveIncludeMemoryInAiContext(value: boolean): Promise<void>;
-
-  enableShield(chainForeignHooks: boolean): Promise<void>;
-  disableShield(): Promise<void>;
-  repairShield(): Promise<void>;
-  checkShieldHealth(): Promise<void>;
-}
-
-export type { SidebarModel } from "./wireState";
-
+/** Placeholder sidebar host — see `src/webview/client/placeholderView.ts`. */
 export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
   private model: SidebarModel | undefined;
@@ -79,7 +21,13 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
     };
-    webviewView.webview.onDidReceiveMessage((message) => void this.handleMessage(message));
+    webviewView.webview.onDidReceiveMessage((message) => {
+      if (message && typeof message === "object" && (message as { type?: unknown }).type === "ready") {
+        this.postState();
+        return;
+      }
+      void dispatchSidebarMessage(this.actions, message ?? {}, (requestId, result) => this.postNoteResult(requestId, result));
+    });
     webviewView.webview.html = this.getHtml();
     this.postState();
   }
@@ -90,155 +38,20 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
   }
 
   private postState(): void {
-    if (!this.view || !this.model) {
-      return;
-    }
-    this.view.webview.postMessage({ type: "state", payload: toWireState(this.model) });
+    if (!this.view || !this.model) return;
+    void this.view.webview.postMessage({ type: "state", payload: toWireState(this.model) });
   }
 
-  /**
-   * Replies to ONE specific mutation request so the webview can decide
-   * whether it's safe to clear a draft or exit edit mode — see
-   * `MemoryMutationResult`'s doc comment. `requestId` is opaque,
-   * client-generated, and round-tripped unchanged; a missing/malformed
-   * one (a stale or hand-crafted message) is simply dropped rather than
-   * guessed at.
-   */
-  private postMemoryResult(requestId: unknown, result: MemoryMutationResult): void {
+  private postNoteResult(requestId: unknown, result: NoteMutationResult): void {
     if (!this.view || typeof requestId !== "string" || !requestId) return;
-    this.view.webview.postMessage({ type: "memoryMutationResult", requestId, ok: result.ok, error: result.error });
-  }
-
-  /**
-   * The webview is a trust boundary (see `../validation`): even though its
-   * only content today is this extension's own script, nothing here may
-   * assume a message has the shape a TypeScript cast claims. A message that
-   * fails validation for the field an action actually needs is dropped
-   * entirely — never coerced (`String(anObject)` silently becomes
-   * `"[object Object]"`, which is a worse failure mode than a no-op) and
-   * never partially actioned with a guessed default in place of the
-   * missing/malformed field.
-   */
-  private async handleMessage(message: { type?: string; [key: string]: unknown }): Promise<void> {
-    const a = this.actions;
-    switch (message.type) {
-      case "rescan":
-        await a.rescan();
-        break;
-      case "fixCommitIdentity":
-        await a.fixCommitIdentity();
-        break;
-      case "unsetLocalIdentity":
-        await a.unsetLocalIdentity();
-        break;
-      case "addProfileForRepo":
-        await a.addProfileForRepo();
-        break;
-      case "openSettingsJson":
-        await a.openSettingsJson();
-        break;
-      case "copyContextForAI":
-        await a.copyContextForAI();
-        break;
-      case "copyWorkspaceSafetySummary":
-        await a.copyWorkspaceSafetySummary();
-        break;
-      case "enableWorkspaceTrust":
-        await a.enableWorkspaceTrust();
-        break;
-      case "resolveProfileConflict":
-        await a.resolveProfileConflict();
-        break;
-      case "selectRepo":
-        if (isNonEmptyString(message.id)) await a.selectRepo(message.id);
-        break;
-      case "addMemoryNote":
-        if (isNonEmptyString(message.text)) {
-          this.postMemoryResult(message.requestId, await a.addMemoryNote(message.text, message.pinned === true));
-        } else {
-          this.postMemoryResult(message.requestId, { ok: false, error: "A note can't be empty." });
-        }
-        break;
-      case "updateMemoryNote":
-        if (isNonEmptyString(message.id) && typeof message.text === "string") {
-          this.postMemoryResult(message.requestId, await a.updateMemoryNote(message.id, message.text));
-        } else {
-          this.postMemoryResult(message.requestId, { ok: false, error: "A note can't be empty." });
-        }
-        break;
-      case "removeMemoryNote":
-        if (isNonEmptyString(message.id)) await a.removeMemoryNote(message.id);
-        break;
-      case "togglePinMemoryNote":
-        if (isNonEmptyString(message.id)) await a.togglePinMemoryNote(message.id);
-        break;
-      case "addSavedCommand":
-        if (isNonEmptyString(message.label) && isNonEmptyString(message.command)) {
-          this.postMemoryResult(message.requestId, await a.addSavedCommand(message.label, message.command));
-        } else {
-          this.postMemoryResult(message.requestId, { ok: false, error: "A saved command needs both a label and a command." });
-        }
-        break;
-      case "removeSavedCommand":
-        if (isNonEmptyString(message.id)) await a.removeSavedCommand(message.id);
-        break;
-      case "runSavedCommand":
-        if (isNonEmptyString(message.id)) await a.runSavedCommand(message.id);
-        break;
-      case "copySavedCommand":
-        if (isNonEmptyString(message.id)) await a.copySavedCommand(message.id);
-        break;
-      case "exportMemory":
-        await a.exportMemory();
-        break;
-      case "exportAllMemory":
-        await a.exportAllMemory();
-        break;
-      case "importMemory":
-        await a.importMemory();
-        break;
-      case "saveProfile": {
-        const profile = sanitizeProfile(message.profile);
-        if (profile) await a.saveProfile(profile);
-        break;
-      }
-      case "deleteProfile":
-        if (isNonEmptyString(message.id)) await a.deleteProfile(message.id);
-        break;
-      case "saveProtectedBranches":
-        await a.saveProtectedBranches(sanitizeStringArray(message.branches));
-        break;
-      case "saveRequireLocalIdentity":
-        if (typeof message.value === "boolean") await a.saveRequireLocalIdentity(message.value);
-        break;
-      case "saveIncludeMemoryInAiContext":
-        if (typeof message.value === "boolean") await a.saveIncludeMemoryInAiContext(message.value);
-        break;
-      case "enableShield":
-        await a.enableShield(message.chainForeignHooks === true);
-        break;
-      case "disableShield":
-        await a.disableShield();
-        break;
-      case "repairShield":
-        await a.repairShield();
-        break;
-      case "checkShieldHealth":
-        await a.checkShieldHealth();
-        break;
-    }
+    void this.view.webview.postMessage({ type: "noteResult", requestId, ok: result.ok, error: result.error });
   }
 
   private getHtml(): string {
-    if (!this.view) {
-      return "";
-    }
+    if (!this.view) return "";
     const nonce = getNonce();
-    const cssUri = this.view.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.extensionUri, "media", "sidebar.css"),
-    );
+    const cssUri = this.view.webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, "media", "sidebar.css"));
     const cspSource = this.view.webview.cspSource;
-
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -248,38 +61,10 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
 <link href="${cssUri}" rel="stylesheet" />
 <title>Repo Identity Guard</title>
 </head>
-<body class="custom-scrollbar flex flex-col overflow-y-auto">
-<header class="flex h-[38px] w-full shrink-0 items-center justify-between border-b border-outline-variant bg-surface-container px-sidebar-padding">
-  <div class="flex min-w-0 items-center gap-1.5">
-    <button class="hidden shrink-0 rounded p-1 text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface" id="backButton" title="Back"></button>
-    <span class="shrink-0 text-primary" id="headerIcon"></span>
-    <div class="flex min-w-0 flex-col leading-none">
-      <span class="truncate text-[12.5px] font-bold text-on-surface" id="headerTitle">Repo Identity Guard</span>
-      <span class="truncate text-[9.5px] text-on-surface-variant" id="headerSubtitle">Safe to work, commit, push?</span>
-    </div>
-  </div>
-  <div class="flex shrink-0 gap-0.5">
-    <button class="rounded p-1.5 text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface" data-nav="main" title="Home" id="homeButton"></button>
-    <button class="rounded p-1.5 text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface" id="rescanButton" title="Rescan"></button>
-    <button class="rounded p-1.5 text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface" data-nav="settings" title="Settings" id="settingsNavButton"></button>
-  </div>
-</header>
-<main class="flex flex-1 flex-col gap-lg p-sidebar-padding" id="app"></main>
+<body>
+<main id="app"></main>
 <script nonce="${nonce}">
-${ICONS_JS}
-${COMPONENTS_JS}
-${ONBOARDING_VIEW_JS}
-${MAIN_VIEW_JS}
-${SHIELD_VIEW_JS}
-${DETAILS_VIEW_JS}
-${MEMORY_VIEW_JS}
-${SETTINGS_VIEW_JS}
-${NAVIGATION_JS}
-document.getElementById("backButton").innerHTML = icon("arrowLeft", 14);
-document.getElementById("headerIcon").innerHTML = icon("shield", 15);
-document.getElementById("homeButton").innerHTML = icon("home", 14);
-document.getElementById("rescanButton").innerHTML = icon("refresh", 14);
-document.getElementById("settingsNavButton").innerHTML = icon("settings", 14);
+${PLACEHOLDER_VIEW_JS}
 </script>
 </body>
 </html>`;

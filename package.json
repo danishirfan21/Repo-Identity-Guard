@@ -1,7 +1,7 @@
 {
   "name": "repo-identity-guard",
   "displayName": "Repo Identity Guard",
-  "description": "Know instantly whether it's safe to work, commit, push, or let an AI agent run commands in this repo.",
+  "description": "Lock a Git repository to an explicitly chosen Git/GitHub identity, and keep private notes per repository.",
   "version": "0.2.0",
   "publisher": "local",
   "icon": "resources/repo-id-marketplace.png",
@@ -20,14 +20,13 @@
   "keywords": [
     "git",
     "identity",
-    "safety",
-    "security",
-    "ssh",
     "github",
-    "ai agent",
+    "ssh",
+    "commit",
     "pre-commit",
     "pre-push",
-    "hooks"
+    "hooks",
+    "notes"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -54,64 +53,53 @@
       "repoIdentityGuard": [
         {
           "id": "repoIdentityGuard.statusView",
-          "name": "Status",
+          "name": "Repo Identity Guard",
           "type": "webview"
         }
       ]
     },
     "commands": [
       {
-        "command": "repoIdentityGuard.scan",
-        "title": "Repo Identity Guard: Rescan"
+        "command": "repoIdentityGuard.open",
+        "title": "Repo Identity Guard: Open"
       },
       {
-        "command": "repoIdentityGuard.showStatus",
-        "title": "Repo Identity Guard: Show Status"
+        "command": "repoIdentityGuard.assignIdentity",
+        "title": "Repo Identity Guard: Assign Identity to Current Repository"
       },
       {
-        "command": "repoIdentityGuard.fixIdentity",
-        "title": "Repo Identity Guard: Fix Commit Identity"
+        "command": "repoIdentityGuard.changeIdentity",
+        "title": "Repo Identity Guard: Change Assigned Identity"
       },
       {
-        "command": "repoIdentityGuard.addRuleForCurrentRepo",
-        "title": "Repo Identity Guard: Add Profile for Current Repo"
+        "command": "repoIdentityGuard.unlockRepository",
+        "title": "Repo Identity Guard: Unlock Current Repository"
       },
       {
-        "command": "repoIdentityGuard.copyDiagnosticReport",
-        "title": "Repo Identity Guard: Copy Context for AI"
+        "command": "repoIdentityGuard.repairLock",
+        "title": "Repo Identity Guard: Repair Identity Lock"
       },
       {
-        "command": "repoIdentityGuard.copyWorkspaceSafetySummary",
-        "title": "Repo Identity Guard: Copy Workspace Safety Summary"
+        "command": "repoIdentityGuard.checkLock",
+        "title": "Repo Identity Guard: Check Identity Lock (verifies push account)"
       },
       {
-        "command": "repoIdentityGuard.openSettings",
-        "title": "Repo Identity Guard: Open Settings"
+        "command": "repoIdentityGuard.applyIdentityToGitConfig",
+        "title": "Repo Identity Guard: Use Assigned Identity in Git Config"
       },
       {
-        "command": "repoIdentityGuard.enableShield",
-        "title": "Repo Identity Guard: Enable Shield"
-      },
-      {
-        "command": "repoIdentityGuard.disableShield",
-        "title": "Repo Identity Guard: Disable Shield"
-      },
-      {
-        "command": "repoIdentityGuard.repairShield",
-        "title": "Repo Identity Guard: Repair Shield"
-      },
-      {
-        "command": "repoIdentityGuard.checkShieldHealth",
-        "title": "Repo Identity Guard: Check Shield Health"
+        "command": "repoIdentityGuard.editIdentities",
+        "title": "Repo Identity Guard: Edit Identities"
       }
     ],
     "configuration": {
       "title": "Repo Identity Guard",
       "properties": {
-        "repoIdentityGuard.profiles": {
+        "repoIdentityGuard.identities": {
           "type": "array",
           "default": [],
-          "description": "Profiles (e.g. Work, Personal) matched against a repo's remote owner to determine the expected identity and rules.",
+          "scope": "application",
+          "markdownDescription": "Reusable identities (e.g. Work, Personal). An identity does nothing on its own: a repository is only locked when you explicitly assign an identity to it (\"Repo Identity Guard: Assign Identity to Current Repository\"). Repositories are never matched to identities automatically. User settings only — a workspace cannot define identities.",
           "items": {
             "type": "object",
             "required": [
@@ -119,82 +107,37 @@
               "label",
               "gitEmail"
             ],
+            "additionalProperties": false,
             "properties": {
               "id": {
                 "type": "string",
-                "description": "Stable unique identifier for this profile."
+                "description": "Stable unique id. Locks record it so later edits to this identity can be detected."
               },
               "label": {
                 "type": "string",
-                "description": "Short display label, for example Work or Personal."
+                "description": "Short display label, e.g. Work or Personal."
               },
               "gitName": {
                 "type": "string",
-                "description": "Expected Git commit author name for matching repositories."
+                "description": "Expected Git author/committer name. Omit to enforce only the email."
               },
               "gitEmail": {
                 "type": "string",
-                "description": "Expected Git commit author email for matching repositories."
+                "description": "Expected Git author/committer email. Always enforced in locked repositories."
               },
-              "expectedRemoteOwners": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "GitHub owners/orgs (wildcards allowed) whose repos should match this profile."
-              },
-              "exactRepos": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "Exact repositories pinned to this profile, canonicalized as host/owner/repo (wildcards allowed), e.g. github.com/acme/secret. Always wins over expectedRemoteOwners — this is how one specific repo is bound to a profile regardless of owner patterns."
-              },
-              "expectedBranchPatterns": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "Wildcard branch name patterns considered normal for this profile, e.g. feature/*."
-              },
-              "strictPushSetup": {
-                "type": "boolean",
-                "description": "When true, HTTPS remotes and generic SSH hosts are treated as Not Safe until locked to this profile."
+              "expectedGitHubLogin": {
+                "type": "string",
+                "description": "The github.com username every push from a locked repository must authenticate as (what `ssh -T git@<alias>` reports). Not your email, not the repository owner. Omit to lock commits only. Requires at least one trusted SSH host alias, otherwise every push is blocked."
               },
               "trustedSshHostAliases": {
                 "type": "array",
                 "items": {
                   "type": "string"
                 },
-                "description": "SSH host aliases (e.g. github-work, from a ~/.ssh/config Host entry) this profile explicitly trusts as an approved push route. A custom SSH alias is never trusted just for being non-generic — only aliases listed here can make Push Account read as a trusted route, and even then it is never cryptographic proof of the remote account."
-              },
-              "expectedGitHubLogin": {
-                "type": "string",
-                "description": "The GitHub username this profile expects a trusted SSH route to authenticate as when Shield performs strict GitHub account verification. This is NOT your commit email (gitEmail), NOT the repository's owner or org (expectedRemoteOwners / exactRepos), NOT the SSH host alias (trustedSshHostAliases), and NOT a generic Git username — it is the github.com account name that `ssh -T git@…` reports for this route, e.g. \"danish-work\". Only used when strictPushSetup is on and the push route is already a trusted SSH alias; leave it empty to make no claim about which account authenticates. Requires Shield to be enabled; run \"Repo Identity Guard: Repair Shield\" after changing it."
+                "description": "SSH host aliases (Host entries in ~/.ssh/config, e.g. github-work) that pushes for this identity must use. Each must resolve to github.com with IdentitiesOnly yes; the account is still verified live on every push."
               }
             }
           }
-        },
-        "repoIdentityGuard.protectedBranches": {
-          "type": "array",
-          "default": [
-            "main",
-            "master"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "description": "Local branch policy: branch names Repo Identity Guard treats as protected on this machine. Not synced with GitHub's own branch protection settings."
-        },
-        "repoIdentityGuard.requireLocalIdentity": {
-          "type": "boolean",
-          "default": false,
-          "description": "Require matched repositories to set the expected identity in local Git config, even when the effective identity currently matches via global config."
-        },
-        "repoIdentityGuard.includeMemoryInAiContext": {
-          "type": "boolean",
-          "default": false,
-          "description": "Off by default. When enabled, your pinned Repo Memory note is included in 'Copy Context for AI'. Pinned notes are free text you wrote for yourself and may contain sensitive info — only enable this if you're sure."
         }
       }
     }
@@ -202,7 +145,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "Read-only repo scanning still runs in untrusted workspaces. Every mutating or executing action — fixing commit identity, running saved commands, and enabling/disabling/repairing Shield Mode (which installs Git hooks) — is blocked until the workspace is trusted."
+      "description": "Notes (add, edit, delete, search, copy, export, import) work in untrusted workspaces — they are local data that is never executed. Assigning, changing, repairing or unlocking an identity lock installs or removes Git hooks, so those actions require Workspace Trust; legacy Shield installations are also only migrated once the workspace is trusted."
     }
   },
   "devDependencies": {

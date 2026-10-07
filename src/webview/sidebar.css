@@ -94,17 +94,26 @@
   }
 }
 
+/*
+ * PLACEHOLDER UI. The sidebar is intentionally minimal while the product
+ * is redesigned around the identity-lock + notes backend; these few
+ * classes exist only so the placeholder is legible in every theme.
+ */
 @layer components {
-  /* Base bordered surface used by every card-like block. */
   .vs-card {
     background-color: var(--rig-surface-container-low);
     border: 1px solid var(--rig-border);
+    border-radius: 4px;
+    padding: 8px;
   }
 
   .vs-button-primary {
     background-color: var(--rig-button-bg);
     color: var(--rig-button-fg);
     border: 1px solid transparent;
+    border-radius: 2px;
+    padding: 2px 8px;
+    cursor: pointer;
   }
 
   .vs-button-primary:hover {
@@ -115,10 +124,12 @@
     background-color: transparent;
     color: var(--rig-fg);
     border: 1px solid var(--rig-border);
+    border-radius: 2px;
+    padding: 2px 8px;
+    cursor: pointer;
   }
 
   .vs-button-secondary:hover {
-    background-color: var(--rig-surface-container-high);
     border-color: var(--rig-primary);
     color: var(--rig-primary);
   }
@@ -127,95 +138,31 @@
     background-color: var(--rig-input-bg);
     color: var(--rig-input-fg);
     border: 1px solid var(--rig-input-border);
+    width: 100%;
+    box-sizing: border-box;
+    padding: 4px;
   }
 
-  .vs-input:focus {
-    outline: none;
-    border-color: var(--rig-border-strong);
-  }
-
-  .vs-chip {
-    background-color: var(--rig-chip-bg);
-    border: 1px solid var(--rig-border);
-    color: var(--rig-fg);
-  }
-
-  .vs-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-  }
-
-  .vs-icon svg {
-    width: 1em;
-    height: 1em;
-  }
-
-  /* Status badges (Confirmed / Contradicted / Unverified / Warning / N/A) */
-  .badge-confirmed {
-    background-color: var(--rig-success-bg);
-    color: var(--rig-success);
-    border: 1px solid color-mix(in srgb, var(--rig-success) 40%, transparent);
-  }
-
-  .badge-contradicted {
-    background-color: var(--rig-error-bg);
-    color: var(--rig-error);
-    border: 1px solid color-mix(in srgb, var(--rig-error) 40%, transparent);
-  }
-
-  .badge-warning,
-  .badge-unverified {
-    background-color: var(--rig-warning-bg);
-    color: var(--rig-warning);
-    border: 1px solid color-mix(in srgb, var(--rig-warning) 40%, transparent);
-  }
-
-  .badge-not_applicable {
-    background-color: var(--rig-surface-container-high);
+  .rig-muted {
     color: var(--rig-fg-muted);
-    border: 1px solid var(--rig-border);
   }
 
-  .verdict-safe {
-    background-color: var(--rig-success-bg);
-    border: 1px solid color-mix(in srgb, var(--rig-success) 35%, transparent);
+  .rig-note-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
   }
 
-  .verdict-not_safe {
-    background-color: var(--rig-error-bg);
-    border: 1px solid color-mix(in srgb, var(--rig-error) 35%, transparent);
-  }
-
-  .verdict-not_checked {
-    background-color: var(--rig-surface-container-low);
-    border: 1px solid var(--rig-border);
-  }
-
-  /* Shield lifecycle badges (OFF / ACTIVE / DEGRADED / BROKEN / UNAVAILABLE) — a separate axis from repository safety above, never reusing its verdict-* classes so the two are never visually conflated. */
-  .badge-shield-active {
-    background-color: var(--rig-success-bg);
+  .rig-state-active {
     color: var(--rig-success);
-    border: 1px solid color-mix(in srgb, var(--rig-success) 40%, transparent);
   }
 
-  .badge-shield-degraded {
-    background-color: var(--rig-warning-bg);
+  .rig-state-needs_attention {
     color: var(--rig-warning);
-    border: 1px solid color-mix(in srgb, var(--rig-warning) 40%, transparent);
   }
 
-  .badge-shield-broken {
-    background-color: var(--rig-error-bg);
-    color: var(--rig-error);
-    border: 1px solid color-mix(in srgb, var(--rig-error) 40%, transparent);
-  }
-
-  .badge-shield-off,
-  .badge-shield-unavailable {
-    background-color: var(--rig-surface-container-high);
+  .rig-state-unavailable,
+  .rig-state-unassigned {
     color: var(--rig-fg-muted);
-    border: 1px solid var(--rig-border);
   }
 }
