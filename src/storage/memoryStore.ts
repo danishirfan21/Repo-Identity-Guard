@@ -1,100 +1,86 @@
-import * as vscode from "vscode";
+import type * as vscode from "vscode";
 import { canonicalizeRepoPath } from "../services/gitService";
-import { MemoryNote, RepoMemory } from "../types";
+import { RepoMemory } from "../types";
 import {
   ImportEntryPreview,
   ImportFilePreview,
   ImportOptions,
   MemoryExport,
-  PersistedMemoryV2,
+  PersistedMemoryV3,
   applyMemoryImport,
   buildMemoryExport,
   getRepoMemory,
   makeId,
   memoryMutations,
+  needsMigration,
   normalizeLoadedMemory,
+  noteCopyText,
   previewMemoryImportEntry,
   previewMemoryImportFile,
   reconcileStaleKey,
+  searchNotes,
 } from "./memoryStoreCore";
 
-export {
-  MemoryLimitError,
-  MAX_NOTE_LENGTH,
-  MAX_NOTES_PER_REPO,
-  MAX_COMMAND_LABEL_LENGTH,
-  MAX_COMMAND_LENGTH,
-  MAX_COMMANDS_PER_REPO,
-  MAX_IMPORT_FILE_BYTES,
-} from "./memoryStoreCore";
+export { MemoryLimitError, MAX_NOTE_LENGTH, MAX_NOTES_PER_REPO, MAX_IMPORT_FILE_BYTES } from "./memoryStoreCore";
 export type { ImportEntryPreview, ImportEntrySummary, ImportFilePreview, ImportOptions, MemoryExport } from "./memoryStoreCore";
 
 const STORAGE_KEY = "repoIdentityGuard.memoryByRepo";
 
+/**
+ * The persistence surface `MemoryStore` needs — exactly the subset of
+ * `vscode.Memento` it uses, so tests can supply an in-memory fake.
+ */
+export interface MemoryBackend {
+  get<T>(key: string): T | undefined;
+  update(key: string, value: unknown): Thenable<void>;
+}
+
 export interface MemoryKeys {
+  /** Canonical git common directory — the repository-wide notes key shared by every linked worktree. */
   notesKey: string;
+  /**
+   * Canonical checkout (worktree) root. Notes never live here any more; it
+   * is kept only so data stored under it by older releases (migrated saved
+   * commands) can be reconciled into `notesKey` — see `reconcileLegacyKeys`.
+   */
   checkoutKey: string;
 }
 
 /**
- * Repo Memory is local-first and private: it lives only in this VS Code
- * install's global storage (never a file inside the repo), so notes can
- * never be accidentally committed or pushed.
+ * Repo Notes is local-first and private: it lives only in this VS Code
+ * install's global storage (never a file inside the repository), so notes
+ * can never be accidentally committed or pushed, and it is never added to
+ * Settings Sync.
  *
  * Mutations are serialized through a single internal promise queue
- * (`enqueue`): `globalState` reads/writes are not atomic across concurrent
- * webview messages on their own (read snapshot, mutate, write back — two
- * overlapping calls can both read the same prior state and the
- * last-to-finish silently wins), so every public mutator here is queued
- * rather than racing directly against `globalState`. The queue itself
- * (`this.queue`) always resolves, even when the mutation it ran rejected —
- * see `enqueue`'s doc comment — so one failed mutation can never
- * permanently wedge every mutation after it.
+ * (`enqueue`): `globalState` read-modify-write is not atomic across
+ * concurrent webview messages, so every public mutator is queued. The
+ * queue always resolves, even when the mutation it ran rejected, so one
+ * failed mutation can never wedge every mutation after it.
  *
- * SCOPE OF THIS GUARANTEE — read before assuming more than it says: the
- * queue serializes mutations WITHIN ONE `MemoryStore` INSTANCE, i.e.
- * within one running Extension Host / one VS Code window. It does NOT,
- * and cannot, coordinate across two separate windows that have the same
- * profile open at once, each running its own Extension Host with its own
- * `MemoryStore` and its own independent in-memory `globalState` snapshot.
- * `vscode.ExtensionContext.globalState` exposes no cross-window change
- * notification and no atomic compare-and-swap; each window's `.update()`
- * does a read-modify-write against ITS OWN last-known snapshot, not a
- * fresh read of whatever another window most recently persisted to disk.
- * Two windows editing Repo Memory around the same moment can therefore
- * still lose an update to each other — see
- * `src/test/memoryStore.test.ts`'s "documented limitation" test, which
- * demonstrates the actual mechanism, and README.md's Repo Memory section,
- * which states this limitation to users. This is a real constraint of the
- * VS Code extension API this feature is built on, not something this
- * class's own design can close without either a cross-process lock file
- * (real added complexity, and still no atomicity guarantee VS Code itself
- * would honor) or moving off `globalState` entirely — both rejected here
- * as disproportionate to a local notes feature. Within a single window,
- * the guarantee above is real and tested.
+ * SCOPE OF THIS GUARANTEE: the queue serializes mutations WITHIN ONE
+ * `MemoryStore` instance (one VS Code window). Two windows editing notes
+ * around the same moment can still lose an update to each other —
+ * `globalState` offers no cross-window notification or compare-and-swap.
+ * See `src/test/memoryStore.test.ts`'s "documented limitation" test and
+ * README.md.
  */
 export class MemoryStore {
   private queue: Promise<void> = Promise.resolve();
+  private readonly backend: MemoryBackend;
 
-  public constructor(private readonly context: vscode.ExtensionContext) {}
-
-  private readAll(): PersistedMemoryV2 {
-    return normalizeLoadedMemory(this.context.globalState.get<unknown>(STORAGE_KEY));
+  public constructor(contextOrBackend: vscode.ExtensionContext | MemoryBackend) {
+    this.backend = "globalState" in contextOrBackend ? contextOrBackend.globalState : contextOrBackend;
   }
 
-  private async writeAll(state: PersistedMemoryV2): Promise<void> {
-    await this.context.globalState.update(STORAGE_KEY, state);
+  private readAll(): PersistedMemoryV3 {
+    return normalizeLoadedMemory(this.backend.get<unknown>(STORAGE_KEY));
   }
 
-  /**
-   * Runs `fn` only after every previously-enqueued mutation on this store
-   * has settled (succeeded OR failed), and lets later calls proceed
-   * regardless of how this one turns out. `this.queue` is reassigned to a
-   * promise that NEVER rejects (the `.catch(() => undefined)` at the end),
-   * so a thrown `MemoryLimitError` — or any other failure — surfaces to
-   * THIS call's caller via the returned/rejected `settle` promise without
-   * poisoning the shared chain for every mutation queued after it.
-   */
+  private async writeAll(state: PersistedMemoryV3): Promise<void> {
+    await this.backend.update(STORAGE_KEY, state);
+  }
+
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     const previousSettled = this.queue;
     const settle = previousSettled.then(fn, fn);
@@ -106,14 +92,21 @@ export class MemoryStore {
   }
 
   /**
-   * Resolves the canonical identity keys for a repository/checkout right
-   * now via a real filesystem call — used by `enable`-adjacent one-shot
-   * flows (export/import, reconciliation) that can afford to await it.
-   * The hot path (`getMemory` on every render) instead takes an
-   * already-resolved `MemoryKeys` from the caller — see
-   * `extension.ts`'s `repoMemoryKeys` cache — so rendering the sidebar
-   * never blocks on `fs.realpath`.
+   * Persists the schema migration (v1/v2 → v3, saved commands → notes)
+   * once, at activation, so it is not merely re-derived in memory on every
+   * read. Idempotent: a v3 store is left untouched, and the migration
+   * itself is deterministic (see memoryStoreCore.ts).
    */
+  public async migrateStorage(): Promise<boolean> {
+    return this.enqueue(async () => {
+      const raw = this.backend.get<unknown>(STORAGE_KEY);
+      if (!needsMigration(raw)) return false;
+      await this.writeAll(normalizeLoadedMemory(raw));
+      return true;
+    });
+  }
+
+  /** Resolves the canonical keys for a repository/checkout via a real filesystem call. */
   public async resolveKeys(repoRoot: string, gitCommonDir?: string): Promise<MemoryKeys> {
     const checkoutKey = await canonicalizeRepoPath(repoRoot);
     const notesKey = gitCommonDir ? await canonicalizeRepoPath(gitCommonDir) : checkoutKey;
@@ -121,34 +114,35 @@ export class MemoryStore {
   }
 
   /**
-   * Opportunistic migration of a still-raw (pre-canonicalization) key
-   * left over from an older release onto today's canonical keys — merges
-   * (never overwrites) so no note/command is ever lost, and is a no-op
-   * once a repository's data already lives under its canonical key.
-   * Called once per repository per scan from `extension.ts`, right after
-   * `resolveKeys`, so a repo opened again after an upgrade self-heals
-   * without any explicit user action.
+   * Opportunistic, lossless reconciliation of notes stored under a raw
+   * (pre-canonicalization) repository root, or under this checkout's key
+   * (saved commands migrated from schema v2), onto the repository-wide
+   * notes key. Merges by id, never overwrites; a no-op once reconciled.
    */
   public async reconcileLegacyKeys(rawRepoRoot: string, keys: MemoryKeys): Promise<void> {
-    if (rawRepoRoot === keys.notesKey && rawRepoRoot === keys.checkoutKey) return;
     await this.enqueue(async () => {
       const all = this.readAll();
-      const withNotes = reconcileStaleKey(all, "notesByRepoKey", rawRepoRoot, keys.notesKey);
-      const withCommands = reconcileStaleKey(withNotes, "commandsByCheckoutKey", rawRepoRoot, keys.checkoutKey);
-      if (withCommands === all) return;
-      await this.writeAll(withCommands);
+      let next = reconcileStaleKey(all, rawRepoRoot, keys.notesKey);
+      next = reconcileStaleKey(next, keys.checkoutKey, keys.notesKey);
+      if (next === all) return;
+      await this.writeAll(next);
     });
   }
 
   public getMemory(keys: MemoryKeys): RepoMemory {
-    return getRepoMemory(this.readAll(), keys);
+    return getRepoMemory(this.readAll(), keys.notesKey);
   }
 
-  public getPinnedNote(notesKey: string): MemoryNote | undefined {
-    return (this.readAll().notesByRepoKey[notesKey] ?? []).find((note) => note.pinned);
+  public searchNotes(keys: MemoryKeys, query: string): RepoMemory {
+    return { notes: searchNotes(this.getMemory(keys).notes, query) };
   }
 
-  private mutate(mutator: (state: PersistedMemoryV2) => PersistedMemoryV2): Promise<PersistedMemoryV2> {
+  /** The exact stored text of one note (what "Copy note" copies), or `undefined`. */
+  public getNoteText(keys: MemoryKeys, noteId: string): string | undefined {
+    return noteCopyText(this.getMemory(keys).notes, noteId);
+  }
+
+  private mutate(mutator: (state: PersistedMemoryV3) => PersistedMemoryV3): Promise<PersistedMemoryV3> {
     return this.enqueue(async () => {
       const all = this.readAll();
       const next = mutator(all);
@@ -161,35 +155,25 @@ export class MemoryStore {
 
   public async addNote(keys: MemoryKeys, text: string, pinned = false): Promise<RepoMemory> {
     const next = await this.mutate((state) => memoryMutations.addNote(state, keys.notesKey, text, pinned, Date.now()));
-    return getRepoMemory(next, keys);
+    return getRepoMemory(next, keys.notesKey);
   }
 
   public async updateNote(keys: MemoryKeys, noteId: string, text: string): Promise<RepoMemory> {
     const next = await this.mutate((state) => memoryMutations.updateNote(state, keys.notesKey, noteId, text, Date.now()));
-    return getRepoMemory(next, keys);
+    return getRepoMemory(next, keys.notesKey);
   }
 
   public async removeNote(keys: MemoryKeys, noteId: string): Promise<RepoMemory> {
     const next = await this.mutate((state) => memoryMutations.removeNote(state, keys.notesKey, noteId));
-    return getRepoMemory(next, keys);
+    return getRepoMemory(next, keys.notesKey);
   }
 
   public async togglePin(keys: MemoryKeys, noteId: string): Promise<RepoMemory> {
     const next = await this.mutate((state) => memoryMutations.togglePin(state, keys.notesKey, noteId));
-    return getRepoMemory(next, keys);
+    return getRepoMemory(next, keys.notesKey);
   }
 
-  public async addCommand(keys: MemoryKeys, label: string, command: string): Promise<RepoMemory> {
-    const next = await this.mutate((state) => memoryMutations.addCommand(state, keys.checkoutKey, label, command, Date.now()));
-    return getRepoMemory(next, keys);
-  }
-
-  public async removeCommand(keys: MemoryKeys, commandId: string): Promise<RepoMemory> {
-    const next = await this.mutate((state) => memoryMutations.removeCommand(state, keys.checkoutKey, commandId));
-    return getRepoMemory(next, keys);
-  }
-
-  /** Exports the given repository's current memory only — never every repository on the machine unless the caller explicitly asks via `exportAllMemory`. */
+  /** Exports the given repository's notes only. */
   public exportMemory(keys: MemoryKeys, label: string): MemoryExport {
     return buildMemoryExport([{ label, memory: this.getMemory(keys) }], Date.now());
   }
@@ -201,20 +185,17 @@ export class MemoryStore {
     );
   }
 
-  /** Read-only, target-independent: is this a Repo Memory export file this version understands, and what repository entries does it contain? Used to decide whether the caller needs to show a picker (more than one entry) before importing. */
   public previewImportFile(raw: unknown): ImportFilePreview {
     return previewMemoryImportFile(raw);
   }
 
-  /** Read-only, target-aware: validates and summarizes importing ONE chosen repository entry into this target, without changing anything. */
   public previewImportEntry(keys: MemoryKeys, raw: unknown, entryIndex: number): ImportEntryPreview {
     return previewMemoryImportEntry(raw, entryIndex, this.getMemory(keys));
   }
 
-  /** Merges ONE chosen repository entry from the import file into ONE target repository (the currently open one) — never a multi-repo silent restore. Duplicate ids are skipped unless `options.overwriteDuplicates` is set. */
   public async importMemory(keys: MemoryKeys, raw: unknown, entryIndex: number, options: ImportOptions): Promise<RepoMemory> {
-    const next = await this.mutate((state) => applyMemoryImport(state, keys, raw, entryIndex, options));
-    return getRepoMemory(next, keys);
+    const next = await this.mutate((state) => applyMemoryImport(state, keys.notesKey, raw, entryIndex, options));
+    return getRepoMemory(next, keys.notesKey);
   }
 }
 

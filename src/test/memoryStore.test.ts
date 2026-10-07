@@ -109,13 +109,13 @@ test("a failed mutation (over-limit) does not permanently poison the queue — a
 test("many concurrent addNote calls (stress) all land — none lost to interleaved read/mutate/write", async () => {
   const { store } = newStore(2);
   const count = 25;
-  await Promise.all(Array.from({ length: count }, (_, i) => store.addCommand(KEYS, `cmd ${i}`, `echo ${i}`)));
-  assert.equal(store.getMemory(KEYS).commands.length, count);
+  await Promise.all(Array.from({ length: count }, (_, i) => store.addNote(KEYS, `note ${i}`, false)));
+  assert.equal(store.getMemory(KEYS).notes.length, count);
 });
 
 // ==================== reliability: writes fail cleanly, never silently ====================
 
-test("a globalState write failure on togglePin/removeNote/removeCommand rejects that call cleanly, rather than resolving with stale data", async () => {
+test("a globalState write failure on togglePin/updateNote/removeNote rejects that call cleanly, rather than resolving with stale data", async () => {
   let shouldFail = false;
   let store: unknown;
   const context: FakeContext = {
@@ -134,13 +134,12 @@ test("a globalState write failure on togglePin/removeNote/removeCommand rejects 
   const memStore = new MemoryStore(context as never);
   await memStore.addNote(KEYS, "seed note", false);
   const noteId = memStore.getMemory(KEYS).notes[0].id;
-  await memStore.addCommand(KEYS, "seed cmd", "echo hi");
-  const commandId = memStore.getMemory(KEYS).commands[0].id;
 
   shouldFail = true;
   await assert.rejects(memStore.togglePin(KEYS, noteId));
+  await assert.rejects(memStore.updateNote(KEYS, noteId, "changed"));
   await assert.rejects(memStore.removeNote(KEYS, noteId));
-  await assert.rejects(memStore.removeCommand(KEYS, commandId));
+  assert.equal(memStore.getMemory(KEYS).notes[0].text, "seed note", "a failed write leaves the stored note exactly as it was");
 });
 
 test("a globalState write failure does not poison the queue for a later call against a store that starts working again", async () => {
@@ -175,7 +174,7 @@ test("a globalState write failure does not poison the queue for a later call aga
  * cross-window change notification and no atomic compare-and-swap —
  * each window's `.update()` does a read-modify-write against ITS OWN
  * last-known snapshot, not a fresh read of whatever another window most
- * recently persisted. Two windows editing Repo Memory around the same
+ * recently persisted. Two windows editing notes around the same
  * moment can therefore still lose an update to each other, exactly like
  * two independent processes racing on a shared file with no locking.
  *
@@ -186,8 +185,8 @@ test("a globalState write failure does not poison the queue for a later call aga
  * in-memory `globalState` cache was populated before the other window's
  * write happened. This is the best feasible test without two real
  * Extension Host processes; it exists to keep the documented limitation
- * (see `MemoryStore`'s class doc comment and README.md's Repo Memory
- * section) honest and regression-tested, not to claim the limitation is
+ * (see `MemoryStore`'s class doc comment and README.md's notes section)
+ * honest and regression-tested, not to claim the limitation is
  * fixed.
  */
 test("documented limitation: two independent MemoryStore instances (modeling two VS Code windows) sharing one backing store can still lose an update to each other", async () => {
@@ -276,7 +275,7 @@ test("canonical path/casing behavior: notesKey is derived from gitCommonDir when
 
 // ==================== linked-worktree semantics (via shared notesKey) ====================
 
-test("linked-worktree semantics: two different checkouts that share the SAME gitCommonDir share notes, but keep separate saved commands", async () => {
+test("linked-worktree semantics: two different checkouts that share the SAME gitCommonDir share one note collection", async () => {
   const sharedCommonDir = await fs.mkdtemp(path.join(os.tmpdir(), "memstore-shared-common-"));
   const worktreeA = await fs.mkdtemp(path.join(os.tmpdir(), "memstore-wt-a-"));
   const worktreeB = await fs.mkdtemp(path.join(os.tmpdir(), "memstore-wt-b-"));
@@ -289,13 +288,8 @@ test("linked-worktree semantics: two different checkouts that share the SAME git
 
     await store.addNote(keysA, "shared repo note", false);
     assert.equal(store.getMemory(keysB).notes.length, 1, "a note added from worktree A must be visible from worktree B");
-
-    await store.addCommand(keysA, "A-only command", "echo a");
-    await store.addCommand(keysB, "B-only command", "echo b");
-    assert.equal(store.getMemory(keysA).commands.length, 1, "saved commands must stay per-checkout");
-    assert.equal(store.getMemory(keysB).commands.length, 1);
-    assert.equal(store.getMemory(keysA).commands[0].label, "A-only command");
-    assert.equal(store.getMemory(keysB).commands[0].label, "B-only command");
+    await store.addNote(keysB, "added from B", false);
+    assert.deepEqual(store.getMemory(keysA).notes.map((n) => n.text).sort(), ["added from B", "shared repo note"]);
   } finally {
     await fs.rm(sharedCommonDir, { recursive: true, force: true }).catch(() => undefined);
     await fs.rm(worktreeA, { recursive: true, force: true }).catch(() => undefined);
@@ -309,17 +303,13 @@ test("reconcileLegacyKeys migrates data stored under a raw (pre-canonicalization
   const { store } = newStore();
   const rawRoot = "/some/raw/repoRoot";
   await store.addNote({ notesKey: rawRoot, checkoutKey: rawRoot }, "legacy note", false);
-  await store.addCommand({ notesKey: rawRoot, checkoutKey: rawRoot }, "legacy cmd", "echo legacy");
 
   const canonicalKeys = { notesKey: "/canonical/notes", checkoutKey: "/canonical/checkout" };
   await store.reconcileLegacyKeys(rawRoot, canonicalKeys);
 
   const memory = store.getMemory(canonicalKeys);
-  assert.equal(memory.notes.length, 1);
-  assert.equal(memory.notes[0].text, "legacy note");
-  assert.equal(memory.commands.length, 1);
-  assert.equal(memory.commands[0].label, "legacy cmd");
-  assert.deepEqual(store.getMemory({ notesKey: rawRoot, checkoutKey: rawRoot }), { notes: [], commands: [] }, "the stale key must be cleared after reconciliation");
+  assert.deepEqual(memory.notes.map((n) => n.text), ["legacy note"]);
+  assert.deepEqual(store.getMemory({ notesKey: rawRoot, checkoutKey: rawRoot }), { notes: [] }, "the stale key must be cleared after reconciliation");
 });
 
 test("reconcileLegacyKeys never overwrites data already present under the canonical key — it merges", async () => {
@@ -394,4 +384,63 @@ test("MemoryStore.exportAllMemory includes every supplied repository under its o
     { label: "repo-2", keys: { notesKey: "r2", checkoutKey: "r2" } },
   ]);
   assert.deepEqual(exported.repositories.map((r) => r.label), ["repo-1", "repo-2"]);
+});
+
+// ==================== saved-command migration through the real store ====================
+
+function seededStore(raw: unknown): { store: MemoryStore; snapshot: () => unknown } {
+  let stored: unknown = raw;
+  const backend = {
+    get: <T>(_key: string): T | undefined => stored as T | undefined,
+    update: async (_key: string, value: unknown): Promise<void> => {
+      stored = value;
+    },
+  };
+  return { store: new MemoryStore(backend), snapshot: () => stored };
+}
+
+const V2_WITH_COMMANDS = {
+  version: 2,
+  notesByRepoKey: { "/repo/.git": [{ id: "n1", text: "repo note", pinned: true, createdAt: 1 }] },
+  commandsByCheckoutKey: {
+    "/repo": [{ id: "c1", label: "Dev server", command: "pnpm dev --port 5173", createdAt: 2 }],
+    "/repo-wt": [{ id: "c2", label: "Danger", command: "rm -rf / # never run me", createdAt: 3 }],
+  },
+};
+
+test("migrateStorage persists the v2 → v3 migration once; a second run is a no-op", async () => {
+  const { store, snapshot } = seededStore(JSON.parse(JSON.stringify(V2_WITH_COMMANDS)));
+  assert.equal(await store.migrateStorage(), true);
+  const persisted = snapshot() as { version: number; notesByRepoKey: Record<string, unknown[]> };
+  assert.equal(persisted.version, 3);
+  assert.equal("commandsByCheckoutKey" in persisted, false);
+  assert.equal(await store.migrateStorage(), false);
+  assert.deepEqual(snapshot(), persisted);
+});
+
+test("migrated commands from every linked worktree end up, once each, in the repository's shared notes — and are never executed", async () => {
+  const { store } = seededStore(JSON.parse(JSON.stringify(V2_WITH_COMMANDS)));
+  await store.migrateStorage();
+  const main = { notesKey: "/repo/.git", checkoutKey: "/repo" };
+  const linked = { notesKey: "/repo/.git", checkoutKey: "/repo-wt" };
+  await store.reconcileLegacyKeys("/repo", main);
+  await store.reconcileLegacyKeys("/repo-wt", linked);
+  // Reopening (a second activation) changes nothing.
+  await store.reconcileLegacyKeys("/repo", main);
+  await store.reconcileLegacyKeys("/repo-wt", linked);
+
+  const notes = store.getMemory(main).notes;
+  assert.deepEqual(notes.map((n) => n.id), ["n1", "legacy-cmd-c1", "legacy-cmd-c2"]);
+  assert.equal(store.getNoteText(main, "legacy-cmd-c1"), "Dev server\npnpm dev --port 5173");
+  assert.equal(store.getNoteText(main, "legacy-cmd-c2"), "Danger\nrm -rf / # never run me");
+  assert.deepEqual(store.searchNotes(main, "PORT").notes.map((n) => n.id), ["legacy-cmd-c1"]);
+  // The pinned note stays the one pinned note.
+  assert.deepEqual(notes.filter((n) => n.pinned).map((n) => n.id), ["n1"]);
+});
+
+test("MemoryStore has no way to execute anything: its public surface is data-only", () => {
+  const methods = Object.getOwnPropertyNames(MemoryStore.prototype).filter((name) => name !== "constructor");
+  for (const name of methods) {
+    assert.doesNotMatch(name, /run|exec|spawn|terminal|command/i, `unexpected executable-sounding method: ${name}`);
+  }
 });
