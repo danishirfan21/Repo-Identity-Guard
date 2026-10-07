@@ -165,7 +165,7 @@ export function resolveSshCommandOverrides(env: SshTransportEnvironment): string
  * trusted aliases (never a generic shared host). Returns the blocking
  * reason when it can't.
  */
-function routeReasons(policy: ShieldPolicy, protocol: string, host: string | undefined, sshCommandOverrides: string[]): ShieldReason[] {
+function routeReasons(policy: ShieldPolicy, protocol: string, host: string | undefined, sshUser: string | undefined, sshCommandOverrides: string[]): ShieldReason[] {
   const isGenericHost = !!host && GENERIC_REMOTE_HOSTS.has(normalize(host));
 
   if (protocol === "ssh" && sshCommandOverrides.length > 0) {
@@ -180,6 +180,18 @@ function routeReasons(policy: ShieldPolicy, protocol: string, host: string | und
   const trustedAliases = policy.trustedSshHostAliases.map(normalize);
   const isTrustedAlias = protocol === "ssh" && !!host && !isGenericHost && trustedAliases.includes(normalize(host));
   if (isTrustedAlias) {
+    // Option-injection guard: an SSH user or host beginning with "-" would
+    // be read by `ssh` as a command-line OPTION (e.g. "-oProxyCommand=..."),
+    // not a destination, when the account probe runs. Such a route is never
+    // handed to ssh at all. Mirrors the same guard in shield-evaluate.sh.
+    if ((sshUser ?? "").startsWith("-") || (host ?? "").startsWith("-")) {
+      return [
+        {
+          id: "push-route-unverified",
+          message: 'This push\'s SSH user or host begins with "-", which ssh would read as a command-line option, so the route is never probed.',
+        },
+      ];
+    }
     return [];
   }
 
@@ -237,7 +249,7 @@ export function evaluatePush(policy: ShieldPolicy, facts: PushEvalFacts, now: nu
     return decisionFromReasons("push", [], now);
   }
   const parsed = parseRemoteUrl(facts.remoteUrl);
-  const route = routeReasons(policy, parsed.protocol, parsed.host, facts.sshCommandOverrides);
+  const route = routeReasons(policy, parsed.protocol, parsed.host, parsed.sshUser, facts.sshCommandOverrides);
   if (route.length > 0) {
     return decisionFromReasons("push", route, now);
   }

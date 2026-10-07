@@ -1010,6 +1010,19 @@ $ROUTE_FIX"
     route_block push-route-unverified unknown_protocol "This push's protocol could not be determined, so the account that would authenticate it cannot be verified."
   fi
 
+  # ---- option-injection guard ----
+  # An SSH user or host beginning with "-" would be read by `ssh` as a
+  # command-line OPTION (e.g. "-oProxyCommand=..."), not as the
+  # destination, by the probe below. Git itself refuses to connect to such
+  # a URL, but this evaluator never relies on that: such a route is never
+  # handed to ssh. Mirrors routeReasons() in src/shield/evaluator.ts.
+  case "$SSH_USER" in
+    -*) route_block push-route-unverified malformed "This push's SSH user begins with \"-\", which ssh would read as a command-line option, so the route is never probed." ;;
+  esac
+  case "$HOST" in
+    -*) route_block push-route-unverified malformed "This push's SSH host begins with \"-\", which ssh would read as a command-line option, so the route is never probed." ;;
+  esac
+
   # ---- account: live verification over the exact route ----
   verify_github_account "$HOST" "$SSH_USER" "$EXPECTED_GH_LOGIN" "$URL_PORT"
 }

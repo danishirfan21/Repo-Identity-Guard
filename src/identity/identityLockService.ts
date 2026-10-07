@@ -129,7 +129,7 @@ export function deriveEnforcement(inspection: ShieldInspection, identities: Iden
     return {
       state: "needs_attention",
       reason:
-        "This repository still has a legacy Repo Identity Guard \"Shield\" installation, which this version no longer enforces (its hooks fail closed until it is migrated). Repair migrates it to an identity lock if an explicit binding can be proven, otherwise it is removed.",
+        "This repository still has a legacy Repo Identity Guard \"Shield\" installation, which keeps enforcing the old Shield policy until it is migrated. Repair migrates it to an identity lock if an explicit binding can be proven, otherwise it is removed; Unlock removes it.",
       commitEnforced: false,
       push: "none",
       repairAvailable: true,

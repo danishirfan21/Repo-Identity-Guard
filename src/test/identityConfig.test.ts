@@ -77,7 +77,7 @@ test("an invalid GitHub login is an ERROR — never silently dropped into a weak
 });
 
 test("trusted SSH aliases: invalid entries are errors; duplicates (case-insensitive) collapse", () => {
-  for (const alias of ["git@github.com", "has space", "a/b", "a\\b", "", "line\nbreak"]) {
+  for (const alias of ["git@github.com", "has space", "a/b", "a\\b", "", "line\nbreak", "-oProxyCommand=x", "-github-work"]) {
     assert.equal(validateIdentity({ ...VALID, trustedSshHostAliases: [alias] }).ok, false, JSON.stringify(alias));
   }
   assert.equal(validateIdentity({ ...VALID, trustedSshHostAliases: "github-work" }).ok, false);

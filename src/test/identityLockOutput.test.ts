@@ -13,7 +13,8 @@ import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
 import { ShieldReasonId } from "../shield/types";
 import { makeFakeSshBin } from "./testUtil/fakeSsh";
 import { runEvaluatorScript } from "./testUtil/evaluatorShell";
-import { AUTHENTICATED_AS, routeFakeRunner } from "./testUtil/routeFakeSsh";
+import { sshTargetArgs } from "../shield/sshEndpoint";
+import { AUTHENTICATED_AS, makeRouteFakeSsh, routeFakeRunner } from "./testUtil/routeFakeSsh";
 import { EVALUATOR_SOURCE, WORK_IDENTITY, WORK_IDENTITY_WITH_LOGIN, parseBlockPrelude, testPolicy } from "./testUtil/lockFixtures";
 
 /**
@@ -187,6 +188,35 @@ test("NO SECRETS: credentials embedded in a remote URL are never printed in a bl
     assert.notEqual(result.code, 0, url);
     assert.doesNotMatch(result.stderr, /SUPERSECRET/, `a credential leaked for ${url}:\n${result.stderr}`);
   }
+});
+
+test("OPTION INJECTION: an SSH user or host beginning with '-' is refused before ssh is ever invoked (shell and TypeScript agree)", async () => {
+  const repo = await makeRepo();
+  cleanupDirs.push(repo);
+  const policy = testPolicy({ ...WORK_IDENTITY_WITH_LOGIN, trustedSshHostAliases: ["github-work"] });
+  await writePolicy(repo, serializeShieldPolicy(policy));
+  const fakeSsh = await makeRouteFakeSsh();
+  cleanupDirs.push(fakeSsh);
+  const argvLog = path.join(fakeSsh, "argv.log");
+  for (const url of [
+    "ssh://-oProxyCommand=touch%20pwned@github-work/AcmeSoftware/acme.git",
+    "-oProxyCommand=x@github-work:AcmeSoftware/acme.git",
+  ]) {
+    const result = await runEvaluatorScript(repo, process.env, fakeSsh, EVALUATOR_SOURCE, ["push", "origin", url], { FAKE_SSH_ARGV_LOG: argvLog });
+    assert.notEqual(result.code, 0, url);
+    const prelude = parseBlockPrelude(result.stderr);
+    assert.equal(prelude.REASON_ID, "push-route-unverified", url);
+    assert.equal(prelude.DETAIL, "malformed", url);
+    const log: string[][] = [];
+    const ts = await checkPushAccount({ identity: WORK_IDENTITY_WITH_LOGIN, transport: {}, env: {}, pushRemoteUrl: url, runner: routeFakeRunner({}, log) });
+    assert.equal(ts.status, "unverifiable", url);
+    assert.equal(ts.reasonId, "push-route-unverified", url);
+    assert.deepEqual(log, [], `TypeScript probe ran ssh for ${url}`);
+  }
+  assert.equal(await fs.stat(argvLog).then(() => true).catch(() => false), false, "the shell evaluator must never have run ssh");
+  assert.throws(() => sshTargetArgs("github-work", { user: "-oProxyCommand=x" }));
+  assert.throws(() => sshTargetArgs("-oProxyCommand=x"));
+  assert.throws(() => sshTargetArgs("github-work", { port: "22 -oProxyCommand=x" }));
 });
 
 test("prelude values are single lines: a label with a newline cannot reach the policy, and one_line flattens anything that does", async () => {

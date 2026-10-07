@@ -17,8 +17,8 @@ const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 /** github.com username rules: alphanumerics and single hyphens, 1–39 chars, no leading/trailing hyphen. */
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
 
-/** An SSH host alias (or literal host, including a bracketed IPv6 literal) — no whitespace, `@`, `/` or `\`. */
-const SSH_ALIAS = /^[^\s@/\\]+$/;
+/** An SSH host alias (or literal host, including a bracketed IPv6 literal) — no whitespace, `@`, `/` or `\`, and never a leading `-` (ssh would parse it as an option). */
+const SSH_ALIAS = /^[^\s@/\\-][^\s@/\\]*$/;
 
 export type IdentityValidationResult = { ok: true; identity: Identity } | { ok: false; errors: string[] };
 

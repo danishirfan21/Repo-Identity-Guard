@@ -82,12 +82,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (repos.some((repo) => repo.id === id)) selectedId = id;
       refreshViews();
     },
-    assignIdentity: (identityId) => assignIdentity(identityId, "assign"),
-    changeIdentity: (identityId) => assignIdentity(identityId, "change"),
-    unlockRepository: () => unlockRepository(),
-    repairLock: () => repairLock(),
-    checkLock: () => checkLock(),
-    applyIdentityToGitConfig: () => applyIdentityToGitConfig(),
+    // Sidebar actions always act on the repository the sidebar shows as
+    // selected — never on whatever repository the active editor happens to
+    // be in (that is the Command Palette's rule, see `commandTarget`).
+    assignIdentity: (identityId) => assignIdentity(identityId, "assign", selectedEntry()),
+    changeIdentity: (identityId) => assignIdentity(identityId, "change", selectedEntry()),
+    unlockRepository: () => unlockRepository(selectedEntry()),
+    repairLock: () => repairLock(selectedEntry()),
+    checkLock: () => checkLock({ target: selectedEntry() }),
+    applyIdentityToGitConfig: () => applyIdentityToGitConfig(selectedEntry()),
     editIdentities: () => editIdentities(),
 
     addNote: (text) => noteMutation((keys) => memoryStore.addNote(keys, text)),
@@ -340,8 +343,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return picked?.identity;
   }
 
-  async function assignIdentity(identityId: string | undefined, mode: "assign" | "change"): Promise<void> {
-    const entry = commandTarget();
+  async function assignIdentity(identityId: string | undefined, mode: "assign" | "change", target: RepoEntry | undefined = commandTarget()): Promise<void> {
+    const entry = target;
     if (!entry) {
       await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
       return;
@@ -399,15 +402,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         `Git currently commits here as ${effective.email ?? "an unknown identity"}, so commits will be blocked until this repository uses ${identity.gitEmail}.`,
         "Use Assigned Identity in Git Config",
       );
-      if (choice) await applyIdentityToGitConfig();
+      if (choice) await applyIdentityToGitConfig(repos.find((repo) => repo.id === entry.id) ?? entry);
     }
     if (identity.expectedGitHubLogin && (identity.trustedSshHostAliases ?? []).length > 0) {
-      await checkLock({ quietWhenVerified: true });
+      await checkLock({ quietWhenVerified: true, target: repos.find((repo) => repo.id === entry.id) ?? entry });
     }
   }
 
-  async function unlockRepository(): Promise<void> {
-    const entry = commandTarget();
+  async function unlockRepository(target: RepoEntry | undefined = commandTarget()): Promise<void> {
+    const entry = target;
     if (!entry) {
       await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
       return;
@@ -429,8 +432,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await scan();
   }
 
-  async function repairLock(): Promise<void> {
-    const entry = commandTarget();
+  async function repairLock(target: RepoEntry | undefined = commandTarget()): Promise<void> {
+    const entry = target;
     if (!entry) {
       await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
       return;
@@ -453,8 +456,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * that makes a network connection: it verifies the push account over the
    * real SSH route, exactly as the pre-push hook would.
    */
-  async function checkLock(options: { quietWhenVerified?: boolean } = {}): Promise<void> {
-    const entry = commandTarget();
+  async function checkLock(options: { quietWhenVerified?: boolean; target?: RepoEntry } = {}): Promise<void> {
+    const entry = options.target ?? commandTarget();
     if (!entry) {
       await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
       return;
@@ -495,8 +498,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   }
 
-  async function applyIdentityToGitConfig(): Promise<void> {
-    const entry = commandTarget();
+  async function applyIdentityToGitConfig(target: RepoEntry | undefined = commandTarget()): Promise<void> {
+    const entry = target;
     const view = entry?.status?.assignmentView;
     if (!entry || !view) {
       await vscode.window.showInformationMessage("This repository has no assigned identity.");

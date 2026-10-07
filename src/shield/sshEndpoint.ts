@@ -47,6 +47,12 @@ export const defaultSshRunner: SshRunner = (args, options) =>
 export function sshTargetArgs(hostOrAlias: string, options: { port?: string; user?: string } = {}): string[] {
   const host = hostOrAlias.trim();
   const user = options.user?.trim();
+  // Defense in depth (callers already refuse such routes): a destination
+  // beginning with "-" would be parsed by ssh as an OPTION, and a port that
+  // is not purely numeric could smuggle one in after "-p".
+  if (host.startsWith("-") || (user ?? "").startsWith("-") || (options.port !== undefined && !/^[0-9]+$/.test(options.port))) {
+    throw new Error("Refusing to pass an SSH destination or port that could be parsed as an ssh option.");
+  }
   const target = user ? `${user}@${host}` : host;
   return options.port ? ["-p", options.port, target] : [target];
 }
@@ -69,8 +75,14 @@ export async function resolveSshEffectiveRoute(
   options: { port?: string; user?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; runner?: SshRunner } = {},
 ): Promise<SshEffectiveRoute | undefined> {
   if (!hostOrAlias.trim()) return undefined;
+  let target: string[];
+  try {
+    target = sshTargetArgs(hostOrAlias, options);
+  } catch {
+    return undefined; // could be parsed as an ssh option: never run, "unresolved" (fail closed)
+  }
   const runner = options.runner ?? defaultSshRunner;
-  const result = await runner(["-G", ...sshTargetArgs(hostOrAlias, options)], {
+  const result = await runner(["-G", ...target], {
     env: options.env ?? process.env,
     timeoutMs: options.timeoutMs ?? 5000,
   });

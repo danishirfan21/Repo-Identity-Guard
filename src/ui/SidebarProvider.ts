@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as vscode from "vscode";
 import { NoteMutationResult, SidebarActions, dispatchSidebarMessage } from "./sidebarMessages";
 import { PLACEHOLDER_VIEW_JS } from "../webview/client/placeholderView";
@@ -71,7 +72,7 @@ ${PLACEHOLDER_VIEW_JS}
   }
 }
 
+/** CSP script nonce — from a CSPRNG, never Math.random(). */
 function getNonce(): string {
-  const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  return Array.from({ length: 32 }, () => possible.charAt(Math.floor(Math.random() * possible.length))).join("");
+  return crypto.randomBytes(24).toString("base64").replace(/[^A-Za-z0-9]/g, "");
 }
