@@ -7,10 +7,12 @@
 # extensionPath the way src/extension.ts does.
 #
 # The one rule that matters most: `resources/**` must NEVER be excluded.
-# Shield installs a copy of resources/shield/shield-evaluate.sh into each
-# repository it guards, resolved from `context.extensionPath`. If that file
-# is missing from the package, "Enable Shield" fails at the point of use,
-# on a machine that has no way to get it back.
+# The identity lock installs a copy of resources/shield/shield-evaluate.sh
+# into each repository an identity is assigned to, resolved from
+# `context.extensionPath`. If that file is missing from the package,
+# "Assign Identity" fails at the point of use, on a machine that has no way
+# to get it back. (src/** below also keeps the legacy-migration test
+# fixtures, which are real 0.2.0 hooks, out of the package.)
 
 # TypeScript sources — only the compiled output ships.
 .vscode/**

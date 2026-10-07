@@ -1,6 +1,24 @@
 # Shield Mode: threat model and architecture
 
-## CURRENT STATUS (read this first)
+> **HISTORICAL DOCUMENT (superseded in 0.3.0).** "Shield Mode" no longer
+> exists as a user-facing feature. Its hook engine now enforces the
+> explicit per-repository **identity lock** described in
+> [IDENTITY_LOCK.md](IDENTITY_LOCK.md), which is the authoritative
+> description of current behavior. Removed since this document was written:
+> the SAFE / NOT SAFE status model, owner/org profile matching, protected
+> branches, expected branch patterns, detached-HEAD and repository-state
+> checks, push-destination approval, `strictPushSetup`, Enable/Disable
+> Shield and the Shield screen. Still current, and still described
+> accurately here: the hook shims, fail-closed behavior, foreign-hook
+> chaining, transactional install and rollback, the installation record,
+> `core.hooksPath` and worktree handling, integrity/version detection, the
+> SSH route and GitHub account verification, and the research in "Phase 9:
+> Git hook mechanism research". The threat boundary is unchanged:
+> `--no-verify`, a deliberate `core.hooksPath` override, and arbitrary local
+> shell access all bypass enforcement. Everything below is kept as the
+> engineering record of how the engine was built and hardened.
+
+## CURRENT STATUS AT THE TIME (0.2.x — superseded, see above)
 
 **Shield Mode is implemented and enforcing.** `Repo Identity Guard: Enable
 Shield` installs real `pre-commit`, `pre-merge-commit`, and `pre-push`

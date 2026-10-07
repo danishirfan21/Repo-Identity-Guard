@@ -1,6 +1,95 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — Unreleased: identity lock and notes only
+
+Repo Identity Guard is reduced to two jobs: **explicit per-repository
+identity locking** and **private per-repository notes**. See the README
+and [docs/IDENTITY_LOCK.md](docs/IDENTITY_LOCK.md).
+
+### Changed
+
+- **Assigning an identity to a repository is now the only way to enforce
+  anything, and enforcement is the only effect of assigning.** The hook
+  engine formerly exposed as Shield Mode enforces the assigned identity:
+  commit author/committer always, and the pushing GitHub account when the
+  identity has `expectedGitHubLogin` (SSH route through a trusted alias,
+  `ssh -G` + `ssh -T` verification — unchanged in rigor).
+- **Unassigned repositories are never touched**: no hooks, no files, no
+  blocked commits or pushes.
+- **No automatic matching.** Identities are never matched to repositories
+  by remote owner, organization, `exactRepos`, upstream remotes or
+  anything else.
+- Assign / change identity is all-or-nothing (preflight + rollback);
+  unlock removes hooks before the record and never reports "unlocked"
+  while a lock hook remains.
+- Block messages start with a machine-readable prelude
+  (`REPO_IDENTITY_GUARD_BLOCK`, `ACTION`, `REASON`, `REASON_ID`,
+  `IDENTITY`, `EXPECTED_*` / `FOUND_*`, push `DETAIL` / `REMOTE` /
+  `ROUTE_HOST`); a narrow reason catalog is shared by the shell evaluator
+  and TypeScript.
+- Policy schema v3 (identity snapshot, `lockId`, `assignedAt`, derived
+  `enforcedActions`); hook/evaluator artifacts v6.
+- Settings: `repoIdentityGuard.identities` (user scope only) replaces
+  `repoIdentityGuard.profiles`.
+- Workspace Trust is required only for assign / change / repair / unlock
+  (and legacy migration); notes work fully in untrusted workspaces.
+- Passive refreshes never run `ssh`; the push account is checked live
+  only on a real push, right after assigning, and by **Check Identity
+  Lock**.
+- The sidebar is a minimal placeholder pending a UI redesign.
+
+### Removed
+
+- The SAFE / NOT SAFE / NOT CHECKED model, its six capabilities, Review
+  Details, and the multi-root workspace aggregate.
+- Branch policy (`protectedBranches`, `expectedBranchPatterns`, detached
+  HEAD), repository-state checks (dirty tree, merge/rebase in progress,
+  conflicts), push-destination approval, and `strictPushSetup`.
+- Copy Context for AI, Copy Workspace Safety Summary, and
+  `includeMemoryInAiContext`.
+- Saved commands and the command runner (nothing is ever executed).
+- `requireLocalIdentity`, onboarding, Fix Commit Identity's profile-based
+  flow, Add Profile for Current Repo, and the Shield commands/screen.
+- Commands removed: Rescan, Show Status, Fix Commit Identity, Add Profile
+  for Current Repo, Copy Context for AI, Copy Workspace Safety Summary,
+  Open Settings, Enable/Disable/Repair Shield, Check Shield Health.
+
+### Migration
+
+- **Profiles → identities** (once, when no identities exist yet, user
+  settings only): `id`, `label`, `gitName`, `gitEmail`,
+  `expectedGitHubLogin`, `trustedSshHostAliases` are kept;
+  `expectedRemoteOwners`, `exactRepos`, `expectedBranchPatterns` and
+  `strictPushSetup` are dropped. Invalid profiles are skipped and
+  reported. Behavior change: an identity's `expectedGitHubLogin` is always
+  enforced for pushes in repositories locked to it (Shield previously
+  enforced it only under certain profile settings).
+- **Saved commands → notes**, losslessly and idempotently: note id
+  `legacy-cmd-<command id>`, text `<label>\n<command>`, original
+  `createdAt`, unpinned; commands from every linked worktree end up in the
+  repository's notes. Export schema v2 is notes-only; v1 exports (with
+  commands) still import, converted the same way.
+- **Legacy Shield installations** are migrated on the first scan in a
+  trusted workspace: locked only when the repository was explicitly bound
+  to exactly one profile via a literal `exactRepos` entry and Shield was
+  enabled for that profile (and `origin` still matches); otherwise the
+  Shield hooks are removed, chained user hooks restored, and the
+  repository is unassigned. Until then, the 0.2.x hooks keep enforcing the
+  0.2.x policy.
+- Obsolete settings (`repoIdentityGuard.profiles`, `protectedBranches`,
+  `requireLocalIdentity`, `includeMemoryInAiContext`) are ignored and can
+  be deleted.
+
+### Security
+
+- An SSH user or host beginning with `-` in a push URL is refused before
+  `ssh` is invoked (it would be parsed as an option); identity aliases may
+  not begin with `-`.
+- Sidebar actions act on the sidebar's selected repository, never
+  implicitly on the active editor's repository.
+- The webview CSP nonce comes from a CSPRNG.
+
+## Earlier unreleased work (pre-0.3.0, superseded by the above)
 
 ### Fixed — Repo Memory release-blocker review: no more silent truncation, and no more lost drafts
 

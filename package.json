@@ -2,7 +2,7 @@
   "name": "repo-identity-guard",
   "displayName": "Repo Identity Guard",
   "description": "Lock a Git repository to an explicitly chosen Git/GitHub identity, and keep private notes per repository.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "local",
   "icon": "resources/repo-id-marketplace.png",
   "license": "MIT",
