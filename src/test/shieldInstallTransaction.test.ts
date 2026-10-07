@@ -10,7 +10,7 @@ import { SHIELD_ARTIFACT_MARKER } from "../shield/artifacts";
 import { ShieldManager } from "../shield/manager";
 import { shieldEvaluatorScriptFilePath, shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
 import { shieldInstallRecordFilePath } from "../shield/installRecord";
-import { Profile, RepoFacts } from "../types";
+import { WORK_IDENTITY } from "./testUtil/lockFixtures";
 
 /**
  * PART 1 + PART 2 — Shield's install transaction under fault injection.
@@ -56,14 +56,7 @@ import { Profile, RepoFacts } from "../types";
 const execFileAsync = promisify(execFile);
 const EVALUATOR_SOURCE = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
 
-const workProfile: Profile = {
-  id: "work",
-  label: "Work",
-  gitName: "Danish Irfan",
-  gitEmail: "work@example.com",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  strictPushSetup: false,
-};
+const workProfile = WORK_IDENTITY;
 
 interface Repo {
   dir: string;
@@ -95,24 +88,8 @@ async function makeRepo(): Promise<Repo> {
   return repo;
 }
 
-function factsFor(repo: Repo): RepoFacts {
-  return {
-    isGitRepo: true,
-    repoRoot: repo.dir,
-    currentBranch: "main",
-    remoteHost: "github.com",
-    remoteOwner: "AcmeSoftware",
-    remoteRepo: "thing",
-    pushRemoteHost: "github.com",
-    pushRemoteOwner: "AcmeSoftware",
-    pushRemoteRepo: "thing",
-    effectiveGitName: "Danish Irfan",
-    effectiveGitEmail: "work@example.com",
-  };
-}
-
-function enableInput(repo: Repo, chainForeignHooks = false) {
-  return { facts: factsFor(repo), profiles: [workProfile], protectedBranches: ["main"], chainForeignHooks };
+function enableInput(_repo: Repo, chainForeignHooks = false) {
+  return { identity: workProfile, lockId: "test-lock", assignedAt: 1, chainForeignHooks };
 }
 
 /** Makes `filePath` structurally un-writable by a temp-file-plus-rename write, for any user including root. */
@@ -223,7 +200,7 @@ test("PART 1 — FIRST ENABLE with an unwritable install record installs NOTHING
     assert.equal(result.ok, false);
     assert.notEqual(result.inspection.state, "active");
     assert.match(result.inspection.reasons[0], /could not durably record which hooks directory/);
-    assert.match(result.inspection.reasons[0], /Shield was NOT enabled/);
+    assert.match(result.inspection.reasons[0], /The identity lock was NOT installed/);
     assert.match(result.inspection.reasons[0], /Nothing was installed/);
 
     // No hook installed at all.
@@ -294,7 +271,7 @@ test("PART 1 — REPAIR with an unwritable install record aborts without destroy
     );
     assert.equal(repaired.ok, false);
     assert.equal(repaired.inspection.state, "degraded");
-    assert.match(repaired.inspection.reasons[0], /repair was ABORTED before touching anything/);
+    assert.match(repaired.inspection.reasons[0], /this operation was ABORTED before touching anything/);
     assert.match(repaired.inspection.reasons[0], /unchanged and still enforcing/);
 
     // (b) existing enforcement is byte-for-byte intact.
@@ -337,7 +314,7 @@ test("PART 1 — a hooksPath MIGRATION with an unwritable record never installs 
     );
     assert.equal(repaired.ok, false);
     assert.notEqual(repaired.inspection.state, "active");
-    assert.match(repaired.inspection.reasons[0], /repair was ABORTED before touching anything/);
+    assert.match(repaired.inspection.reasons[0], /this operation was ABORTED before touching anything/);
 
     // Nothing installed into the unrecordable new location...
     assert.deepEqual(await shieldHooksIn(newHooksDir), []);
@@ -440,7 +417,7 @@ test("PART 2 — policy write failure rolls back completely: no hook, no evaluat
     const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, enableInput(repo));
     assert.equal(result.ok, false);
     assert.notEqual(result.inspection.state, "active");
-    assert.match(result.inspection.reasons[0], /could not finish installing its artifacts/);
+    assert.match(result.inspection.reasons[0], /could not finish installing/);
 
     assert.deepEqual(await shieldHooksIn(hooksDir), []);
     assert.equal(await fs.readFile(shieldEvaluatorScriptFilePath(commonDir)).catch(() => null), null);
@@ -511,7 +488,7 @@ test("PART 2 — a hook write failure rolls back every earlier write in reverse 
 
     assert.equal(result.ok, false);
     assert.notEqual(result.inspection.state, "active");
-    assert.match(result.inspection.reasons[0], /could not finish installing its artifacts/);
+    assert.match(result.inspection.reasons[0], /could not finish installing/);
 
     // Full rollback: no hook survived, and the evaluator/policy went with them.
     assert.deepEqual(await shieldHooksIn(hooksDir), []);

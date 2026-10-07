@@ -1,16 +1,14 @@
 import { promises as fs } from "node:fs";
 import * as crypto from "node:crypto";
 import * as path from "node:path";
-import { canonicalRepoKey, resolveProfiles } from "../core/profileResolver";
+import type { Identity } from "../identity/types";
 import {
   getCoreHooksPathConfig,
   getGitCommonDir,
-  getGitConfigValue,
   getGitDir,
   getGitVersionRaw,
   getHooksDir,
 } from "../services/gitService";
-import { Profile, RepoFacts } from "../types";
 import {
   SHIELD_ARTIFACT_MARKER,
   SHIELD_ARTIFACT_VERSION,
@@ -18,10 +16,8 @@ import {
   buildPreCommitHookScript,
   buildPrePushHookScript,
   extractShieldArtifactVersion,
-  isShieldOwnedArtifact,
 } from "./artifacts";
-import { SshTransportEnvironment, resolveSshCommandOverrides } from "./evaluator";
-import { SHIELD_MIN_GIT_VERSION_DISPLAY, evaluateGitVersionSupport } from "./gitVersion";
+import { evaluateGitVersionSupport } from "./gitVersion";
 import {
   normalizeHookDirs,
   readShieldInstallRecord,
@@ -29,32 +25,17 @@ import {
   shieldInstallRecordFilePath,
   writeShieldInstallRecord,
 } from "./installRecord";
-import { ShieldPolicy, buildShieldPolicy, parseShieldPolicy, serializeShieldPolicy } from "./policy";
-import { CanonicalSshEndpoint, resolveCanonicalSshEndpoint } from "./sshEndpoint";
+import { LegacyPolicyInfo, ShieldPolicy, buildShieldPolicy, parseShieldPolicy, readLegacyPolicyInfo, serializeShieldPolicy } from "./policy";
 import { shieldEvaluatorScriptFilePath, shieldPolicyFilePath, shieldStorageDir } from "./storage";
 import { ShieldAction, ShieldLifecycleState } from "./types";
 
 /**
- * The real `ssh -G` resolution `canonicalizeDestination` uses by default —
- * factored out purely so tests can substitute a deterministic in-process
- * fake via `ShieldEnableInput.sshResolver`/`ShieldInspectOptions.sshResolver`
- * instead of shadowing a fake `ssh` binary onto PATH, which real Windows
- * shells and Node's own process spawning do not resolve identically (see
- * docs/SHIELD_MODE.md's Windows evaluator-testing section). Production
- * code always takes this default; nothing user-facing can override it.
- */
-export type SshResolver = (
-  host: string,
-  options: { env: NodeJS.ProcessEnv; port?: string; user?: string },
-) => Promise<CanonicalSshEndpoint | undefined>;
-
-const defaultSshResolver: SshResolver = (host, options) =>
-  resolveCanonicalSshEndpoint(host, { env: options.env, port: options.port, user: options.user });
-
-/**
- * ShieldManager owns Shield's on-disk lifecycle: installing/removing/
- * repairing the pre-commit, pre-merge-commit and pre-push hooks and the
- * policy + evaluator copy they read, and reporting their current health. It does **not**
+ * ShieldManager owns the identity lock's on-disk enforcement lifecycle
+ * (the engine was historically a user-facing feature called "Shield Mode";
+ * it is now an internal detail driven by `IdentityLockService`):
+ * installing/removing/repairing the pre-commit, pre-merge-commit and
+ * pre-push hooks and the lock policy + evaluator copy they read, and
+ * reporting their current health. It does **not**
  * evaluate Shield decisions itself (that's `src/shield/evaluator.ts` and
  * the shipped `resources/shield/shield-evaluate.sh`, run standalone at
  * hook time) and it does **not** depend on `vscode` — every method here is
@@ -229,24 +210,26 @@ export interface ShieldInspection {
   policyPath?: string;
   policyPresent: boolean;
   policyValid: boolean;
-  policyProfileLabel?: string;
+  /** The assigned identity's label as recorded in a valid policy. */
+  policyIdentityLabel?: string;
   /**
-   * Display-only facts read straight off the valid, parsed policy —
-   * `undefined` whenever `policyValid` is `false` (there is nothing
-   * trustworthy to show). Added for the Shield UI's "Active" screen
-   * (approved repository/destination, trusted route, expected account),
-   * which needs data `inspect()` already parses internally but never
-   * returned. Never a private key, password, or token — only the same
-   * non-secret facts `ShieldPolicy` itself carries.
+   * Non-secret facts read straight off the valid, parsed lock policy —
+   * `undefined` whenever `policyValid` is `false`. This IS the assignment
+   * record (see `src/identity/assignment.ts`).
    */
   policySnapshot?: {
-    approvedRepositoryKey?: string;
-    approvedPushDestination?: { host?: string; owner?: string; repo?: string; canonicalHost?: string; canonicalPort?: string };
-    trustedSshHostAliases: string[];
+    lockId: string;
+    assignedAt: number;
+    identityId: string;
+    identityLabel: string;
+    expectedGitName?: string;
+    expectedGitEmail: string;
     expectedGitHubLogin?: string;
-    strictPushSetup: boolean;
-    enabledActions: string[];
+    trustedSshHostAliases: string[];
+    enforcedActions: ShieldAction[];
   };
+  /** Set when the policy file is a legacy (v1/v2) "Shield Mode" policy — never enforced by this build, only migrated. */
+  legacyPolicy?: LegacyPolicyInfo;
   evaluatorPath?: string;
   evaluatorPresent: boolean;
   evaluatorOwned: boolean;
@@ -255,10 +238,18 @@ export interface ShieldInspection {
   evaluatorModified: boolean;
   /** True when `core.hooksPath` (any scope) is set to something other than Git's built-in default — informational context for why a governed hook might be missing from the resolved `hooksDir`, never itself a reason to block anything. */
   hooksPathCustomized: boolean;
-  /** True when the matched profile's live definition (by id, from `ShieldInspectOptions.currentProfiles`) differs from what's baked into the persisted policy — e.g. `expectedGitHubLogin`, `trustedSshHostAliases`, or `strictPushSetup` edited in Settings without repairing Shield. Always `false` when `currentProfiles` wasn't supplied. */
-  policyProfileDrift: boolean;
-  /** True when `ShieldInspectOptions.currentPushDestination` differs (by owner/repo, same comparison the evaluator itself uses) from the policy's `approvedPushDestination` — i.e. the repository's actual remote has moved since Shield was last enabled/repaired. Always `false` when `currentPushDestination` wasn't supplied. */
-  pushDestinationDrift: boolean;
+  /**
+   * True when the assigned identity's live definition (looked up by the
+   * policy's `identityId` in `ShieldInspectOptions.currentIdentities`) no
+   * longer matches what the installed policy enforces — e.g. its email or
+   * GitHub login was edited in settings, or it was deleted. Enforcement
+   * keeps using the recorded snapshot until the lock is repaired; this is
+   * never silently "fine". Always `false` when `currentIdentities` wasn't
+   * supplied.
+   */
+  identityDrift: boolean;
+  /** Which fields drifted (or `"identity removed"`), in a stable order. Empty when `identityDrift` is false. */
+  identityDriftDetails: string[];
   /**
    * Hook files still carrying Shield's ownership marker in a hooks
    * directory Shield previously installed into but which is no longer the
@@ -295,39 +286,49 @@ export interface ShieldInspection {
 export interface ShieldOperationResult {
   ok: boolean;
   inspection: ShieldInspection;
+  /**
+   * Set by `enable()`/`repair()` with `requireComplete` when the operation
+   * could not produce a fully active installation and therefore restored
+   * the previous on-disk state (a first install is removed entirely; a
+   * re-install puts back the exact prior bytes) — so a failed operation
+   * never leaves a half-installed lock behind.
+   */
+  rolledBack?: boolean;
+  /**
+   * Non-fatal problems from an otherwise-successful operation (e.g. a stale
+   * hook at a previous `core.hooksPath` location that could not be cleaned
+   * up). Present only when there is something to say.
+   */
+  warnings?: string[];
 }
 
 export interface ShieldEnableInput {
-  facts: RepoFacts;
-  profiles: Profile[];
-  protectedBranches: string[];
+  /** The identity to enforce. Must already be validated by the caller (`sanitizeIdentity`). */
+  identity: Identity;
+  /** Random id of this assignment — see `ShieldPolicy.lockId`. */
+  lockId: string;
+  /** When the assignment was made — see `ShieldPolicy.assignedAt`. */
+  assignedAt: number;
   now?: number;
   /**
-   * Explicit, never-default opt-in (Phase 6) to chain a foreign hook
-   * already occupying a slot Shield wants, instead of leaving that slot
-   * alone. See the class-level "Hook coexistence" doc comment for exactly
-   * what this does and doesn't do. Defaults to `false` — omitting this
-   * reproduces Phase 3/4/5 behavior exactly: a foreign hook is never
-   * touched.
+   * Explicit, never-default opt-in to chain a foreign hook already
+   * occupying a slot the lock needs, instead of refusing. See the
+   * class-level "Hook coexistence" doc comment. Defaults to `false`.
    */
   chainForeignHooks?: boolean;
   /**
-   * Process environment to use when resolving the approved push
-   * destination's canonical SSH endpoint (see
-   * `ShieldInspectOptions.env` — same purpose, same default of
-   * `process.env`). Exists for tests to inject a fake `ssh` via a
-   * PATH-shadowing directory; production callers should simply omit this.
+   * All-or-nothing mode, used by every identity-lock operation:
+   *  - preflight: if any hook slot is occupied by something that would be
+   *    left untouched (a foreign hook without `chainForeignHooks`, a
+   *    symlink, a non-executable file, a stale sidecar), refuse BEFORE
+   *    writing anything;
+   *  - verify: if the fresh post-install inspection is not `active`,
+   *    restore the previous on-disk state and report `rolledBack`.
+   * Without it, `enable()` keeps the partial-install behavior (writes what
+   * it can and reports `degraded`) that the engine's own hardening tests
+   * exercise.
    */
-  env?: NodeJS.ProcessEnv;
-  /**
-   * Test-only dependency injection for the canonical SSH endpoint
-   * resolution `enable()`/`repair()` perform — defaults to a real `ssh -G`
-   * call. Deterministic across all three platforms (unlike PATH-shadowing
-   * a fake `ssh` binary, which Windows' process spawning does not resolve
-   * the same way a POSIX shell does) — see manager.ts's `SshResolver` doc
-   * comment. Never set by production code.
-   */
-  sshResolver?: SshResolver;
+  requireComplete?: boolean;
 }
 
 export interface ShieldInspectOptions {
@@ -335,65 +336,17 @@ export interface ShieldInspectOptions {
    * Absolute path to this extension's own bundled
    * `resources/shield/shield-evaluate.sh`. When supplied, `inspect()`
    * compares it byte-for-byte against the installed evaluator copy to
-   * populate `evaluatorModified` — a modified-but-still-"shield"-owned
-   * evaluator (marker intact, body hand-edited) would otherwise be
-   * indistinguishable from a genuine one. Omit to skip this check
-   * (`evaluatorModified` is then always `false`, not "unknown").
+   * populate `evaluatorModified` — a modified-but-still-owned evaluator
+   * (marker intact, body hand-edited) would otherwise be indistinguishable
+   * from a genuine one. Omit to skip this check.
    */
   evaluatorScriptSource?: string;
   /**
-   * The caller's current, live profile list (e.g. fresh from Settings) —
-   * when supplied, `inspect()` looks up the profile matching the policy's
-   * `matchedProfileId` and compares its identity/policy-relevant fields
-   * against what's persisted, populating `policyProfileDrift`. Omit to
-   * skip this check.
+   * The caller's current identity list (fresh from settings). When
+   * supplied, the identity the policy was built from is looked up by id
+   * and compared field by field, populating `identityDrift`. Omit to skip.
    */
-  currentProfiles?: Profile[];
-  /**
-   * The repository's current, freshly-resolved push destination (e.g.
-   * from a fresh `RepoFacts` scan) — when supplied, compared against the
-   * policy's `approvedPushDestination` to populate `pushDestinationDrift`.
-   * Omit to skip this check. `protocol` (ssh/https/unknown) is needed only
-   * when `resolveCanonicalDestinationDrift` is also set.
-   */
-  currentPushDestination?: { host?: string; owner?: string; repo?: string; protocol?: string; port?: string; sshUser?: string };
-  /**
-   * Opt-in, expensive drift check: re-resolves the CURRENT push
-   * destination's REAL canonical SSH endpoint right now (a real `ssh -G`
-   * call, same as `enable()`/`repair()` use to establish the APPROVED
-   * endpoint) and compares it against the policy's persisted
-   * `approvedPushDestination.canonicalHost`/`canonicalPort` — the only way
-   * to detect an SSH alias silently repointed in `~/.ssh/config` since
-   * Shield was last enabled or repaired (its NAME never changes, so a
-   * literal host-string comparison cannot see it).
-   *
-   * Deliberately never implied by merely supplying `currentPushDestination`:
-   * `inspect()` runs on every routine background scan (file-watcher
-   * events, workspace-folder switches, ...), and spawning a real `ssh`
-   * process on every one of those would be a real, user-visible
-   * performance cost for an automatic check nobody asked for in the
-   * moment. Set this only for an explicit, on-demand check (the sidebar's
-   * "Check Shield Health" / `checkShieldHealth()`) — routine scans get a
-   * cheaper literal host/owner/repo comparison instead, which still
-   * catches a genuinely different remote, just not a same-named alias
-   * quietly repointed underneath it. Either way, what actually enforces
-   * at push time is `evaluator.ts`/`shield-evaluate.sh`, which ALWAYS
-   * canonicalizes the current route fresh, on every real push,
-   * unconditionally — this flag only affects how promptly the sidebar's
-   * diagnostic health/drift indicator notices, never what a push allows.
-   */
-  resolveCanonicalDestinationDrift?: boolean;
-  /**
-   * Process environment to use for the canonical SSH endpoint resolution
-   * above (both the `GIT_SSH`/`GIT_SSH_COMMAND`/`GIT_SSH_VARIANT`
-   * override check and the `ssh -G` spawn itself) — defaults to
-   * `process.env`. Exists so a test can inject a fake `ssh` via a
-   * PATH-shadowing directory without mutating the real test process's
-   * global environment; production callers should simply omit this.
-   */
-  env?: NodeJS.ProcessEnv;
-  /** Test-only dependency injection — see `ShieldEnableInput.sshResolver`. Never set by production code. */
-  sshResolver?: SshResolver;
+  currentIdentities?: Identity[];
 }
 
 interface HookSpec {
@@ -531,9 +484,9 @@ function foreignHookRefusalReason(fileName: ShieldHookFileName, hookPath: string
     kind === "symlink"
       ? "it is a symbolic link, and moving it aside would replace the link with a plain copy — silently breaking the arrangement it is part of"
       : kind === "nonexecutable-regular"
-        ? "it is not executable, so Git never runs it — and chaining it would make Shield's own hook try to execute it on every operation, failing with a bare \"Permission denied\""
-        : "it is not a regular file (e.g. a directory, socket, or device), which Shield has no faithful way to preserve or run";
-  return `A ${fileName} hook already exists at ${hookPath} that Repo Identity Guard did not create, and Shield refused to chain it because ${detail}. Shield left it completely untouched and did not install its own ${fileName} hook here. Resolve it yourself (for a symlink: replace it with a regular executable script, or point core.hooksPath at a directory Shield can manage; for a non-executable file: make it executable or remove it), then run "Repair Shield".`;
+        ? "it is not executable, so Git never runs it — and chaining it would make the identity lock's own hook try to execute it on every operation, failing with a bare \"Permission denied\""
+        : "it is not a regular file (e.g. a directory, socket, or device), which Repo Identity Guard has no faithful way to preserve or run";
+  return `A ${fileName} hook already exists at ${hookPath} that Repo Identity Guard did not create, and Repo Identity Guard refused to chain it because ${detail}. It was left completely untouched and the identity lock's own ${fileName} hook was not installed here. Resolve it yourself (for a symlink: replace it with a regular executable script, or point core.hooksPath at a directory Repo Identity Guard can manage; for a non-executable file: make it executable or remove it), then try again.`;
 }
 
 /**
@@ -569,30 +522,25 @@ async function deleteIfExists(filePath: string): Promise<void> {
   }
 }
 
-/** Fields of a matched profile that a persisted policy bakes in — compared for drift by `policyProfileDrift`. Order given here is the order drift is reported in. */
-const PROFILE_DRIFT_FIELDS = ["gitName", "gitEmail", "strictPushSetup", "expectedGitHubLogin"] as const;
-
 function normalizeAliasList(aliases: string[] | undefined): string {
   return [...(aliases ?? [])].map((a) => a.trim().toLowerCase()).sort().join(",");
 }
 
-function normalizeOwnerRepo(value: string | undefined): string {
-  return (value ?? "").trim().toLowerCase();
-}
-
 /**
- * Same idea as `normalizeOwnerRepo`, but for HOST strings specifically:
- * also strips one matching pair of enclosing `[...]` brackets, since
- * `[2001:db8::1]` and `2001:db8::1` name the same IPv6 address and
- * different `ssh` implementations/versions are not guaranteed to report
- * `ssh -G`'s `hostname` line bracketed one way or the other. Mirrors
- * `normalizeHost()` in evaluator.ts and `normalize_host()` in
- * shield-evaluate.sh exactly, so health/drift agrees with hook
- * enforcement on what counts as "the same host."
+ * Field-by-field comparison of the identity a policy was built from with
+ * that identity's live definition. Order is the order drift is reported
+ * in. Exact comparison on purpose: any edit to an enforced value means the
+ * installed lock no longer enforces what settings say.
  */
-function normalizeHost(value: string | undefined): string {
-  const trimmed = (value ?? "").trim().toLowerCase();
-  return trimmed.length > 2 && trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
+export function identityDriftFields(policy: ShieldPolicy, live: Identity | undefined): string[] {
+  if (!live) return ["identity removed"];
+  const fields: string[] = [];
+  if (live.label !== policy.identityLabel) fields.push("label");
+  if ((live.gitName ?? "") !== (policy.expectedGitName ?? "")) fields.push("gitName");
+  if (live.gitEmail !== policy.expectedGitEmail) fields.push("gitEmail");
+  if ((live.expectedGitHubLogin ?? "") !== (policy.expectedGitHubLogin ?? "")) fields.push("expectedGitHubLogin");
+  if (normalizeAliasList(live.trustedSshHostAliases) !== normalizeAliasList(policy.trustedSshHostAliases)) fields.push("trustedSshHostAliases");
+  return fields;
 }
 
 /** Byte-level ownership check — see {@link readBytesIfExists} for why nothing here decodes text it did not write. */
@@ -668,8 +616,8 @@ export class ShieldManager {
         evaluatorOwned: false,
         evaluatorModified: false,
         hooksPathCustomized: false,
-        policyProfileDrift: false,
-        pushDestinationDrift: false,
+        identityDrift: false,
+        identityDriftDetails: [],
         orphanedHookPaths: [],
         gitVersionSupported: false,
         // The Git version was never even read here — resolveGitContext
@@ -772,111 +720,33 @@ export class ShieldManager {
       hooks.some((h) => h.ownership === "shield") ||
       orphanedHookPaths.length > 0;
 
-    const foreignHooks = hooks.filter((h) => h.ownership === "foreign");
-    // Only a hook whose action this policy actually governs matters for
-    // "is Shield fully active" — a policy that (for whatever reason) only
-    // enables "commit" must not report degraded over a missing pre-push
-    // hook it never intended to install.
-    const enabledActions = policyResult?.ok ? policyResult.policy.enabledActions : undefined;
-    const missingGovernedHooks = hooks.filter(
-      (h) => h.ownership === "absent" && (enabledActions ? enabledActions.includes(h.action) : true),
-    );
+    // Only a hook whose action this policy actually enforces matters for
+    // "is the lock fully active" — a commit-only lock (no expected GitHub
+    // login) must not report degraded over a missing or foreign pre-push
+    // hook it does not need.
+    const enforcedActions = policyResult?.ok ? policyResult.policy.enforcedActions : undefined;
+    const governs = (h: ShieldHookInspection) => (enforcedActions ? enforcedActions.includes(h.action) : true);
+    const missingGovernedHooks = hooks.filter((h) => h.ownership === "absent" && governs(h));
+    const foreignHooks = hooks.filter((h) => h.ownership === "foreign" && governs(h));
     const outdatedOrIncompatibleHooks = hooks.filter(
       (h) => h.ownership === "shield" && (h.version === undefined || h.version !== SHIELD_ARTIFACT_VERSION),
     );
     const modifiedHooks = hooks.filter((h) => h.contentModified);
 
-    let policyProfileDrift = false;
-    const profileDriftDetails: string[] = [];
-    if (policyResult?.ok && options.currentProfiles) {
+    let identityDrift = false;
+    let identityDriftDetails: string[] = [];
+    if (policyResult?.ok && options.currentIdentities) {
       const policy = policyResult.policy;
-      const liveProfile = options.currentProfiles.find((p) => p.id === policy.matchedProfileId);
-      if (!liveProfile) {
-        policyProfileDrift = true;
-        profileDriftDetails.push(`the matched profile ("${policy.matchedProfileId}") no longer exists in current settings`);
-      } else {
-        for (const field of PROFILE_DRIFT_FIELDS) {
-          const liveValue = liveProfile[field];
-          const policyValue = field === "gitName" ? policy.expectedGitName : field === "gitEmail" ? policy.expectedGitEmail : field === "strictPushSetup" ? policy.strictPushSetup : policy.expectedGitHubLogin;
-          if (JSON.stringify(liveValue ?? null) !== JSON.stringify(policyValue ?? null)) {
-            policyProfileDrift = true;
-            profileDriftDetails.push(field);
-          }
-        }
-        if (normalizeAliasList(liveProfile.trustedSshHostAliases) !== normalizeAliasList(policy.trustedSshHostAliases)) {
-          policyProfileDrift = true;
-          profileDriftDetails.push("trustedSshHostAliases");
-        }
-      }
-    }
-
-    let pushDestinationDrift = false;
-    if (policyResult?.ok && options.currentPushDestination) {
-      const approved = policyResult.policy.approvedPushDestination;
-      const current = options.currentPushDestination;
-      if (!approved || !approved.owner) {
-        // No baseline destination was ever approved for this policy —
-        // pre-push evaluation already fails closed on every push in this
-        // case (see evaluator.ts's destinationReasons), so health must not
-        // silently report "active" while enforcement is effectively
-        // unconditional-block. Health and hook enforcement must agree.
-        pushDestinationDrift = true;
-      } else {
-        // Same fail-closed posture as the evaluator's destinationReasons: a
-        // field the approval recorded but the current push destination
-        // can't reproduce is a change, never a silent match.
-        const ownerChanged = normalizeOwnerRepo(approved.owner) !== normalizeOwnerRepo(current.owner);
-        const repoChanged = !!approved.repo && normalizeOwnerRepo(approved.repo) !== normalizeOwnerRepo(current.repo);
-
-        let hostChanged: boolean;
-        let portChanged = false;
-        if (options.resolveCanonicalDestinationDrift) {
-          // Expensive, on-demand path (explicit "Check Shield Health"
-          // only — see ShieldInspectOptions.resolveCanonicalDestinationDrift
-          // for why routine background scans never set this): re-resolves
-          // the CURRENT destination's REAL canonical endpoint right now,
-          // the same way enable()/repair() established the APPROVED one,
-          // which is the only way to catch an SSH alias silently
-          // repointed in ~/.ssh/config since Shield was last
-          // enabled/repaired — its NAME never changes, so no literal
-          // string comparison can see it.
-          const currentCanonical = await this.canonicalizeDestination(
-            repoRoot,
-            current.protocol,
-            current.host,
-            options.env,
-            current.port,
-            current.sshUser,
-            options.sshResolver,
-          );
-          hostChanged =
-            !approved.canonicalHost ||
-            !currentCanonical.canonicalHost ||
-            normalizeHost(approved.canonicalHost) !== normalizeHost(currentCanonical.canonicalHost);
-          portChanged =
-            !!approved.canonicalPort &&
-            !!currentCanonical.canonicalPort &&
-            approved.canonicalPort !== currentCanonical.canonicalPort;
-        } else {
-          // Cheap path: literal host/owner/repo comparison only. Catches
-          // a genuinely different remote, but NOT a same-named alias
-          // quietly repointed to a different physical endpoint — that
-          // requires the canonical resolution above. What actually
-          // enforces at push time (evaluator.ts / shield-evaluate.sh)
-          // ALWAYS canonicalizes the current route fresh, unconditionally,
-          // on every real push — this cheap path only affects how
-          // promptly the sidebar's diagnostic indicator notices, never
-          // what a push allows.
-          hostChanged = normalizeHost(approved.host) !== normalizeHost(current.host);
-        }
-
-        pushDestinationDrift = hostChanged || ownerChanged || repoChanged || portChanged;
-      }
+      identityDriftDetails = identityDriftFields(
+        policy,
+        options.currentIdentities.find((identity) => identity.id === policy.identityId),
+      );
+      identityDrift = identityDriftDetails.length > 0;
     }
 
     const hooksPathCustomized = !!coreHooksPath;
     const hooksPathNote = hooksPathCustomized
-      ? ` ("core.hooksPath" is currently set to "${coreHooksPath}" — if that was changed after Shield was enabled, this is why.)`
+      ? ` ("core.hooksPath" is currently set to "${coreHooksPath}" — if that was changed after the lock was installed, this is why.)`
       : "";
 
     if (!anyShieldArtifactPresent) {
@@ -896,7 +766,7 @@ export class ShieldManager {
       for (const hook of foreignHooks) {
         reasons.push(
           hook.fileKind === "executable-regular"
-            ? `A ${hook.fileName} hook already exists at ${hook.path} that Repo Identity Guard did not create. Shield will not overwrite or delete it — move it aside yourself, enable Shield with hook chaining, or run "Repair Shield" after resolving it.`
+            ? `A ${hook.fileName} hook already exists at ${hook.path} that Repo Identity Guard did not create. It will not be overwritten or deleted — move it aside yourself, or re-assign the identity with hook chaining, then run "Repair Identity Lock".`
             : foreignHookRefusalReason(hook.fileName, hook.path, hook.fileKind),
         );
       }
@@ -910,65 +780,62 @@ export class ShieldManager {
       state = "degraded";
       for (const orphan of orphanedHookPaths) {
         reasons.push(
-          `A Shield-owned hook is still installed at ${orphan}, which is not the hooks directory Git currently uses${coreHooksPath ? ` ("core.hooksPath" is set to "${coreHooksPath}")` : ""}. It is inert ONLY while "core.hooksPath" points elsewhere -- it is not harmless, and it takes effect again the moment that setting changes back or is unset. Run "Repair Shield" or "Disable Shield" — both clean up Shield's previous installation locations.`,
+          `An identity-lock hook is still installed at ${orphan}, which is not the hooks directory Git currently uses${coreHooksPath ? ` ("core.hooksPath" is set to "${coreHooksPath}")` : ""}. It is inert ONLY while "core.hooksPath" points elsewhere -- it is not harmless, and it takes effect again the moment that setting changes back or is unset. Run "Repair Identity Lock" or "Unlock Current Repository" — both clean up previous installation locations.`,
         );
       }
     } else if (!policyResult) {
       state = "degraded";
-      reasons.push('Shield artifacts are present but no policy file was found. Run "Repair Shield" or re-enable Shield.');
+      reasons.push('Identity-lock files are present but no policy file was found, so every commit and push is blocked. Run "Repair Identity Lock" or "Unlock Current Repository".');
     } else if (!policyResult.ok) {
       state = "broken";
       reasons.push(
-        `Shield's policy file is invalid: ${policyResult.errors.map((e) => `${e.path}: ${e.message}`).join("; ")}.`,
+        `The identity-lock policy file is invalid: ${policyResult.errors.map((e) => `${e.path}: ${e.message}`).join("; ")}.`,
       );
     } else if (!evaluatorOwned) {
       state = "degraded";
       reasons.push(
-        'Shield\'s evaluator copy is missing or was modified outside Repo Identity Guard. Run "Repair Shield" to reinstall it.',
+        'The identity-lock evaluator copy is missing or was modified outside Repo Identity Guard. Run "Repair Identity Lock" to reinstall it.',
       );
     } else if (evaluatorModified) {
       state = "degraded";
-      reasons.push('Shield\'s evaluator copy has been modified outside Repo Identity Guard. Run "Repair Shield" to restore it.');
+      reasons.push('The identity-lock evaluator copy has been modified outside Repo Identity Guard. Run "Repair Identity Lock" to restore it.');
     } else if (evaluatorVersion === undefined || evaluatorVersion !== SHIELD_ARTIFACT_VERSION) {
       state = "degraded";
       reasons.push(
         evaluatorVersion !== undefined && evaluatorVersion > SHIELD_ARTIFACT_VERSION
-          ? `Shield's evaluator copy is a newer version (v${evaluatorVersion}) than this build of the extension recognizes (v${SHIELD_ARTIFACT_VERSION}). Update the extension, then run "Repair Shield."`
-          : 'A newer Shield evaluator is available. Run "Repair Shield" to update it.',
+          ? `The identity-lock evaluator copy is a newer version (v${evaluatorVersion}) than this build of the extension recognizes (v${SHIELD_ARTIFACT_VERSION}). Update the extension, then run "Repair Identity Lock."`
+          : 'A newer identity-lock evaluator is available. Run "Repair Identity Lock" to update it.',
       );
     } else if (missingGovernedHooks.length > 0) {
       state = "degraded";
       for (const hook of missingGovernedHooks) {
-        reasons.push(`Shield's ${hook.fileName} hook is missing. Run "Repair Shield" to reinstall it.${hooksPathNote}`);
+        reasons.push(`The identity lock's ${hook.fileName} hook is missing. Run "Repair Identity Lock" to reinstall it.${hooksPathNote}`);
       }
     } else if (modifiedHooks.length > 0) {
       state = "degraded";
       for (const hook of modifiedHooks) {
-        reasons.push(`Shield's ${hook.fileName} hook has been modified outside Repo Identity Guard. Run "Repair Shield" to restore it.`);
+        reasons.push(`The identity lock's ${hook.fileName} hook has been modified outside Repo Identity Guard. Run "Repair Identity Lock" to restore it.`);
       }
     } else if (outdatedOrIncompatibleHooks.length > 0) {
       state = "degraded";
       for (const hook of outdatedOrIncompatibleHooks) {
         reasons.push(
           hook.version !== undefined && hook.version > SHIELD_ARTIFACT_VERSION
-            ? `Shield's ${hook.fileName} hook is a newer version (v${hook.version}) than this build of the extension recognizes (v${SHIELD_ARTIFACT_VERSION}). Update the extension, then run "Repair Shield."`
-            : `A newer Shield ${hook.fileName} hook is available. Run "Repair Shield" to update it.`,
+            ? `The identity lock's ${hook.fileName} hook is a newer version (v${hook.version}) than this build of the extension recognizes (v${SHIELD_ARTIFACT_VERSION}). Update the extension, then run "Repair Identity Lock."`
+            : `A newer identity-lock ${hook.fileName} hook is available. Run "Repair Identity Lock" to update it.`,
         );
       }
     } else if (!installRecordCoversLiveHooks) {
       state = "degraded";
       reasons.push(
-        `Shield's hooks are installed at ${gitContext.hooksDir}, but Shield's installation record does not name that directory (it is missing, unreadable, or corrupt). Enforcement is working right now, but if "core.hooksPath" is changed before Shield is disabled, "Disable Shield" would not know to look here — and a Shield hook left behind with no evaluator beside it blocks every commit and push. Run "Repair Shield" to restore the record.`,
+        `The identity lock's hooks are installed at ${gitContext.hooksDir}, but its installation record does not name that directory (it is missing, unreadable, or corrupt). Enforcement is working right now, but if "core.hooksPath" is changed before the repository is unlocked, Unlock would not know to look here — and a lock hook left behind with no evaluator beside it blocks every commit and push. Run "Repair Identity Lock" to restore the record.`,
       );
-    } else if (policyProfileDrift) {
+    } else if (identityDrift) {
       state = "degraded";
       reasons.push(
-        `The matched profile's live settings no longer match what Shield last approved (${profileDriftDetails.join(", ")}). Run "Repair Shield" to re-sync.`,
-      );
-    } else if (pushDestinationDrift) {
-      state = "degraded";
-      reasons.push(
-        `This repository's current push destination no longer matches what Shield last approved. Run "Repair Shield" after confirming this is intentional.`,
+        identityDriftDetails[0] === "identity removed"
+          ? `The identity this repository is locked to ("${policyResult?.ok ? policyResult.policy.identityId : "?"}") no longer exists in settings. The lock keeps enforcing the identity recorded when it was installed until you assign another identity or unlock the repository.`
+          : `The assigned identity was edited in settings since this lock was installed (${identityDriftDetails.join(", ")}), but the lock still enforces the previous values. Run "Repair Identity Lock" to apply the edit.`,
       );
     } else {
       state = "active";
@@ -982,25 +849,29 @@ export class ShieldManager {
       policyPath,
       policyPresent: policyRaw !== null,
       policyValid: policyResult?.ok ?? false,
-      policyProfileLabel: policyResult?.ok ? policyResult.policy.profileLabel : undefined,
+      policyIdentityLabel: policyResult?.ok ? policyResult.policy.identityLabel : undefined,
       policySnapshot: policyResult?.ok
         ? {
-            approvedRepositoryKey: policyResult.policy.approvedRepositoryKey,
-            approvedPushDestination: policyResult.policy.approvedPushDestination,
-            trustedSshHostAliases: policyResult.policy.trustedSshHostAliases,
+            lockId: policyResult.policy.lockId,
+            assignedAt: policyResult.policy.assignedAt,
+            identityId: policyResult.policy.identityId,
+            identityLabel: policyResult.policy.identityLabel,
+            expectedGitName: policyResult.policy.expectedGitName,
+            expectedGitEmail: policyResult.policy.expectedGitEmail,
             expectedGitHubLogin: policyResult.policy.expectedGitHubLogin,
-            strictPushSetup: policyResult.policy.strictPushSetup,
-            enabledActions: policyResult.policy.enabledActions,
+            trustedSshHostAliases: [...policyResult.policy.trustedSshHostAliases],
+            enforcedActions: [...policyResult.policy.enforcedActions],
           }
         : undefined,
+      legacyPolicy: policyRaw !== null && !policyResult?.ok ? readLegacyPolicyInfo(policyRaw) : undefined,
       evaluatorPath,
       evaluatorPresent: evaluatorRaw !== null,
       evaluatorOwned,
       evaluatorVersion,
       evaluatorModified,
       hooksPathCustomized,
-      policyProfileDrift,
-      pushDestinationDrift,
+      identityDrift,
+      identityDriftDetails,
       orphanedHookPaths,
       gitVersionRaw: gitVersionRaw ?? undefined,
       gitVersionSupported: gitVersionSupport.supported,
@@ -1023,84 +894,6 @@ export class ShieldManager {
    *    those hooks are inspected properly by the main path above and are
    *    not orphans at all.
    */
-  /**
-   * Reads the SSH transport-override environment for this repo, the same
-   * way `evaluate_push`/`destinationReasons` do at hook time —
-   * `GIT_SSH`/`GIT_SSH_COMMAND`/`GIT_SSH_VARIANT` from the process
-   * environment, `core.sshCommand`/`ssh.variant` from Git config at this
-   * repo's effective scope. Never reads a key, a credential, or executes
-   * anything the override VALUES would run — see `resolveSshCommandOverrides`
-   * for why presence alone, never the value, is what matters.
-   */
-  private async readSshTransportEnvironment(repoRoot: string, env: NodeJS.ProcessEnv): Promise<SshTransportEnvironment> {
-    const [coreSshCommand, sshVariantConfig] = await Promise.all([
-      getGitConfigValue(repoRoot, "core.sshCommand"),
-      getGitConfigValue(repoRoot, "ssh.variant"),
-    ]);
-    return {
-      gitSsh: env.GIT_SSH,
-      gitSshCommand: env.GIT_SSH_COMMAND,
-      coreSshCommand: coreSshCommand ?? undefined,
-      gitSshVariant: env.GIT_SSH_VARIANT,
-      sshVariantConfig: sshVariantConfig ?? undefined,
-    };
-  }
-
-  /**
-   * Resolves a push destination's REAL physical endpoint — the single
-   * canonicalization routine shared by `enable()`/`repair()` (building the
-   * APPROVED endpoint once, durably) and an explicit "Check Shield
-   * Health" (re-resolving the CURRENT endpoint on demand — see
-   * `ShieldInspectOptions.resolveCanonicalDestinationDrift`). Never
-   * attempted, and never trusted, when an SSH transport override is in
-   * effect: the override can redirect the connection regardless of what
-   * `ssh -G` reports for the URL's own host, so a caller must treat an
-   * empty result here as "unprovable," never as "unchanged" or "fine" —
-   * see `destinationReasons()` in evaluator.ts for the full fail-closed
-   * rationale this mirrors.
-   */
-  private async canonicalizeDestination(
-    repoRoot: string,
-    protocol: string | undefined,
-    host: string | undefined,
-    env: NodeJS.ProcessEnv = process.env,
-    explicitPort?: string,
-    sshUser?: string,
-    sshResolver: SshResolver = defaultSshResolver,
-  ): Promise<{ canonicalHost?: string; canonicalPort?: string }> {
-    if (!host) {
-      return {};
-    }
-    if (protocol !== "ssh") {
-      // Only SSH has local ~/.ssh/config alias indirection an attacker
-      // could silently repoint after Shield approved a destination --
-      // HTTPS, and any other/unrecognized protocol Git itself accepts
-      // (git://, file://, ...), have no such ambiguity: the literal host
-      // IS the canonical host. Kept 1:1 with destinationReasons() in
-      // evaluator.ts and the shell evaluator's matching branch.
-      return { canonicalHost: host };
-    }
-    const overrides = resolveSshCommandOverrides(await this.readSshTransportEnvironment(repoRoot, env));
-    if (overrides.length > 0) {
-      return {};
-    }
-    // The explicit URL port (e.g. "443" in `ssh://git@host:443/...`) must
-    // travel into THIS SAME "ssh -G" call, exactly as
-    // shield-evaluate.sh's resolve_canonical_ssh_route does for the hook's
-    // own resolution -- an unchanged approved destination whose URL
-    // carries an explicit port must canonicalize identically at
-    // enable/repair time and at push time. Passing no port here (when the
-    // URL carried none) while the push-time side passes one, or vice
-    // versa, is exactly the bug this parameter closes: `ssh -G host` and
-    // `ssh -G -p 443 host` can legitimately report different effective
-    // ports for the SAME unchanged destination.
-    const endpoint = await sshResolver(host, { env, port: explicitPort, user: sshUser });
-    if (!endpoint) {
-      return {};
-    }
-    return { canonicalHost: endpoint.host, canonicalPort: endpoint.port };
-  }
-
   private async findOrphanedShieldHookPaths(gitContext: ShieldGitContext): Promise<string[]> {
     const record = await readShieldInstallRecord(shieldInstallRecordFilePath(shieldStorageDir(gitContext.gitCommonDir)));
     if (!record) return [];
@@ -1118,139 +911,22 @@ export class ShieldManager {
   }
 
   /**
-   * Builds the policy Shield would install for this repo right now, from
-   * already-resolved facts/profiles/protectedBranches — the same
-   * resolution the rest of the extension already uses (`resolveProfiles`),
-   * so Shield's notion of "the matched profile" never diverges from what
-   * the sidebar shows. Returns `undefined` (never throws) when there is no
-   * single resolved profile to build a policy from — 0 matches
-   * (`profile-unresolved`) or 2+/a fork conflict (`profile-conflict`) are
-   * both "cannot enable Shield yet," not an error.
-   */
-  private async buildPolicyForRepo(
-    repoRoot: string,
-    input: ShieldEnableInput,
-  ): Promise<{ policy: ShieldPolicy } | { error: "profile-unresolved" | "profile-conflict"; message: string }> {
-    const { facts, profiles, protectedBranches, now } = input;
-    const resolution = resolveProfiles(facts, profiles);
-
-    if (resolution.forkConflict) {
-      return {
-        error: "profile-conflict",
-        message: `This repo's origin and upstream remotes imply two different profiles (${resolution.forkConflict.originProfile.label} vs ${resolution.forkConflict.upstreamProfile.label}). Resolve the conflict (Review Details > Resolve Conflict) before enabling Shield.`,
-      };
-    }
-    if (resolution.matches.length === 0) {
-      return {
-        error: "profile-unresolved",
-        message: "No profile matches this repository yet. Add one from Settings before enabling Shield.",
-      };
-    }
-    if (resolution.matches.length > 1) {
-      return {
-        error: "profile-conflict",
-        message: `${resolution.matches.length} profiles match this repository (${resolution.matches.map((p) => p.label).join(", ")}). Narrow their owner patterns before enabling Shield.`,
-      };
-    }
-
-    const profile = resolution.matches[0];
-
-    // ---- canonical identity vs. approved push destination ----
-    //
-    // These are two DIFFERENT facts and Phase 8 found them conflated:
-    // `approvedPushDestination` was built from the `remote*` (origin
-    // fetch) facts, so every repository whose actual plain-push
-    // destination differs from origin's fetch URL had Shield approving
-    // the wrong place. That is not a rare shape — Git offers four
-    // separate ways to arrange it, all of which `getPushRemoteName` /
-    // `getPushUrl` already resolve correctly for the sidebar:
-    // `branch.<name>.pushRemote`, `remote.pushDefault`,
-    // `remote.<name>.pushurl`, and a `branch.<name>.remote` that isn't
-    // origin. In each, Shield would previously approve origin's owner/repo
-    // and then evaluate a real push that legitimately goes elsewhere —
-    // blocking correct pushes, and (in the mirror case) approving a
-    // destination nobody pushes to.
-    //
-    // - `approvedRepositoryKey` stays origin-based: it is the repository's
-    //   canonical IDENTITY, the same key `resolveProfiles`/`exactRepos`
-    //   match against, and origin is the right notion of "which repo is
-    //   this" even for a repo that pushes somewhere else.
-    // - `approvedPushDestination` is now built strictly from the
-    //   `pushRemote*` facts: the destination a plain `git push` would
-    //   ACTUALLY reach, which is the only thing pre-push evaluation
-    //   compares against.
-    //
-    // No fallback to origin when the push destination didn't resolve: an
-    // absent `approvedPushDestination` already fails closed at push time
-    // (see `destinationReasons`), and silently substituting origin here
-    // would reintroduce exactly the bug this fixes.
-    const approvedRepositoryKey = canonicalRepoKey(facts.remoteHost, facts.remoteOwner, facts.remoteRepo);
-    let approvedPushDestination: ShieldPolicy["approvedPushDestination"];
-    if (facts.pushRemoteOwner || facts.pushRemoteHost || facts.pushRemoteRepo) {
-      // Round-2 release-blocker fix: resolve and persist the REAL
-      // canonical physical endpoint NOW, once, durably -- never trust the
-      // literal host/alias text alone. See `canonicalizeDestination` and
-      // `ShieldPolicy.approvedPushDestination.canonicalHost`'s doc
-      // comment for the full "why a literal comparison isn't enough"
-      // writeup. An unresolvable endpoint (an SSH transport override in
-      // effect, `ssh` unavailable, or resolution failing) is NOT refused
-      // here -- enable()/repair() still install Shield's commit
-      // protection, exactly like an entirely absent push destination
-      // already does, and `canonicalHost` is simply left undefined, which
-      // makes push destination fail closed on every push until the
-      // override is removed and Shield is repaired (see
-      // `destinationReasons()`).
-      const canonical = await this.canonicalizeDestination(
-        repoRoot,
-        facts.pushRemoteProtocol,
-        facts.pushRemoteHost,
-        input.env,
-        facts.pushRemotePort,
-        facts.pushRemoteUser,
-        input.sshResolver,
-      );
-      approvedPushDestination = {
-        host: facts.pushRemoteHost,
-        owner: facts.pushRemoteOwner,
-        repo: facts.pushRemoteRepo,
-        canonicalHost: canonical.canonicalHost,
-        canonicalPort: canonical.canonicalPort,
-      };
-    } else {
-      approvedPushDestination = undefined;
-    }
-
-    const policy = buildShieldPolicy({
-      profile,
-      approvedRepositoryKey,
-      approvedPushDestination,
-      protectedBranches,
-      // Both actions are enforced as of Phase 4: enable()/repair() install
-      // both the pre-commit and pre-push hook shims. Note that an absent
-      // `approvedPushDestination` (no resolvable remote yet) still results
-      // in "push" being enabled here — push evaluation's own destination
-      // check fails CLOSED in that case (see evaluator.ts
-      // destinationReasons), which is the intended conservative behavior,
-      // not a gap to work around by leaving "push" out.
-      enabledActions: ["commit", "push"],
-      now,
-    });
-    return { policy };
-  }
-
-  /**
-   * Installs (or repairs) Shield for this repo: writes the policy and a
-   * fresh evaluator copy under this repo's git-common-dir, then installs
-   * the pre-commit, pre-merge-commit AND pre-push hook shims — each
-   * independently, and each
-   * only into an empty hook slot, one Shield already owns, or (with
+   * Installs (or re-installs) the identity lock for this repo: writes the
+   * lock policy for `input.identity` and a fresh evaluator copy under this
+   * repo's git-common-dir, then installs the pre-commit, pre-merge-commit
+   * AND pre-push hook shims — each independently, and each only into an
+   * empty hook slot, one the lock already owns, or (with
    * `input.chainForeignHooks: true`) one occupied by a foreign hook that
    * gets chained rather than replaced (see the class-level "Hook
    * coexistence" doc comment). A foreign hook is never touched when
-   * `chainForeignHooks` is left unset/false; Shield still writes its own
-   * policy/evaluator (harmless and inert without a hook to invoke them)
-   * and reports `degraded` rather than pretending full enforcement is
-   * active.
+   * `chainForeignHooks` is left unset/false.
+   *
+   * With `input.requireComplete` (what `IdentityLockService` always
+   * passes) the operation is all-or-nothing: an occupied slot the lock
+   * needs refuses the operation before anything is written, and a
+   * post-install inspection that is not `active` restores the previous
+   * on-disk state. Without it, a refused slot is skipped and the result is
+   * reported `degraded` (the engine's original partial-install behavior).
    *
    * `evaluatorScriptSource` is the absolute path to this extension's own
    * bundled `resources/shield/shield-evaluate.sh` — passed in rather than
@@ -1259,7 +935,7 @@ export class ShieldManager {
    */
   async enable(repoRoot: string, evaluatorScriptSource: string, input: ShieldEnableInput): Promise<ShieldOperationResult> {
     const gitContext = await this.resolveGitContext(repoRoot).catch((error) => {
-      throw new Error(`Cannot enable Shield: ${toMessage(error)}`);
+      throw new Error(`Cannot install the identity lock: ${toMessage(error)}`);
     });
 
     // Phase 8: refuse outright on a Git that cannot run the hooks Shield
@@ -1274,18 +950,19 @@ export class ShieldManager {
         inspection: {
           ...inspection,
           reasons: [
-            `${gitVersionSupport.reason as string} Shield was not installed; nothing on disk was changed.`,
+            `${gitVersionSupport.reason as string} The identity lock was not installed; nothing on disk was changed.`,
             ...inspection.reasons,
           ],
         },
       };
     }
 
-    const built = await this.buildPolicyForRepo(repoRoot, input);
-    if ("error" in built) {
-      const inspection = await this.inspect(repoRoot);
-      return { ok: false, inspection: { ...inspection, reasons: [built.message, ...inspection.reasons] } };
-    }
+    const policy: ShieldPolicy = buildShieldPolicy({
+      identity: input.identity,
+      lockId: input.lockId,
+      assignedAt: input.assignedAt,
+      now: input.now,
+    });
 
     const policyPath = shieldPolicyFilePath(gitContext.gitCommonDir);
     const evaluatorPath = shieldEvaluatorScriptFilePath(gitContext.gitCommonDir);
@@ -1349,6 +1026,46 @@ export class ShieldManager {
       }),
     );
 
+    // ---- preflight (requireComplete): refuse before writing anything ----
+    //
+    // An identity lock must never be reported (or persisted) as assigned
+    // while a hook it needs could not be installed. So in all-or-nothing
+    // mode, any slot governing an ENFORCED action that would be skipped
+    // (foreign hook without chaining, a symlink, a non-executable file, a
+    // stale chained-original sidecar) refuses the whole operation up
+    // front. A skipped slot for an action the lock does not enforce (the
+    // pre-push slot of a commit-only lock) is fine: nothing is lost by
+    // leaving a foreign hook there untouched.
+    if (input.requireComplete) {
+      const blockingSkips = hookWrites.filter((w) => w.mode === "skip" && policy.enforcedActions.includes(w.spec.action));
+      if (blockingSkips.length > 0) {
+        const refusals: string[] = [];
+        for (const write of blockingSkips) {
+          const kind = await classifyHookFile(write.hookPath);
+          const sidecarKind = await classifyHookFile(chainedOriginalPath(write.hookPath));
+          if (kind === "executable-regular" && sidecarKind !== "absent") {
+            refusals.push(
+              `A ${write.spec.fileName} hook exists at ${write.hookPath} and a previously chained original is still waiting at ${chainedOriginalPath(write.hookPath)}. Repo Identity Guard will not move another hook on top of it. Resolve which one you want to keep, then try again.`,
+            );
+          } else if (kind === "executable-regular") {
+            refusals.push(
+              `A ${write.spec.fileName} hook already exists at ${write.hookPath} that Repo Identity Guard did not create. It was left untouched. Assign the identity again with hook chaining (your hook keeps running after the identity check), or move it aside first.`,
+            );
+          } else {
+            refusals.push(foreignHookRefusalReason(write.spec.fileName, write.hookPath, kind));
+          }
+        }
+        const inspection = await this.inspect(repoRoot);
+        return {
+          ok: false,
+          inspection: {
+            ...inspection,
+            reasons: [...refusals, "Nothing was written: the identity lock was not installed or changed.", ...inspection.reasons],
+          },
+        };
+      }
+    }
+
     // Policy + evaluator are always (re)written: they're inert without a
     // wired hook, and rewriting them keeps Shield's recorded intent
     // current (matches ShieldPolicy's "intent, not cached status"
@@ -1411,7 +1128,7 @@ export class ShieldManager {
     try {
       storageDirCreated = (await fs.mkdir(storageDir, { recursive: true })) !== undefined;
     } catch (error) {
-      metadataFailure = `Shield's storage directory (${storageDir}) could not be created: ${toMessage(error)}`;
+      metadataFailure = `The identity lock's storage directory (${storageDir}) could not be created: ${toMessage(error)}`;
     }
 
     // The superset: every hooks directory Shield was already responsible
@@ -1429,7 +1146,7 @@ export class ShieldManager {
         supersetDirs.length === previousRecord.hookDirs.length &&
         supersetDirs.every((dir) => previousRecord.hookDirs.some((d) => sameHookDir(d, dir)));
       if (!alreadyCurrent && !(await writeShieldInstallRecord(installRecordPath, supersetDirs, input.now ?? Date.now()))) {
-        metadataFailure = `Shield could not durably record which hooks directory it installs into (${installRecordPath} is not writable)`;
+        metadataFailure = `Repo Identity Guard could not durably record which hooks directory it installs into (${installRecordPath} is not writable)`;
       }
     }
 
@@ -1443,8 +1160,8 @@ export class ShieldManager {
       }
       const inspection = await this.inspect(repoRoot);
       const headline = preExisting
-        ? `${metadataFailure}. Shield could not safely establish lifecycle tracking, so this repair was ABORTED before touching anything: no hook was installed, moved, or removed, and the Shield installation already present here is unchanged and still enforcing. Until this is resolved Shield cannot guarantee it can find and remove every hook it owns, so it is reported as degraded. Fix the permissions on ${storageDir} and run "Repair Shield" again.`
-        : `${metadataFailure}. Shield was NOT enabled: without that record it could not guarantee it would later be able to find and remove the hooks it installs, and a Shield hook that Disable Shield cannot reach would block every commit and push in this repository with no Shield left to repair it. Nothing was installed and no Shield state was left behind. Fix the permissions on ${storageDir} and try again.`;
+        ? `${metadataFailure}. Lifecycle tracking could not be safely established, so this operation was ABORTED before touching anything: no hook was installed, moved, or removed, and the identity lock already present here is unchanged and still enforcing. Until this is resolved Repo Identity Guard cannot guarantee it can find and remove every hook it owns, so it is reported as needing attention. Fix the permissions on ${storageDir} and run "Repair Identity Lock" again.`
+        : `${metadataFailure}. The identity lock was NOT installed: without that record Repo Identity Guard could not guarantee it would later be able to find and remove the hooks it installs, and a lock hook that Unlock cannot reach would block every commit and push in this repository. Nothing was installed and nothing was left behind. Fix the permissions on ${storageDir} and try again.`;
       return {
         ok: false,
         inspection: {
@@ -1487,7 +1204,7 @@ export class ShieldManager {
     };
 
     try {
-      await writeTracked(policyPath, serializeShieldPolicy(built.policy));
+      await writeTracked(policyPath, serializeShieldPolicy(policy));
       await writeTracked(evaluatorPath, evaluatorScript, 0o755);
 
       for (const write of hookWrites) {
@@ -1509,18 +1226,24 @@ export class ShieldManager {
       for (const undo of undos.reverse()) {
         await undo().catch((rollbackError) => rollbackFailures.push(toMessage(rollbackError)));
       }
+      if (input.requireComplete && !preExisting && rollbackFailures.length === 0) {
+        // A failed FIRST install leaves nothing behind, not even the
+        // install record / storage directory written in step 2.
+        await this.disable(repoRoot).catch(() => undefined);
+      }
       const inspection = await this.inspect(repoRoot);
       return {
         ok: false,
+        rolledBack: rollbackFailures.length === 0,
         inspection: {
           ...inspection,
           state: inspection.state === "active" ? "degraded" : inspection.state,
           reasons: [
-            `Shield could not finish installing its artifacts: ${toMessage(error)}. ${
+            `The identity lock could not finish installing: ${toMessage(error)}. ${
               rollbackFailures.length === 0
-                ? "Everything this operation had written was rolled back to its previous contents; nothing Shield does not own was touched."
-                : `Rolling back was itself incomplete (${rollbackFailures.join("; ")}) — run "Repair Shield" or "Disable Shield".`
-            } Shield's installation record still names every hooks directory involved, so "Disable Shield" can still reach them.`,
+                ? "Everything this operation had written was rolled back to its previous contents; nothing Repo Identity Guard does not own was touched."
+                : `Rolling back was itself incomplete (${rollbackFailures.join("; ")}) — run "Repair Identity Lock" or "Unlock Current Repository".`
+            } The installation record still names every hooks directory involved, so Unlock can still reach them.`,
             ...orphanCleanup.reasons,
             ...inspection.reasons,
           ],
@@ -1546,9 +1269,44 @@ export class ShieldManager {
     }
 
     const extraReasons = [...orphanCleanup.reasons];
+
+    // ---- verify (requireComplete): never leave a half-active lock ----
+    if (input.requireComplete && inspection.state !== "active") {
+      const rollbackFailures: string[] = [];
+      if (preExisting) {
+        // A re-install of an existing lock: put back the exact previous
+        // bytes, so the lock that was there before keeps enforcing.
+        for (const undo of [...undos].reverse()) {
+          await undo().catch((rollbackError) => rollbackFailures.push(toMessage(rollbackError)));
+        }
+      } else {
+        // A first install: remove everything (restoring any chained hook).
+        await this.disable(repoRoot).catch((rollbackError) => rollbackFailures.push(toMessage(rollbackError)));
+      }
+      const after = await this.inspect(repoRoot);
+      return {
+        ok: false,
+        rolledBack: rollbackFailures.length === 0,
+        inspection: {
+          ...after,
+          reasons: [
+            `The identity lock was installed but did not verify as fully active (${inspection.reasons.join(" ") || inspection.state}). ${
+              rollbackFailures.length === 0
+                ? preExisting
+                  ? "The previous lock was restored exactly as it was."
+                  : "Everything it installed was removed again."
+                : `Restoring the previous state was itself incomplete (${rollbackFailures.join("; ")}).`
+            }`,
+            ...after.reasons,
+          ],
+        },
+      };
+    }
+
     return {
       ok: inspection.state === "active" && extraReasons.length === 0,
       inspection: extraReasons.length === 0 ? inspection : { ...inspection, reasons: [...extraReasons, ...inspection.reasons] },
+      warnings: extraReasons.length > 0 ? extraReasons : undefined,
     };
   }
 
@@ -1595,12 +1353,18 @@ export class ShieldManager {
    */
   private async cleanUpOrphanedInstallations(
     gitContext: ShieldGitContext,
-  ): Promise<{ reasons: string[]; stillPresentDirs: string[] }> {
+  ): Promise<{ reasons: string[]; stillPresentDirs: string[]; ownedHooksRemaining: string[] }> {
     const record = await readShieldInstallRecord(shieldInstallRecordFilePath(shieldStorageDir(gitContext.gitCommonDir)));
-    if (!record) return { reasons: [], stillPresentDirs: [] };
+    if (!record) return { reasons: [], stillPresentDirs: [], ownedHooksRemaining: [] };
 
     const reasons: string[] = [];
     const stillPresentDirs: string[] = [];
+    // Hooks that still carry the ownership marker after cleanup (an I/O
+    // error prevented their removal). Unlike an unresolved chain (where the
+    // slot is no longer ours), these can still fire if `core.hooksPath`
+    // points back here — so `disable()` must not delete the evaluator and
+    // policy they depend on while any remain.
+    const ownedHooksRemaining: string[] = [];
 
     for (const dir of record.hookDirs) {
       if (sameHookDir(dir, gitContext.hooksDir)) continue;
@@ -1612,20 +1376,22 @@ export class ShieldManager {
           if (outcome === "unresolved-chain") {
             leftovers = true;
             reasons.push(
-              `A chained original hook at ${chainedOriginalPath(hookPath)} (from a previous Shield installation location) could not be restored automatically because something other than Shield now occupies ${hookPath}. Resolve this manually — the original is preserved at that exact path.`,
+              `A chained original hook at ${chainedOriginalPath(hookPath)} (from a previous installation location) could not be restored automatically because something other than Repo Identity Guard now occupies ${hookPath}. Resolve this manually — the original is preserved at that exact path.`,
             );
           }
         } catch (error) {
           leftovers = true;
+          const bytes = await readBytesIfExists(hookPath).catch(() => null);
+          if (bytes !== null && isOwnedBytes(bytes)) ownedHooksRemaining.push(hookPath);
           reasons.push(
-            `Shield could not clean up its previously-installed hook at ${hookPath}: ${toMessage(error)}. That hook is inert while "core.hooksPath" points elsewhere, but should be removed by hand.`,
+            `Repo Identity Guard could not clean up its previously-installed hook at ${hookPath}: ${toMessage(error)}. That hook is inert while "core.hooksPath" points elsewhere, but must be removed (fix the permissions and run Unlock again, or delete it by hand).`,
           );
         }
       }
       if (leftovers) stillPresentDirs.push(dir);
     }
 
-    return { reasons, stillPresentDirs };
+    return { reasons, stillPresentDirs, ownedHooksRemaining };
   }
 
   /**
@@ -1662,7 +1428,7 @@ export class ShieldManager {
     return "absent";
   }
 
-  /** Same mechanics as `enable` — exposed separately so callers/commands can frame it as "repair" (re-sync an already-enabled Shield after a profile edit, an extension update, or a previously-blocking foreign hook being cleared) without implying a fresh first-time activation. */
+  /** Same mechanics as `enable` — exposed separately so callers can frame it as "repair" (re-sync an installed lock after an identity edit, an extension update, or a previously-blocking foreign hook being cleared) without implying a fresh assignment. */
   async repair(repoRoot: string, evaluatorScriptSource: string, input: ShieldEnableInput): Promise<ShieldOperationResult> {
     return this.enable(repoRoot, evaluatorScriptSource, input);
   }
@@ -1728,9 +1494,29 @@ export class ShieldManager {
       }
     }
 
-    // Only now — with every hook Shield owns gone — are the artifacts the
-    // hooks depend on removed.
+    // Identity-lock hardening: if a hook the lock owns could NOT be
+    // removed from a previous hooks directory, the policy and evaluator
+    // are kept. Deleting them would (a) make the lock report "unassigned"
+    // while a lock hook still exists, and (b) turn that leftover hook into
+    // a fail-closed "broken installation" the moment `core.hooksPath`
+    // points back at it. Keeping them leaves a coherent "unlock incomplete"
+    // state that a later Unlock can finish.
     const storageDir = shieldStorageDir(gitContext.gitCommonDir);
+    if (orphanCleanup.ownedHooksRemaining.length > 0) {
+      await writeShieldInstallRecord(shieldInstallRecordFilePath(storageDir), orphanCleanup.stillPresentDirs, Date.now());
+      const inspection = await this.inspect(repoRoot);
+      return {
+        ...inspection,
+        reasons: [
+          `Unlock is incomplete: ${orphanCleanup.ownedHooksRemaining.length} identity-lock hook(s) could not be removed (${orphanCleanup.ownedHooksRemaining.join(", ")}), so the lock policy was kept and this repository is still assigned.`,
+          ...extraReasons,
+          ...inspection.reasons,
+        ],
+      };
+    }
+
+    // Only now — with every hook the lock owns gone — are the artifacts the
+    // hooks depend on removed.
     await deleteIfExists(shieldPolicyFilePath(gitContext.gitCommonDir));
     await deleteIfExists(shieldEvaluatorScriptFilePath(gitContext.gitCommonDir));
     if (orphanCleanup.stillPresentDirs.length === 0) {
@@ -1757,27 +1543,28 @@ export class ShieldManager {
     const reasons = [
       ...extraReasons,
       ...unresolvedChains.map(
-        (p) => `A chained original hook at ${p} could not be restored automatically because something other than Shield now occupies its hook slot. Resolve this manually — the original is preserved at that exact path.`,
+        (p) => `A chained original hook at ${p} could not be restored automatically because something other than Repo Identity Guard now occupies its hook slot. Resolve this manually — the original is preserved at that exact path.`,
       ),
       ...inspection.reasons,
     ];
     return reasons.length === inspection.reasons.length ? inspection : { ...inspection, reasons };
   }
 
-  /** Convenience wrapper over `inspect()` for a quick "is Shield actually working here" answer (status bar, a health-check command) without the caller re-deriving it from `ShieldInspection.state` itself. */
+  /** Convenience wrapper over `inspect()` for a quick "is the lock actually working here" answer without the caller re-deriving it from `ShieldInspection.state` itself. */
   async healthCheck(repoRoot: string, options: ShieldInspectOptions = {}): Promise<{ healthy: boolean; state: ShieldLifecycleState; summary: string }> {
     const inspection = await this.inspect(repoRoot, options);
     const healthy = inspection.state === "active" && inspection.reasons.length === 0;
+    const label = inspection.policyIdentityLabel ? ` (${inspection.policyIdentityLabel})` : "";
     const summary =
       inspection.state === "off"
-        ? "Shield is off for this repository."
+        ? "No identity lock is installed in this repository."
         : inspection.state === "active"
           ? healthy
-            ? `Shield is active${inspection.policyProfileLabel ? ` (${inspection.policyProfileLabel})` : ""}.`
-            : `Shield is active${inspection.policyProfileLabel ? ` (${inspection.policyProfileLabel})` : ""}, but an update is available: ${inspection.reasons.join(" ")}`
+            ? `The identity lock is active${label}.`
+            : `The identity lock is active${label}, but needs attention: ${inspection.reasons.join(" ")}`
           : inspection.state === "degraded"
-            ? `Shield is degraded: ${inspection.reasons.join(" ")}`
-            : `Shield is broken: ${inspection.reasons.join(" ")}`;
+            ? `The identity lock needs attention: ${inspection.reasons.join(" ")}`
+            : `The identity lock is broken: ${inspection.reasons.join(" ")}`;
     return { healthy, state: inspection.state, summary };
   }
 }

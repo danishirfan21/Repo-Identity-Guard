@@ -1,164 +1,159 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { Identity } from "../identity/types";
 import {
   SHIELD_POLICY_VERSION,
   ShieldPolicy,
   buildShieldPolicy,
+  enforcedActionsFor,
   parseShieldPolicy,
+  readLegacyPolicyInfo,
   serializeShieldPolicy,
   validateShieldPolicy,
 } from "../shield/policy";
-import { Profile } from "../types";
 
-const workProfile: Profile = {
+const workIdentity: Identity = {
   id: "work",
   label: "Work",
   gitName: "Danish Irfan",
   gitEmail: "work@example.com",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  exactRepos: [],
-  expectedBranchPatterns: ["feature/*"],
-  strictPushSetup: true,
+  expectedGitHubLogin: "danish-work",
   trustedSshHostAliases: ["github-work"],
 };
 
-function buildValidPolicy(): ShieldPolicy {
-  return buildShieldPolicy({
-    profile: workProfile,
-    approvedRepositoryKey: "github.com/acmesoftware/acme-frontend",
-    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend" },
-    protectedBranches: ["main", "master"],
-    enabledActions: ["commit", "push"],
-    now: 12345,
-  });
+function buildValidPolicy(identity: Identity = workIdentity): ShieldPolicy {
+  return buildShieldPolicy({ identity, lockId: "lock-1", assignedAt: 100, now: 12345 });
 }
 
-test("buildShieldPolicy shapes a policy purely from a profile and non-secret facts, with no I/O", () => {
+test("buildShieldPolicy (v3) records exactly the assigned identity and the actions it enforces — nothing about branches, destinations or strictness", () => {
   const policy = buildValidPolicy();
-  assert.equal(policy.policyVersion, SHIELD_POLICY_VERSION);
-  assert.equal(policy.generatedAt, 12345);
-  assert.equal(policy.matchedProfileId, "work");
-  assert.equal(policy.profileLabel, "Work");
-  assert.equal(policy.expectedGitName, "Danish Irfan");
-  assert.equal(policy.expectedGitEmail, "work@example.com");
-  assert.equal(policy.approvedRepositoryKey, "github.com/acmesoftware/acme-frontend");
-  assert.deepEqual(policy.approvedPushDestination, { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend" });
-  assert.deepEqual(policy.trustedSshHostAliases, ["github-work"]);
-  assert.equal(policy.strictPushSetup, true);
-  assert.deepEqual(policy.protectedBranches, ["main", "master"]);
-  assert.deepEqual(policy.expectedBranchPatterns, ["feature/*"]);
-  assert.deepEqual(policy.enabledActions, ["commit", "push"]);
-});
-
-test("buildShieldPolicy defaults absent profile arrays to empty arrays, never undefined", () => {
-  const bareProfile: Profile = { id: "p", label: "P", gitEmail: "p@example.com" };
-  const policy = buildShieldPolicy({
-    profile: bareProfile,
-    protectedBranches: [],
-    enabledActions: [],
-    now: 1,
+  assert.deepEqual(policy, {
+    policyVersion: 3,
+    lockId: "lock-1",
+    assignedAt: 100,
+    generatedAt: 12345,
+    identityId: "work",
+    identityLabel: "Work",
+    expectedGitName: "Danish Irfan",
+    expectedGitEmail: "work@example.com",
+    expectedGitHubLogin: "danish-work",
+    trustedSshHostAliases: ["github-work"],
+    enforcedActions: ["commit", "push"],
   });
-  assert.deepEqual(policy.trustedSshHostAliases, []);
-  assert.deepEqual(policy.expectedBranchPatterns, []);
-  assert.equal(policy.strictPushSetup, false);
-  assert.equal(policy.approvedRepositoryKey, undefined);
-  assert.equal(policy.approvedPushDestination, undefined);
-});
-
-test("a policy built by buildShieldPolicy round-trips through validateShieldPolicy", () => {
-  const policy = buildValidPolicy();
-  const result = validateShieldPolicy(policy);
-  assert.equal(result.ok, true);
-  if (result.ok) {
-    assert.deepEqual(result.policy, policy);
+  for (const retired of ["approvedRepositoryKey", "approvedPushDestination", "protectedBranches", "expectedBranchPatterns", "strictPushSetup", "matchedProfileId", "enabledActions"]) {
+    assert.ok(!(retired in policy), `${retired} must not exist in a v3 policy`);
   }
 });
 
-test("serializeShieldPolicy + parseShieldPolicy round-trips exactly", () => {
-  const policy = buildValidPolicy();
-  const json = serializeShieldPolicy(policy);
-  const result = parseShieldPolicy(json);
-  assert.equal(result.ok, true);
-  if (result.ok) {
-    assert.deepEqual(result.policy, policy);
+test("an identity without an expected GitHub login produces a commit-only lock", () => {
+  const policy = buildValidPolicy({ id: "p", label: "P", gitEmail: "p@example.com" });
+  assert.deepEqual(policy.enforcedActions, ["commit"]);
+  assert.deepEqual(policy.trustedSshHostAliases, []);
+  assert.equal(policy.expectedGitHubLogin, undefined);
+  assert.equal(policy.expectedGitName, undefined);
+  assert.deepEqual(enforcedActionsFor({}), ["commit"]);
+  assert.deepEqual(enforcedActionsFor({ expectedGitHubLogin: "x" }), ["commit", "push"]);
+});
+
+test("a built policy round-trips through validateShieldPolicy and through serialize/parse", () => {
+  for (const policy of [buildValidPolicy(), buildValidPolicy({ id: "p", label: "P", gitEmail: "p@example.com" })]) {
+    const validated = validateShieldPolicy(policy);
+    assert.equal(validated.ok, true);
+    if (validated.ok) assert.deepEqual(validated.policy, policy);
+    const parsed = parseShieldPolicy(serializeShieldPolicy(policy));
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) assert.deepEqual(parsed.policy, policy);
   }
 });
 
 test("parseShieldPolicy reports malformed JSON as a validation failure, not a thrown exception", () => {
   const result = parseShieldPolicy("{ this is not json");
   assert.equal(result.ok, false);
-  if (!result.ok) {
-    assert.ok(result.errors.length > 0);
-    assert.match(result.errors[0].message, /not valid JSON/);
-  }
+  if (!result.ok) assert.match(result.errors[0].message, /not valid JSON/);
 });
 
 test("validateShieldPolicy rejects a wrong/future policyVersion instead of guessing", () => {
-  const policy = buildValidPolicy();
-  const tampered = { ...policy, policyVersion: 999 };
-  const result = validateShieldPolicy(tampered);
+  const result = validateShieldPolicy({ ...buildValidPolicy(), policyVersion: 999 });
   assert.equal(result.ok, false);
-  if (!result.ok) {
-    assert.ok(result.errors.some((e) => e.path === "policyVersion"));
-  }
+  if (!result.ok) assert.ok(result.errors.some((e) => e.path === "policyVersion"));
+});
+
+test("a legacy (v1/v2) Shield policy is never accepted as a lock policy — it is identified as legacy, to be migrated", () => {
+  const legacy = {
+    policyVersion: 2,
+    generatedAt: 1,
+    matchedProfileId: "work",
+    profileLabel: "Work",
+    expectedGitEmail: "work@example.com",
+    approvedRepositoryKey: "github.com/acme/repo",
+    trustedSshHostAliases: [],
+    strictPushSetup: false,
+    protectedBranches: ["main"],
+    expectedBranchPatterns: [],
+    enabledActions: ["commit", "push"],
+  };
+  const result = validateShieldPolicy(legacy);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.errors.find((e) => e.path === "policyVersion")?.message ?? "", /legacy Shield policy/);
+  assert.deepEqual(readLegacyPolicyInfo(JSON.stringify(legacy)), {
+    policyVersion: 2,
+    matchedProfileId: "work",
+    approvedRepositoryKey: "github.com/acme/repo",
+  });
+  assert.equal(readLegacyPolicyInfo(serializeShieldPolicy(buildValidPolicy())), undefined, "a v3 policy is not legacy");
+  assert.equal(readLegacyPolicyInfo("{garbage"), undefined);
+  assert.deepEqual(readLegacyPolicyInfo(JSON.stringify({ policyVersion: 1 })), { policyVersion: 1, matchedProfileId: undefined, approvedRepositoryKey: undefined });
 });
 
 test("validateShieldPolicy rejects non-object input", () => {
   for (const bad of [null, undefined, 42, "a string", ["array", "not", "object"]]) {
-    const result = validateShieldPolicy(bad);
-    assert.equal(result.ok, false, `expected ${JSON.stringify(bad)} to fail validation`);
+    assert.equal(validateShieldPolicy(bad).ok, false, `expected ${JSON.stringify(bad)} to fail validation`);
   }
 });
 
 test("validateShieldPolicy reports every structural problem at once, not just the first", () => {
   const result = validateShieldPolicy({
     policyVersion: SHIELD_POLICY_VERSION,
-    // missing generatedAt, matchedProfileId, profileLabel, expectedGitEmail, etc.
     trustedSshHostAliases: "not-an-array",
-    protectedBranches: [1, 2, 3],
-    enabledActions: ["commit", "rebase"],
+    enforcedActions: ["commit", "rebase"],
   });
   assert.equal(result.ok, false);
   if (!result.ok) {
     const paths = result.errors.map((e) => e.path);
-    assert.ok(paths.includes("generatedAt"));
-    assert.ok(paths.includes("matchedProfileId"));
-    assert.ok(paths.includes("profileLabel"));
-    assert.ok(paths.includes("expectedGitEmail"));
-    assert.ok(paths.includes("trustedSshHostAliases"));
-    assert.ok(paths.includes("protectedBranches"));
-    assert.ok(paths.includes("enabledActions"));
-    assert.ok(result.errors.length >= 7);
+    for (const expected of ["lockId", "assignedAt", "generatedAt", "identityId", "identityLabel", "expectedGitEmail", "trustedSshHostAliases", "enforcedActions"]) {
+      assert.ok(paths.includes(expected), `missing error for ${expected}: ${paths.join(", ")}`);
+    }
+  }
+});
+
+test("enforcedActions must always include commit, and include push exactly when an expected GitHub login is set", () => {
+  const base = buildValidPolicy();
+  const cases: Array<[Partial<ShieldPolicy> & Record<string, unknown>, boolean]> = [
+    [{ enforcedActions: ["push"] }, false],
+    [{ enforcedActions: [] }, false],
+    [{ enforcedActions: ["commit"] }, false], // login set, push missing
+    [{ enforcedActions: ["commit", "push"], expectedGitHubLogin: undefined }, false], // push claimed, no login
+    [{ enforcedActions: ["commit"], expectedGitHubLogin: undefined }, true],
+    [{ enforcedActions: ["commit", "push"] }, true],
+  ];
+  for (const [overrides, ok] of cases) {
+    const candidate: Record<string, unknown> = { ...base, ...overrides };
+    if ("expectedGitHubLogin" in overrides && overrides.expectedGitHubLogin === undefined) delete candidate.expectedGitHubLogin;
+    assert.equal(validateShieldPolicy(candidate).ok, ok, JSON.stringify(overrides));
   }
 });
 
 test("validateShieldPolicy rejects a policy carrying a secret-shaped field, even if otherwise well-formed", () => {
   const policy = buildValidPolicy();
   for (const secretKey of ["token", "accessToken", "password", "privateKey", "sshKey", "credentials", "secret"]) {
-    const tampered = { ...policy, [secretKey]: "should never be here" };
-    const result = validateShieldPolicy(tampered);
+    const result = validateShieldPolicy({ ...policy, [secretKey]: "should never be here" });
     assert.equal(result.ok, false, `expected a policy carrying "${secretKey}" to fail validation`);
-    if (!result.ok) {
-      assert.ok(result.errors.some((e) => e.path === secretKey));
-    }
+    if (!result.ok) assert.ok(result.errors.some((e) => e.path === secretKey));
   }
 });
 
-test("validateShieldPolicy accepts a policy with no push-related facts (no remote configured yet)", () => {
-  const policy = buildShieldPolicy({
-    profile: workProfile,
-    protectedBranches: ["main"],
-    enabledActions: ["commit"],
-    now: 1,
-  });
-  const result = validateShieldPolicy(policy);
-  assert.equal(result.ok, true);
-});
-
 test("serialized policy JSON never contains any of the disallowed secret field names as keys", () => {
-  const policy = buildValidPolicy();
-  const json = serializeShieldPolicy(policy);
-  const parsedKeys = Object.keys(JSON.parse(json));
+  const parsedKeys = Object.keys(JSON.parse(serializeShieldPolicy(buildValidPolicy())));
   for (const secretKey of ["token", "accessToken", "password", "privateKey", "sshKey", "credentials", "secret"]) {
     assert.ok(!parsedKeys.includes(secretKey), `serialized policy must never contain "${secretKey}"`);
   }

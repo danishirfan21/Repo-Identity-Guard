@@ -7,32 +7,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { SHIELD_ARTIFACT_VERSION } from "../shield/artifacts";
 import { ShieldManager } from "../shield/manager";
-import { Profile, RepoFacts } from "../types";
+import { EVALUATOR_SOURCE, WORK_IDENTITY, enableLock } from "./testUtil/lockFixtures";
 
 /**
- * Integration tests for Shield's installation lifecycle (ShieldManager)
- * AND its actual pre-commit enforcement, exercised end-to-end: real
- * temporary Git repositories, the real `git commit` binary, and the real
- * shipped hook (built by `ShieldManager.enable`, which in turn installs a
- * copy of the real `resources/shield/shield-evaluate.sh`) — nothing here
- * calls into VS Code, and nothing here runs the evaluator directly the
- * way shieldEvaluatorScript.test.ts does. This is the "does Shield
- * actually block/allow a real `git commit`" test suite.
+ * Integration tests for the identity lock's enforcement lifecycle
+ * (ShieldManager) AND its actual pre-commit enforcement, exercised
+ * end-to-end: real temporary Git repositories, the real `git commit`
+ * binary, and the real shipped hook (built by `ShieldManager.enable`,
+ * which installs a copy of the real `resources/shield/shield-evaluate.sh`)
+ * — nothing here calls into VS Code. This is the "does the lock actually
+ * block/allow a real `git commit`" test suite; because the hook is run by
+ * `git` itself, every test here is also proof that enforcement works with
+ * VS Code closed.
  */
 
 const execFileAsync = promisify(execFile);
-const EVALUATOR_SOURCE = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
-
-const workProfile: Profile = {
-  id: "work",
-  label: "Work",
-  gitName: "Danish Irfan",
-  gitEmail: "work@example.com",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  expectedBranchPatterns: ["feature/*"],
-  strictPushSetup: true,
-  trustedSshHostAliases: ["github-work"],
-};
+const workProfile = WORK_IDENTITY;
 
 interface Repo {
   dir: string;
@@ -119,79 +109,12 @@ async function cleanup(repo: Repo): Promise<void> {
   await fs.rm(repo.dir, { recursive: true, force: true }).catch(() => undefined);
 }
 
-function baseFacts(repo: Repo): RepoFacts {
-  return {
-    isGitRepo: true,
-    repoRoot: repo.dir,
-    repoName: path.basename(repo.dir),
-    remoteHost: "github.com",
-    remoteOwner: "AcmeSoftware",
-    remoteRepo: "acme-frontend",
-    // Phase 8: `approvedPushDestination` is built from the pushRemote*
-    // facts (the destination a plain `git push` actually reaches), never
-    // from origin's fetch facts. These fixtures describe the ordinary
-    // "origin is also the push destination" arrangement, so both sets
-    // agree; tests that deliberately separate them override pushRemote*.
-    pushRemoteName: "origin",
-    pushRemoteUrl: "git@github.com:AcmeSoftware/acme-frontend.git",
-    pushRemoteProtocol: "ssh" as const,
-    pushRemoteHost: "github.com",
-    pushRemoteOwner: "AcmeSoftware",
-    pushRemoteRepo: "acme-frontend",
-  };
-}
-
-async function enableShield(
-  manager: ShieldManager,
-  repo: Repo,
-  overrides: { profiles?: Profile[]; protectedBranches?: string[]; facts?: Partial<RepoFacts> } = {},
-) {
-  return manager.enable(repo.dir, EVALUATOR_SOURCE, {
-    facts: { ...baseFacts(repo), ...overrides.facts },
-    profiles: overrides.profiles ?? [workProfile],
-    protectedBranches: overrides.protectedBranches ?? ["main", "master"],
-  });
+async function enableShield(manager: ShieldManager, repo: Repo, overrides: { identity?: typeof WORK_IDENTITY } = {}) {
+  return enableLock(manager, repo.dir, overrides.identity ?? WORK_IDENTITY);
 }
 
 async function hooksDirFor(repo: Repo): Promise<string> {
   return git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"]);
-}
-
-// ==================== round-2 release-blocker: canonical destination model ====================
-
-// Regression guard: canonicalizeDestination() (manager.ts) must treat ANY
-// non-ssh protocol as literal-comparable, matching destinationReasons()
-// (evaluator.ts) and the shell evaluator's own branch exactly. An earlier
-// draft of this fix only did so for "https" specifically, which meant a
-// push destination using git:// or file:// (unusual, but real for local
-// mirrors/test setups, and never blocked pre-fix) got NO canonicalHost
-// persisted at enable() time -- and then could never be approved again at
-// push time, since destination matching requires canonicalHost for ANY
-// match. Only SSH has local alias indirection to canonicalize away.
-for (const protocol of ["unknown", "https"] as const) {
-  test(`enable() persists a literal canonicalHost for a "${protocol}" protocol push destination (no ssh spawn needed or possible)`, async () => {
-    const repo = await makeTempRepo();
-    try {
-      const manager = new ShieldManager();
-      const result = await enableShield(manager, repo, {
-        facts: {
-          pushRemoteUrl:
-            protocol === "https"
-              ? "https://github.com/AcmeSoftware/acme-frontend.git"
-              : "git://github.com/AcmeSoftware/acme-frontend.git",
-          pushRemoteProtocol: protocol,
-          pushRemoteHost: "github.com",
-          pushRemoteOwner: "AcmeSoftware",
-          pushRemoteRepo: "acme-frontend",
-        },
-      });
-      assert.equal(result.ok, true, `enable() should succeed: ${result.inspection.reasons.join("; ")}`);
-      const inspection = await manager.inspect(repo.dir);
-      assert.equal(inspection.policySnapshot?.approvedPushDestination?.canonicalHost, "github.com");
-    } finally {
-      await cleanup(repo);
-    }
-  });
 }
 
 // ==================== lifecycle: inspect / enable / disable / repair ====================
@@ -219,7 +142,7 @@ test("enable() installs a policy, an evaluator copy, and owned pre-commit AND pr
     assert.equal(result.ok, true);
     assert.equal(result.inspection.state, "active");
     assert.deepEqual(result.inspection.reasons, []);
-    assert.equal(result.inspection.policyProfileLabel, "Work");
+    assert.equal(result.inspection.policyIdentityLabel, "Work");
 
     const hooksDir = await hooksDirFor(repo);
     for (const [fileName, marker] of [
@@ -244,22 +167,31 @@ test("enable() installs a policy, an evaluator copy, and owned pre-commit AND pr
     const evaluatorContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-evaluate.sh"), "utf8");
     assert.match(evaluatorContent, new RegExp(`repo-identity-guard-shield-artifact v${SHIELD_ARTIFACT_VERSION} \\(evaluator\\)`));
     const policyContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-policy.json"), "utf8");
-    assert.match(policyContent, /"profileLabel": "Work"/);
-    assert.match(policyContent, /"push"/); // enabledActions now includes push as of Phase 4
+    assert.match(policyContent, /"identityLabel": "Work"/);
+    assert.match(policyContent, /"policyVersion": 3/);
   } finally {
     await cleanup(repo);
   }
 });
 
-test("enable() refuses to enable without a resolved profile, and writes nothing", async () => {
+test("enable() with requireComplete refuses up front when a foreign hook occupies a needed slot, and writes NOTHING", async () => {
   const repo = await makeTempRepo();
   try {
-    const manager = new ShieldManager();
-    const result = await enableShield(manager, repo, { profiles: [] });
+    const hooksDir = await hooksDirFor(repo);
+    await fs.mkdir(hooksDir, { recursive: true });
+    const hookPath = path.join(hooksDir, "pre-commit");
+    await fs.writeFile(hookPath, "#!/bin/sh\necho not-shield\nexit 0\n", { mode: 0o755 });
 
+    const manager = new ShieldManager();
+    const result = await enableLock(manager, repo.dir, WORK_IDENTITY, { requireComplete: true });
     assert.equal(result.ok, false);
     assert.equal(result.inspection.state, "off");
-    assert.match(result.inspection.reasons[0], /No profile matches/);
+    assert.equal(result.inspection.policyPresent, false, "no assignment record may be persisted while hooks are not installed");
+    assert.equal(result.inspection.evaluatorPresent, false);
+    assert.match(result.inspection.reasons.join(" "), /did not create/);
+    assert.match(result.inspection.reasons.join(" "), /Nothing was written/);
+    const commonDir = await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    await assert.rejects(fs.access(path.join(commonDir, "repo-identity-guard")));
   } finally {
     await cleanup(repo);
   }
@@ -328,11 +260,7 @@ test("repair() completes activation once a previously-blocking foreign hook is c
 
     await fs.unlink(hookPath); // user moved the foreign hook aside
 
-    const repaired = await manager.repair(repo.dir, EVALUATOR_SOURCE, {
-      facts: baseFacts(repo),
-      profiles: [workProfile],
-      protectedBranches: ["main", "master"],
-    });
+    const repaired = await manager.repair(repo.dir, EVALUATOR_SOURCE, { identity: WORK_IDENTITY, lockId: "test-lock", assignedAt: 1 });
     assert.equal(repaired.ok, true);
     assert.equal(repaired.inspection.state, "active");
   } finally {
@@ -404,7 +332,7 @@ test("healthCheck() summarizes state without requiring the caller to interpret S
     const after = await manager.healthCheck(repo.dir);
     assert.equal(after.healthy, true);
     assert.equal(after.state, "active");
-    assert.match(after.summary, /Shield is active \(Work\)/);
+    assert.match(after.summary, /identity lock is active \(Work\)/);
   } finally {
     await cleanup(repo);
   }
@@ -437,12 +365,12 @@ test("wrong local identity -> blocked with a concise reason", async () => {
     const result = await commit(repo, "should be blocked");
 
     assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /Repo Identity Guard Shield/);
-    assert.match(result.stderr, /COMMIT BLOCKED/);
-    assert.match(result.stderr, /commit-identity-mismatch/);
-    assert.match(result.stderr, /Profile: Work/);
-    assert.match(result.stderr, /Expected:.*work@example\.com/);
-    assert.match(result.stderr, /Found:.*personal@example\.com/);
+    assert.match(result.stderr, /^REPO_IDENTITY_GUARD_BLOCK$/m);
+    assert.match(result.stderr, /Repo Identity Guard blocked this commit/);
+    assert.match(result.stderr, /REASON_ID: commit-identity-mismatch/);
+    assert.match(result.stderr, /IDENTITY: Work/);
+    assert.match(result.stderr, /EXPECTED_EMAIL: work@example\.com/);
+    assert.match(result.stderr, /FOUND_EMAIL: personal@example\.com/);
   } finally {
     await cleanup(repo);
   }
@@ -527,100 +455,34 @@ test("`git -c user.email=... commit` is visible at hook time (via GIT_CONFIG_PAR
   }
 });
 
-test("protected branch -> blocked even with correct identity", async () => {
+test("no branch or repository-state policy: committing on main, on a detached HEAD, and mid-rebase with the right identity all SUCCEED", async () => {
   const repo = await makeTempRepo();
   try {
     const manager = new ShieldManager();
     await enableShield(manager, repo);
-    await git(repo, ["checkout", "-q", "main"]).catch(() => git(repo, ["checkout", "-q", "master"]));
+    await git(repo, ["checkout", "-q", "-b", "main"]).catch(() => git(repo, ["checkout", "-q", "main"]));
+    await touchFile(repo, "a.txt", "on main\n");
+    assert.equal((await commit(repo, "commit on main")).code, 0);
 
-    await touchFile(repo, "a.txt", "content\n");
-    const result = await commit(repo, "direct commit on protected branch");
-
-    assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /protected-branch/);
-  } finally {
-    await cleanup(repo);
-  }
-});
-
-test("detached HEAD -> blocked", async () => {
-  const repo = await makeTempRepo();
-  try {
-    const manager = new ShieldManager();
-    await enableShield(manager, repo);
     const sha = await git(repo, ["rev-parse", "HEAD"]);
     await git(repo, ["checkout", "-q", sha]);
+    await touchFile(repo, "b.txt", "detached\n");
+    assert.equal((await commit(repo, "detached commit")).code, 0);
+    await git(repo, ["checkout", "-q", "feature/shield-tests"]);
 
-    await touchFile(repo, "a.txt", "content\n");
-    const result = await commit(repo, "detached commit");
-
-    assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /detached-head/);
-  } finally {
-    await cleanup(repo);
-  }
-});
-
-async function makeConflictedRebase(repo: Repo): Promise<void> {
-  await touchFile(repo, "conflict.txt", "base\n");
-  await git(repo, ["commit", "-q", "-m", "base"]);
-
-  await git(repo, ["checkout", "-q", "-b", "feature/other"]);
-  await touchFile(repo, "conflict.txt", "from-other-branch\n");
-  await git(repo, ["commit", "-q", "-m", "other change"]);
-
-  await git(repo, ["checkout", "-q", "feature/shield-tests"]);
-  await touchFile(repo, "conflict.txt", "from-shield-tests-branch\n");
-  await git(repo, ["commit", "-q", "-m", "conflicting change"]);
-
-  await git(repo, ["rebase", "feature/other"]).catch(() => undefined); // expected to stop on conflict
-}
-
-test("unresolved conflicts during a rebase -> Git itself refuses the commit before Shield's hook ever runs (documented defense-in-depth: shield-evaluate.sh's own merge-conflicts reason is exercised directly in shieldEvaluatorScript.test.ts, since a real `git commit` can't reach it with unmerged files present)", async () => {
-  const repo = await makeTempRepo();
-  try {
-    const manager = new ShieldManager();
-    await enableShield(manager, repo);
-    await makeConflictedRebase(repo);
-
-    const result = await commit(repo, "commit while conflicted", ["--no-edit"]);
-
-    assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /unmerged files/);
-    // Never even reached Shield's hook.
-    assert.doesNotMatch(result.stderr, /Repo Identity Guard Shield/);
-  } finally {
-    await cleanup(repo);
-  }
-});
-
-test("resolving a rebase conflict and committing manually (not via --continue) -> blocked on repo-operation-in-progress alone", async () => {
-  // Empirically, `git rebase --continue` itself does NOT invoke the
-  // pre-commit hook for the commit it creates internally (confirmed by
-  // hand against real Git 2.43: a pre-commit hook that unconditionally
-  // exits 1 does not stop `rebase --continue` from succeeding) — a
-  // documented gap, not an oversight; see docs/SHIELD_MODE.md "What's
-  // next." The hook DOES run for a plain `git commit` made while a
-  // rebase is merely in progress (conflict already resolved and staged,
-  // `--continue` not yet run), which is the scenario this test exercises.
-  const repo = await makeTempRepo();
-  try {
-    const manager = new ShieldManager();
-    await enableShield(manager, repo);
-    await makeConflictedRebase(repo);
-
-    // Resolve the conflict and stage it — status is clean of unmerged
-    // entries now, but the rebase itself is still in progress.
+    await touchFile(repo, "conflict.txt", "base\n");
+    await git(repo, ["commit", "-q", "-m", "base"]);
+    await git(repo, ["checkout", "-q", "-b", "feature/other"]);
+    await touchFile(repo, "conflict.txt", "from-other-branch\n");
+    await git(repo, ["commit", "-q", "-m", "other change"]);
+    await git(repo, ["checkout", "-q", "feature/shield-tests"]);
+    await touchFile(repo, "conflict.txt", "from-shield-tests-branch\n");
+    await git(repo, ["commit", "-q", "-m", "conflicting change"]);
+    await git(repo, ["rebase", "feature/other"]).catch(() => undefined);
     await fs.writeFile(path.join(repo.dir, "conflict.txt"), "resolved\n");
     await git(repo, ["add", "conflict.txt"]);
-
-    const result = await commit(repo, "manual commit mid-rebase");
-
-    assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /Repo Identity Guard Shield/);
-    assert.match(result.stderr, /repo-operation-in-progress/);
-    assert.doesNotMatch(result.stderr, /merge-conflicts/);
+    const midRebase = await commit(repo, "manual commit mid-rebase");
+    assert.equal(midRebase.code, 0, midRebase.stderr);
   } finally {
     await cleanup(repo);
   }

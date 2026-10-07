@@ -1,8 +1,9 @@
 /**
- * Ownership/version marking for the files Shield writes onto disk (the
- * pre-commit, pre-merge-commit and pre-push hook shims -- the first two
- * built from the same builder, see HOOK_SPECS in manager.ts -- and its copy
- * of the standalone evaluator). All are plain shell scripts, so "ownership" is a comment line
+ * Ownership/version marking for the files the identity lock's enforcement
+ * engine (historically "Shield") writes onto disk (the pre-commit,
+ * pre-merge-commit and pre-push hook shims -- the first two built from the
+ * same builder, see HOOK_SPECS in manager.ts -- and its copy of the
+ * standalone evaluator). All are plain shell scripts, so "ownership" is a comment line
  * embedded in the
  * file itself — checked before ShieldManager will overwrite or delete
  * anything at a path it doesn't fully control, and read back by
@@ -37,8 +38,13 @@ export const SHIELD_ARTIFACT_MARKER = "repo-identity-guard-shield-artifact";
  * `SHIELD_POLICY_VERSION`, which versions the policy schema). `inspect()`
  * flags an on-disk artifact whose embedded version is older than this as
  * "repair available," without treating it as broken or non-owned.
+ *
+ * v6: identity-lock product model — the evaluator enforces only commit
+ * identity and push account identity, every block message starts with the
+ * machine-readable `REPO_IDENTITY_GUARD_BLOCK` prelude, and the pre-push
+ * shim no longer echoes the raw remote URL (which can embed credentials).
  */
-export const SHIELD_ARTIFACT_VERSION = 5;
+export const SHIELD_ARTIFACT_VERSION = 6;
 
 /**
  * The sidecar file name suffix a hook's exact original foreign bytes are
@@ -74,50 +80,69 @@ export function extractShieldArtifactVersion(content: string): number | undefine
 }
 
 
+
 /**
- * Shared shell fragment: resolve the evaluator copy Shield installed, and
- * FAIL CLOSED with a clearly-framed "Shield internal error / broken
- * installation" message if anything about that resolution doesn't hold.
- *
- * ## Why this fails closed (v5 hardening)
- *
- * Up to v4 both shims exited 0 ("fail open") when `git rev-parse
- * --git-common-dir` failed or the evaluator copy was missing. That was
- * wrong, and empirically exploitable: with Shield reported ACTIVE, simply
- * deleting `<gitCommonDir>/repo-identity-guard/shield-evaluate.sh` left
- * the hook in place and every mismatched-identity commit sailed straight
- * through, silently. "Hook installed but evaluator missing" is not a
- * policy verdict and not a disabled Shield — it is a broken installation,
- * and the only safe reading of a broken enforcement mechanism is to stop
- * the operation and say so.
- *
- * The complementary half of this guarantee lives in `ShieldManager`:
- * `disable()` removes/disarms every hook it can prove it owns — at the
- * hooks directory currently in effect AND at every hooks directory
- * recorded in Shield's durable installation record (see
- * `src/shield/installRecord.ts`) — strictly BEFORE it deletes the
- * evaluator/policy. So a *completed* disable never leaves a hook behind
- * to fail closed against a deliberately-removed evaluator. The remaining
- * window (a disable interrupted between those two steps) fails closed
- * with an actionable message rather than silently un-enforcing, and is
- * resolved by re-running Disable Shield or Repair Shield.
- *
- * `$1` is the label used in the message ("COMMIT"/"PUSH").
+ * Shell lines printing the machine-readable prelude every block message
+ * starts with (see `resources/shield/shield-evaluate.sh`'s `block`). Used
+ * for the hook-level failures the evaluator itself can never report —
+ * a broken installation, a broken hook chain, an evaluator crash — so an
+ * AI agent or script sees the same stable format no matter which layer
+ * blocked. These hook-level `REASON_ID`s (`broken-installation`,
+ * `broken-hook-chain`, `internal-error`) are not evaluator reasons and are
+ * never produced by `shield-evaluate.sh`.
  */
-function evaluatorResolutionFragment(actionLabel: string): string {
+function preludeLines(action: "commit" | "push", code: string, reasonId: string, indent = "    "): string {
+  return [
+    `echo 'REPO_IDENTITY_GUARD_BLOCK'`,
+    `echo 'ACTION: ${action}'`,
+    `echo 'REASON: ${code}'`,
+    `echo 'REASON_ID: ${reasonId}'`,
+  ]
+    .map((line) => `${indent}${line}`)
+    .join("\n");
+}
+
+function repairOrUnlock(indent = "    "): string {
+  return [
+    `echo 'What to do: open this repository in VS Code and run "Repo Identity Guard: Repair Identity Lock",'`,
+    `echo 'or "Repo Identity Guard: Unlock Current Repository" if it should not be locked (that also removes this hook).'`,
+  ]
+    .map((line) => `${indent}${line}`)
+    .join("\n");
+}
+
+/**
+ * Shared shell fragment: resolve the evaluator copy the lock installed, and
+ * FAIL CLOSED with a clearly-framed "broken installation" block if
+ * anything about that resolution doesn't hold.
+ *
+ * ## Why this fails closed (v5 hardening, kept)
+ *
+ * Up to v4 the shims exited 0 ("fail open") when the evaluator copy was
+ * missing, which was empirically exploitable: deleting the evaluator left
+ * the hook in place and every mismatched-identity commit sailed through.
+ * "Hook installed but evaluator missing" is a broken installation, and
+ * the only safe reading of broken enforcement is to stop and say so.
+ *
+ * The complementary guarantee lives in `ShieldManager.disable()` (what
+ * Unlock runs): it removes every hook it owns — at the current hooks
+ * directory AND every directory in the durable installation record —
+ * strictly BEFORE deleting the evaluator/policy, so a *completed* unlock
+ * never leaves a hook behind to fail closed.
+ */
+function evaluatorResolutionFragment(action: "commit" | "push"): string {
   return `GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || GIT_COMMON_DIR=""
 if [ -z "$GIT_COMMON_DIR" ]; then
   {
-    echo ""
-    echo "Repo Identity Guard Shield"
-    echo ""
-    echo "${actionLabel} BLOCKED (Shield internal error: broken installation)"
-    echo ""
-    echo "This Shield hook is installed, but the repository's git-common-dir could not be resolved (\\"git rev-parse --path-format=absolute --git-common-dir\\" failed). Shield cannot find its policy or evaluator, so it cannot make a decision -- failing closed."
-    echo ""
-    echo "Note: \\"--path-format\\" requires Git 2.31 or newer, which is Shield's minimum supported Git version."
-    echo ""
-    echo "Next step: run \\"Repo Identity Guard: Repair Shield\\", or \\"Repo Identity Guard: Disable Shield\\" to remove Shield from this repository."
+${preludeLines(action, "broken_installation", "broken-installation")}
+    echo ''
+    echo 'Repo Identity Guard blocked this ${action} (internal error: broken installation).'
+    echo ''
+    echo 'This repository has an identity-lock hook installed, but its common Git directory could not be resolved'
+    echo '("git rev-parse --path-format=absolute --git-common-dir" failed -- Git 2.31 or newer is required), so the'
+    echo 'lock policy cannot be found and the assigned identity cannot be checked. Failing closed.'
+    echo ''
+${repairOrUnlock()}
   } >&2
   exit 1
 fi
@@ -125,20 +150,18 @@ fi
 EVAL_SCRIPT="$GIT_COMMON_DIR/repo-identity-guard/shield-evaluate.sh"
 
 # FAIL CLOSED, never open: a hook that is installed but whose evaluator is
-# missing/unreadable is a BROKEN Shield installation, not a disabled one.
+# missing/unreadable is a BROKEN lock installation, not an unlocked repo.
 if [ ! -f "$EVAL_SCRIPT" ] || [ ! -r "$EVAL_SCRIPT" ]; then
   {
-    echo ""
-    echo "Repo Identity Guard Shield"
-    echo ""
-    echo "${actionLabel} BLOCKED (Shield internal error: broken installation)"
-    echo ""
-    echo "This Shield hook is installed, but Shield's evaluator is missing or unreadable at:"
+${preludeLines(action, "broken_installation", "broken-installation")}
+    echo ''
+    echo 'Repo Identity Guard blocked this ${action} (internal error: broken installation).'
+    echo ''
+    echo 'This repository has an identity-lock hook installed, but the lock evaluator is missing or unreadable at:'
     echo "  $EVAL_SCRIPT"
-    echo ""
-    echo "Shield cannot decide whether this ${actionLabel === "COMMIT" ? "commit" : "push"} is safe, so it is failing closed rather than letting it through unchecked."
-    echo ""
-    echo "Next step: run \\"Repo Identity Guard: Repair Shield\\" to reinstall it, or \\"Repo Identity Guard: Disable Shield\\" to remove Shield from this repository (which also removes this hook)."
+    echo 'The assigned identity cannot be checked, so this ${action} is blocked rather than let through unchecked.'
+    echo ''
+${repairOrUnlock()}
   } >&2
   exit 1
 fi
@@ -147,37 +170,25 @@ fi
 
 /**
  * Shared shell fragment: hand off to a chained original foreign hook, if
- * one is present at `$ORIGINAL_HOOK`.
- *
- * v5 hardening: the sidecar is only ever executed when it is actually an
- * executable regular file. Up to v4 the shim `exec`'d anything that
- * existed, which produced a mysterious `exec: ...: Permission denied`
- * (empirically reproduced) whenever a *non-executable* foreign hook had
- * been chained — a failure with no explanation and no obvious owner.
- * `ShieldManager` now refuses to chain anything but an executable regular
- * file in the first place, so this branch should be unreachable in
- * practice; it exists so that a sidecar that becomes unexecutable
- * afterwards still produces a precise, attributable message instead of a
- * raw shell error. Missing sidecar = nothing was ever chained = exit 0.
- *
- * `$1` is the label used in the message ("COMMIT"/"PUSH"); `$2` is the
- * shell snippet that actually runs the original hook.
+ * one is present at `$ORIGINAL_HOOK`. The sidecar is only ever executed
+ * when it is actually an executable regular file (v5 hardening); a
+ * missing sidecar means nothing was ever chained, so the hook exits 0.
  */
-function chainedHandoffFragment(actionLabel: string, runOriginal: string): string {
+function chainedHandoffFragment(action: "commit" | "push", runOriginal: string): string {
   return `if [ -e "$ORIGINAL_HOOK" ] || [ -L "$ORIGINAL_HOOK" ]; then
   if [ ! -f "$ORIGINAL_HOOK" ] || [ ! -x "$ORIGINAL_HOOK" ]; then
     {
-      echo ""
-      echo "Repo Identity Guard Shield"
-      echo ""
-      echo "${actionLabel} BLOCKED (Shield internal error: broken hook chain)"
-      echo ""
-      echo "Shield's own check passed, but the chained original hook it was supposed to hand off to is not an executable regular file:"
+${preludeLines(action, "broken_hook_chain", "broken-hook-chain", "      ")}
+      echo ''
+      echo 'Repo Identity Guard blocked this ${action} (internal error: broken hook chain).'
+      echo ''
+      echo 'The identity check passed, but the pre-existing hook Repo Identity Guard chained is not an'
+      echo 'executable regular file:'
       echo "  $ORIGINAL_HOOK"
-      echo ""
-      echo "Shield will not guess whether that hook was meant to run, so it is failing closed instead of silently skipping it."
-      echo ""
-      echo "Next step: restore that file's executable permission, or run \\"Repo Identity Guard: Disable Shield\\" (which restores the original hook to its own path) and re-enable Shield afterwards."
+      echo 'Repo Identity Guard will not guess whether that hook was meant to run, so it is failing closed.'
+      echo ''
+      echo 'What to do: restore that file'"'"'s executable permission, or run "Repo Identity Guard: Unlock Current Repository"'
+      echo '(which restores the original hook to its own path) and assign the identity again afterwards.'
     } >&2
     exit 1
   fi
@@ -189,42 +200,34 @@ exit 0
 }
 
 /**
- * The pre-commit hook Shield installs (also installed as
- * `pre-merge-commit` — see `HOOK_SPECS` in `manager.ts`). Contains no
- * enforcement logic of its own — it only locates and runs the evaluator
- * copy Shield placed alongside the repo's policy (both under the shared
- * git-common-dir, so this resolves correctly from any worktree), which is
- * what makes enforcement work with VS Code completely closed.
+ * The pre-commit hook the identity lock installs (also installed as
+ * `pre-merge-commit` — see `HOOK_SPECS` in `manager.ts`, since a real merge
+ * commit runs that hook instead of pre-commit). Contains no enforcement
+ * logic of its own — it only locates and runs the evaluator copy installed
+ * alongside the lock policy (both under the shared git-common-dir, so this
+ * resolves correctly from any worktree), which is what makes enforcement
+ * work with VS Code completely closed.
  *
- * **Fails CLOSED** (v5) if the git-common-dir can't be resolved or that
- * evaluator copy is missing/unreadable — see
- * `evaluatorResolutionFragment` for the full reasoning and for why this
- * cannot leave a user permanently blocked after a completed Disable
- * Shield.
- *
- * Also, unconditionally, checks for a chained original hook (Phase 6 —
- * see `SHIELD_CHAIN_ORIGINAL_SUFFIX`) and hands off to it, with the same
- * argv, once Shield's own check has passed. This lookup costs nothing
- * when no original was ever chained (the sidecar file simply doesn't
- * exist), so this is the one script installed in both the "nothing else
- * was here" and "a foreign hook was moved aside" cases — never two
- * different script variants to keep in sync.
+ * The evaluator's block message is passed through VERBATIM (it already
+ * carries the machine-readable prelude). Output that does not start with
+ * that prelude means the evaluator crashed instead of deciding — still
+ * blocked, but framed as an internal error so "why was I blocked" is never
+ * answered wrong. Once the identity check passes, a chained original hook
+ * (see `SHIELD_CHAIN_ORIGINAL_SUFFIX`) is run with the same argv.
  */
 export function buildPreCommitHookScript(): string {
   return `#!/bin/sh
-# Repo Identity Guard Shield pre-commit hook (owned by Repo Identity Guard)
+# Repo Identity Guard identity-lock pre-commit hook (owned by Repo Identity Guard)
 # ${SHIELD_ARTIFACT_MARKER} v${SHIELD_ARTIFACT_VERSION} (pre-commit)
 #
-# Managed by Repo Identity Guard's Shield Mode. Do not hand-edit this file
-# -- "Repo Identity Guard: Repair Shield" regenerates it, and "Repo
-# Identity Guard: Disable Shield" removes it (only because that command
-# recognizes this exact marker comment; a hand-edited copy that keeps the
-# marker would still be recognized as Shield's own and be replaced/removed
-# by those commands -- if you need to customize hook behavior, chain your
-# own separate hook instead of editing this one).
+# Managed by Repo Identity Guard. Do not hand-edit this file -- "Repo
+# Identity Guard: Repair Identity Lock" regenerates it, and "Repo Identity
+# Guard: Unlock Current Repository" removes it (restoring any hook that was
+# chained behind it). If you need your own pre-commit logic, keep it in a
+# separate hook and let Repo Identity Guard chain it.
 set -eu
 
-${evaluatorResolutionFragment("COMMIT")}
+${evaluatorResolutionFragment("commit")}
 ORIGINAL_HOOK="$0${SHIELD_CHAIN_ORIGINAL_SUFFIX}"
 
 set +e
@@ -233,127 +236,84 @@ CODE=$?
 set -e
 
 if [ "$CODE" -ne 0 ]; then
-  # A structured policy reason always contains at least one "Shield: [id]"
-  # line (add_reason/fail_immediately's own format). Its ABSENCE means the
-  # evaluator crashed or exited before reaching a decision (e.g. an
-  # unbound variable under \`set -eu\`, a missing \`git\` on PATH, a corrupted
-  # copy of the script itself) -- that is a Shield bug, not a policy
-  # verdict, and must never be presented to the user as one. Both branches
-  # still fail closed (the commit is blocked either way); only the
-  # framing differs, so "why was I blocked" is never answered wrong.
   case "$REASON" in
-    *'Shield: ['*)
-      {
-        echo ""
-        echo "Repo Identity Guard Shield"
-        echo ""
-        echo "COMMIT BLOCKED"
-        echo ""
-        printf '%s\\n' "$REASON" | grep -v '^Shield: BLOCKED'
-        echo ""
-        echo "Fix the repository identity or disable Shield for this repository."
-      } >&2
+    REPO_IDENTITY_GUARD_BLOCK*)
+      printf '%s\\n' "$REASON" >&2
       ;;
     *)
       {
-        echo ""
-        echo "Repo Identity Guard Shield"
-        echo ""
-        echo "COMMIT BLOCKED (Shield internal error)"
-        echo ""
-        echo "Shield's evaluator failed unexpectedly instead of reaching a policy decision. Failing closed: the commit is blocked, but this is most likely a Shield bug or a corrupted Shield installation, not a problem with your commit."
-        echo ""
-        echo "Raw evaluator output:"
+${preludeLines("commit", "internal_error", "internal-error", "        ")}
+        echo ''
+        echo 'Repo Identity Guard blocked this commit (internal error).'
+        echo ''
+        echo 'The identity-lock evaluator failed unexpectedly instead of reaching a decision. Failing closed: the'
+        echo 'commit is blocked, but this is most likely a Repo Identity Guard bug or a damaged installation, not a'
+        echo 'problem with your commit.'
+        echo ''
+        echo 'Raw evaluator output:'
         printf '%s\\n' "$REASON"
-        echo ""
-        echo "Next step: re-run \\"sh $EVAL_SCRIPT commit\\" directly to see the full error, then repair or disable Shield for this repository. If this persists, please report it."
+        echo ''
+${repairOrUnlock("        ")}
       } >&2
       ;;
   esac
   exit "$CODE"
 fi
 
-# Shield allows this commit -- hand off to a pre-existing hook that was
-# moved aside when Shield was enabled/repaired with chaining (see
-# ShieldManager's chainForeignHooks option), if any. Its exit code becomes
+# The identity check passed -- hand off to a pre-existing hook that was
+# moved aside when the lock was installed, if any. Its exit code becomes
 # this hook's exit code: a chained tool's own failure (e.g. a linter) is
-# never silently swallowed. No original hook here means nothing to chain
-# -- exit 0.
-${chainedHandoffFragment("COMMIT", `  exec "$ORIGINAL_HOOK" "$@"`)}`;
+# never silently swallowed.
+${chainedHandoffFragment("commit", `  exec "$ORIGINAL_HOOK" "$@"`)}`;
 }
 
 /**
- * The pre-push hook Shield installs. Like the pre-commit hook, it contains
- * no enforcement logic of its own -- it forwards Git's own pre-push
- * arguments (`$1` = remote name, `$2` = remote location/URL) and its own
- * stdin (the `<local-ref> <local-sha1> <remote-ref> <remote-sha1>` lines
- * Git feeds a real pre-push hook) straight through to the evaluator copy
- * Shield placed alongside the repo's policy -- these are the actual
- * action-time values for THIS push, never a value predicted earlier by an
- * extension scan. **Fails CLOSED** (v5) if the evaluator copy is missing
- * or unreadable, for the same reason the pre-commit hook does.
+ * The pre-push hook the identity lock installs. Forwards Git's own
+ * pre-push arguments (`$1` = remote name, `$2` = remote location) and its
+ * stdin to the evaluator — the actual action-time values for THIS push.
  *
- * Also checks for a chained original hook (Phase 6 — see
- * `SHIELD_CHAIN_ORIGINAL_SUFFIX`), same as the pre-commit hook. Pre-push
- * is the one hook Git feeds meaningful stdin, and that stdin can only be
- * read once -- so unlike pre-commit's plain `exec`, this script captures
- * stdin to a temp file up front and feeds that same captured content to
- * BOTH the evaluator and (if Shield allows the push) the chained original
- * hook, each as its own independent read.
+ * Pre-push stdin can only be read once, so it is captured to a private
+ * `mktemp` file and handed to both the evaluator and (if allowed) a
+ * chained original hook. There is deliberately no predictable fallback
+ * path if `mktemp` fails (v5 hardening) — that fails closed.
  *
- * v5 hardening: if `mktemp` cannot create that private file, the script
- * fails closed as a Shield internal error. It used to fall back to a
- * *predictable* `${"$"}{TMPDIR:-/tmp}/repo-identity-guard-prepush-stdin.$$`
- * path and then truncate it (`: >`), which is a classic symlink/pre-
- * creation target in a shared temp directory: another local user who
- * pre-creates that path (the PID is guessable, and the file is truncated
- * and written unconditionally) gets Shield to clobber a file of their
- * choosing, and can read the pushed ref lines. A push is never worth
- * creating that hazard for, and "no secure temp file" is a broken
- * environment, not a policy verdict.
+ * v6: the remote LOCATION is never echoed in any message — an HTTPS
+ * remote URL can embed a username and token.
  */
 export function buildPrePushHookScript(): string {
   return `#!/bin/sh
-# Repo Identity Guard Shield pre-push hook (owned by Repo Identity Guard)
+# Repo Identity Guard identity-lock pre-push hook (owned by Repo Identity Guard)
 # ${SHIELD_ARTIFACT_MARKER} v${SHIELD_ARTIFACT_VERSION} (pre-push)
 #
-# Managed by Repo Identity Guard's Shield Mode. Do not hand-edit this file
-# -- "Repo Identity Guard: Repair Shield" regenerates it, and "Repo
-# Identity Guard: Disable Shield" removes it (only because that command
-# recognizes this exact marker comment; a hand-edited copy that keeps the
-# marker would still be recognized as Shield's own and be replaced/removed
-# by those commands -- if you need to customize hook behavior, chain your
-# own separate hook instead of editing this one).
+# Managed by Repo Identity Guard. Do not hand-edit this file -- "Repo
+# Identity Guard: Repair Identity Lock" regenerates it, and "Repo Identity
+# Guard: Unlock Current Repository" removes it (restoring any hook that was
+# chained behind it). If you need your own pre-push logic, keep it in a
+# separate hook and let Repo Identity Guard chain it.
 set -eu
 
 REMOTE_NAME="\${1:-}"
 REMOTE_LOCATION="\${2:-}"
 
-${evaluatorResolutionFragment("PUSH")}
+${evaluatorResolutionFragment("push")}
 ORIGINAL_HOOK="$(dirname "$0")/pre-push${SHIELD_CHAIN_ORIGINAL_SUFFIX}"
 
 # Git's <local-ref> <local-sha1> <remote-ref> <remote-sha1> lines arrive on
-# stdin exactly once. A chained original hook may need the very same
-# lines the evaluator reads, so they're captured to a private temp file up
-# front and handed to each consumer as its own independent read -- never
-# split, never guessed at, never left for only one of the two to see.
-#
-# No predictable fallback path: if mktemp cannot create a private file,
-# this fails closed as a Shield internal error rather than creating (and
-# truncating!) a guessable path in a world-writable directory.
+# stdin exactly once; a chained original hook may need the very same
+# lines, so they're captured to a private temp file up front. No
+# predictable fallback path: if mktemp fails, this fails closed rather
+# than creating (and truncating!) a guessable path in a shared directory.
 STDIN_CAPTURE=$(mktemp "\${TMPDIR:-/tmp}/repo-identity-guard-prepush-stdin.XXXXXX" 2>/dev/null) || STDIN_CAPTURE=""
 if [ -z "$STDIN_CAPTURE" ] || [ ! -f "$STDIN_CAPTURE" ]; then
   {
-    echo ""
-    echo "Repo Identity Guard Shield"
-    echo ""
-    echo "PUSH BLOCKED (Shield internal error)"
-    echo ""
-    echo "Shield could not create a private temporary file (via mktemp) to hold this push's ref lines, so it cannot evaluate the push. Failing closed."
-    echo ""
-    echo "Shield deliberately does NOT fall back to a predictable temporary file name here -- doing so would let any other local user pre-create or symlink that path."
-    echo ""
-    echo "Next step: check that \\"\${TMPDIR:-/tmp}\\" exists, is writable, and has free space/inodes, then retry."
+${preludeLines("push", "internal_error", "internal-error")}
+    echo ''
+    echo 'Repo Identity Guard blocked this push (internal error).'
+    echo ''
+    echo 'Could not create a private temporary file (via mktemp) to hold this push'"'"'s ref lines, so the push cannot'
+    echo 'be evaluated. Repo Identity Guard deliberately does not fall back to a predictable temporary file name.'
+    echo ''
+    echo "What to do: check that \\"\${TMPDIR:-/tmp}\\" exists, is writable, and has free space, then retry."
   } >&2
   exit 1
 fi
@@ -367,53 +327,34 @@ CODE=$?
 set -e
 
 if [ "$CODE" -ne 0 ]; then
-  # See the pre-commit hook's identical comment: a structured policy
-  # reason always contains a "Shield: [id]" line; its absence means the
-  # evaluator itself crashed, which is a Shield bug, not a policy verdict
-  # -- both still fail closed (block the push), only the framing differs.
   case "$REASON" in
-    *'Shield: ['*)
-      {
-        echo ""
-        echo "Repo Identity Guard Shield"
-        echo ""
-        echo "PUSH BLOCKED"
-        echo ""
-        echo "Remote: $REMOTE_NAME"
-        echo "Destination: $REMOTE_LOCATION"
-        echo ""
-        printf '%s\\n' "$REASON" | grep -v '^Shield: BLOCKED'
-        echo ""
-        echo "Fix the push destination/route or disable Shield for this repository."
-      } >&2
+    REPO_IDENTITY_GUARD_BLOCK*)
+      printf '%s\\n' "$REASON" >&2
       ;;
     *)
       {
-        echo ""
-        echo "Repo Identity Guard Shield"
-        echo ""
-        echo "PUSH BLOCKED (Shield internal error)"
-        echo ""
-        echo "Remote: $REMOTE_NAME"
-        echo "Destination: $REMOTE_LOCATION"
-        echo ""
-        echo "Shield's evaluator failed unexpectedly instead of reaching a policy decision. Failing closed: the push is blocked, but this is most likely a Shield bug or a corrupted Shield installation, not a problem with your push."
-        echo ""
-        echo "Raw evaluator output:"
+${preludeLines("push", "internal_error", "internal-error", "        ")}
+        echo "REMOTE: $REMOTE_NAME"
+        echo ''
+        echo 'Repo Identity Guard blocked this push (internal error).'
+        echo ''
+        echo 'The identity-lock evaluator failed unexpectedly instead of reaching a decision. Failing closed: the'
+        echo 'push is blocked, but this is most likely a Repo Identity Guard bug or a damaged installation, not a'
+        echo 'problem with your push.'
+        echo ''
+        echo 'Raw evaluator output:'
         printf '%s\\n' "$REASON"
-        echo ""
-        echo "Next step: re-run \\"sh $EVAL_SCRIPT push $REMOTE_NAME $REMOTE_LOCATION\\" directly to see the full error, then repair or disable Shield for this repository. If this persists, please report it."
+        echo ''
+${repairOrUnlock("        ")}
       } >&2
       ;;
   esac
   exit "$CODE"
 fi
 
-# Shield allows this push -- hand off to a pre-existing hook that was
-# moved aside when Shield was enabled/repaired with chaining, if any,
-# feeding it the exact same stdin Git gave this hook. Its exit code
-# becomes this hook's exit code -- a chained tool's own failure (e.g. a
-# force-push guard) is never silently swallowed. Not \`exec\`: the trap
-# above must still fire to clean up the captured stdin file.
-${chainedHandoffFragment("PUSH", `  "$ORIGINAL_HOOK" "$@" < "$STDIN_CAPTURE"\n  exit $?`)}`;
+# The push identity check passed -- hand off to a pre-existing hook that
+# was moved aside when the lock was installed, if any, feeding it the
+# exact same stdin. Not \`exec\`: the trap above must still fire to clean
+# up the captured stdin file.
+${chainedHandoffFragment("push", `  "$ORIGINAL_HOOK" "$@" < "$STDIN_CAPTURE"\n  exit $?`)}`;
 }

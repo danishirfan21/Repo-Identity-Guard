@@ -1,22 +1,25 @@
-import { Capability } from "../types";
-
 /**
- * Git operations Shield Mode can guard. Deliberately a closed, explicit set
- * — never inferred from an arbitrary command line or hook name string, so a
- * new hook type can never silently start being "guarded" just because Git
- * happens to invoke a same-named script.
+ * Git operations the identity lock's enforcement engine can guard.
+ * Deliberately a closed, explicit set — never inferred from an arbitrary
+ * command line or hook name string, so a new hook type can never silently
+ * start being "guarded" just because Git happens to invoke a same-named
+ * script.
+ *
+ * (Historical note: this engine was previously exposed to users as
+ * "Shield Mode". It is now an internal implementation detail of the
+ * identity lock — see `src/identity/identityLockService.ts` — and the
+ * `Shield*` names below are kept only because renaming hardened internals
+ * buys nothing functionally.)
  */
 export type ShieldAction = "commit" | "push";
 
 export const SHIELD_ACTIONS: readonly ShieldAction[] = ["commit", "push"];
 
 /**
- * Shield's own lifecycle, distinct from the SAFE/NOT SAFE/NOT CHECKED
- * safety verdict — a repo can be perfectly SAFE while Shield itself is
- * "off", and a repo can be NOT SAFE while Shield is "active" and correctly
- * blocking the operation that caused it. See docs/SHIELD_MODE.md
- * "Lifecycle states" for the full definition of each state and how a hook
- * (once one exists, in a later phase) should behave in each.
+ * The enforcement engine's own on-disk lifecycle. Internal only: the
+ * product-facing state is `RepoIdentityState.enforcement.state`
+ * (`unassigned` / `active` / `needs_attention` / `unavailable`), which
+ * `IdentityLockService` derives from this plus the lock policy.
  */
 export type ShieldLifecycleState = "off" | "active" | "degraded" | "broken";
 
@@ -29,23 +32,21 @@ export const SHIELD_LIFECYCLE_STATES: readonly ShieldLifecycleState[] = [
 
 /**
  * Stable, machine-readable reason identifiers a {@link ShieldDecision} can
- * carry. These are a public contract: once shipped, an id's *meaning* must
- * never change, and ids are additive-only (never renumbered or repurposed).
- * A future hook script, log line, or telemetry event keys off these ids —
- * never off the human-readable `message`, which can be reworded freely.
+ * carry. These are a public contract — they appear verbatim in the
+ * `REASON_ID:` line of every block message a hook prints, which AI agents
+ * and scripts may key off — so an id's *meaning* must never change.
+ *
+ * The taxonomy is deliberately narrow: the identity lock answers exactly
+ * one question ("is this commit/push using the assigned identity?"), so
+ * the only reasons are about commit identity, push identity (and the
+ * transport facts needed to establish it), and the lock's own integrity.
+ * Branch policy, repository-operation state and push-destination ownership
+ * reasons were removed together with those product features.
  */
 export type ShieldReasonId =
-  | "profile-unresolved"
-  | "profile-conflict"
   | "commit-identity-mismatch"
   | "commit-identity-override"
-  | "protected-branch"
-  | "detached-head"
-  | "repo-operation-in-progress"
-  | "merge-conflicts"
-  | "push-destination-mismatch"
   | "push-route-unverified"
-  | "push-route-mismatch"
   | "push-route-override"
   | "push-account-mismatch"
   | "push-account-unverified"
@@ -54,17 +55,9 @@ export type ShieldReasonId =
   | "inspection-failed";
 
 export const SHIELD_REASON_IDS: readonly ShieldReasonId[] = [
-  "profile-unresolved",
-  "profile-conflict",
   "commit-identity-mismatch",
   "commit-identity-override",
-  "protected-branch",
-  "detached-head",
-  "repo-operation-in-progress",
-  "merge-conflicts",
-  "push-destination-mismatch",
   "push-route-unverified",
-  "push-route-mismatch",
   "push-route-override",
   "push-account-mismatch",
   "push-account-unverified",
@@ -77,32 +70,19 @@ export function isShieldReasonId(value: unknown): value is ShieldReasonId {
   return typeof value === "string" && (SHIELD_REASON_IDS as readonly string[]).includes(value);
 }
 
-/**
- * One reason a {@link ShieldDecision} denied (or would have denied) an
- * action. `capability` links back to the existing six-capability vocabulary
- * (see `../types`'s `Capability`) when this reason corresponds directly to
- * one of those checks, so the same underlying fact is never worded two
- * different ways between the sidebar and a Shield hook's terminal output.
- * Not every reason maps to a capability (e.g. `policy-missing` is a Shield
- * concept with no sidebar equivalent).
- */
+/** One reason a {@link ShieldDecision} denied an action. */
 export interface ShieldReason {
   id: ShieldReasonId;
   message: string;
-  capability?: Capability;
 }
 
 /**
- * The result of evaluating one Git action against the current policy and
- * current Git state, at the moment it's about to happen.
+ * The result of evaluating one Git action against the current lock policy
+ * and current Git state, at the moment it's about to happen.
  *
  * A ShieldDecision is a **point-in-time snapshot, never a cache**: it must
  * be recomputed by re-reading Git state at the moment of the action (inside
- * the hook, once hooks exist), never reused from an earlier sidebar scan.
- * The sidebar's `StatusSummary` can be minutes old by the time a commit
- * actually happens (an agent can act long after the last scan); a
- * ShieldDecision that guards a real Git operation cannot afford that same
- * staleness. See docs/SHIELD_MODE.md "Decisions are never cached".
+ * the hook), never reused from an earlier extension scan.
  */
 export interface ShieldDecision {
   action: ShieldAction;
@@ -129,14 +109,7 @@ export function denyDecision(
   return { action, allowed: false, reasons, evaluatedAt };
 }
 
-/**
- * Builds a decision from whatever reasons were collected during
- * evaluation: allowed when there are none, denied (with all of them
- * surfaced, not just the first) otherwise. This is the shape an evaluator
- * should use — collect every applicable reason, then call this once, so a
- * denial always explains everything wrong at once rather than one problem
- * per attempt.
- */
+/** Builds a decision from whatever reasons were collected during evaluation: allowed when there are none, denied otherwise. */
 export function decisionFromReasons(
   action: ShieldAction,
   reasons: ShieldReason[],

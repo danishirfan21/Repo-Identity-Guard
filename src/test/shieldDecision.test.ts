@@ -27,8 +27,8 @@ test("denyDecision carries every reason given, not just the first", () => {
   const decision = denyDecision(
     "commit",
     [
-      { id: "protected-branch", message: "on main" },
-      { id: "commit-identity-mismatch", message: "wrong identity" },
+      { id: "push-route-unverified", message: "https" },
+      { id: "push-account-unverified", message: "unverified" },
     ],
     2000,
   );
@@ -56,8 +56,31 @@ test("every ShieldReasonId has a catalog entry with a non-empty description (com
   assert.deepEqual(Object.keys(SHIELD_REASON_CATALOG).sort(), [...SHIELD_REASON_IDS].sort());
 });
 
+test("the reason taxonomy is exactly the identity-lock set: commit identity, push identity (and its transport), and lock integrity", () => {
+  assert.deepEqual([...SHIELD_REASON_IDS].sort(), [
+    "commit-identity-mismatch",
+    "commit-identity-override",
+    "inspection-failed",
+    "policy-corrupt",
+    "policy-missing",
+    "push-account-mismatch",
+    "push-account-unverified",
+    "push-route-override",
+    "push-route-unverified",
+  ]);
+  const codes = SHIELD_REASON_IDS.map((id) => SHIELD_REASON_CATALOG[id].code);
+  assert.equal(new Set(codes).size, codes.length, "machine codes must be unique");
+  for (const code of codes) assert.match(code, /^[a-z_]+$/);
+  assert.equal(SHIELD_REASON_CATALOG["commit-identity-mismatch"].code, "wrong_identity");
+  assert.equal(SHIELD_REASON_CATALOG["push-account-mismatch"].code, "wrong_push_account");
+});
+
 test("isShieldReasonId accepts only known reason ids", () => {
-  assert.equal(isShieldReasonId("protected-branch"), true);
+  assert.equal(isShieldReasonId("commit-identity-mismatch"), true);
+  // Retired with the branch-policy / repo-state / destination features:
+  for (const retired of ["protected-branch", "detached-head", "repo-operation-in-progress", "merge-conflicts", "push-destination-mismatch", "profile-unresolved", "profile-conflict"]) {
+    assert.equal(isShieldReasonId(retired), false, retired);
+  }
   assert.equal(isShieldReasonId("policy-corrupt"), true);
   assert.equal(isShieldReasonId("not-a-real-reason"), false);
   assert.equal(isShieldReasonId(42), false);

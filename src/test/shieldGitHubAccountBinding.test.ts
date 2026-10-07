@@ -5,12 +5,13 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { Identity } from "../identity/types";
 import { ShieldManager } from "../shield/manager";
-import { Profile, RepoFacts } from "../types";
+import { WORK_IDENTITY_WITH_LOGIN, enableLock } from "./testUtil/lockFixtures";
 
 /**
- * Integration tests for Shield Mode Phase 5's verified GitHub SSH account
- * binding — the real `resources/shield/shield-evaluate.sh`, a real
+ * Integration tests for the identity lock's verified GitHub SSH account
+ * binding (originally Shield Mode Phase 5) — the real `resources/shield/shield-evaluate.sh`, a real
  * temporary Git repo, and a real bare remote, exactly like
  * `shieldPrePush.test.ts` (Phase 4). What's different here is the fake
  * `ssh` shadowed onto PATH also answers `ssh -G <alias>` and
@@ -25,18 +26,7 @@ import { Profile, RepoFacts } from "../types";
  */
 
 const execFileAsync = promisify(execFile);
-const EVALUATOR_SOURCE = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
-
-const workProfile: Profile = {
-  id: "work",
-  label: "Work",
-  gitName: "Danish Irfan",
-  gitEmail: "work@example.com",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  strictPushSetup: true,
-  trustedSshHostAliases: ["github-work"],
-  expectedGitHubLogin: "danish-work",
-};
+const workProfile: Identity = WORK_IDENTITY_WITH_LOGIN;
 
 interface Repo {
   dir: string;
@@ -220,37 +210,8 @@ async function cleanup(...dirs: string[]): Promise<void> {
   await Promise.all(dirs.map((dir) => fs.rm(dir, { recursive: true, force: true }).catch(() => undefined)));
 }
 
-function approvedFacts(repo: Repo, overrides: Partial<RepoFacts> = {}): RepoFacts {
-  return {
-    isGitRepo: true,
-    repoRoot: repo.dir,
-    repoName: path.basename(repo.dir),
-    remoteHost: "github-work",
-    remoteOwner: "AcmeSoftware",
-    remoteRepo: "acme-frontend",
-    // Phase 8: `approvedPushDestination` is built from the pushRemote*
-    // facts (the destination a plain `git push` actually reaches), never
-    // from origin's fetch facts. These fixtures describe the ordinary
-    // "origin is also the push destination" arrangement, so both sets
-    // agree; tests that deliberately separate them override pushRemote*.
-    pushRemoteName: "origin",
-    pushRemoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git",
-    pushRemoteProtocol: "ssh" as const,
-    pushRemoteHost: "github-work",
-    pushRemoteOwner: "AcmeSoftware",
-    pushRemoteRepo: "acme-frontend",
-    ...overrides,
-  };
-}
-
-async function enableShield(
-  manager: ShieldManager,
-  repo: Repo,
-  facts: RepoFacts,
-  profiles: Profile[] = [workProfile],
-  env?: NodeJS.ProcessEnv,
-): Promise<void> {
-  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles, protectedBranches: [], env });
+async function enableShield(manager: ShieldManager, repo: Repo, identity: Identity = workProfile): Promise<void> {
+  const result = await enableLock(manager, repo.dir, identity, { requireComplete: true });
   assert.equal(result.ok, true, `enable() should succeed: ${result.inspection.reasons.join("; ")}`);
 }
 
@@ -261,27 +222,14 @@ interface Scenario {
   fakeSshBin: string;
 }
 
-async function setUpScenario(profiles: Profile[] = [workProfile], enableEnvOverrides: NodeJS.ProcessEnv = {}): Promise<Scenario> {
+async function setUpScenario(identity: Identity = workProfile): Promise<Scenario> {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   const fakeSshBin = await makeFakeSshBin();
   const bare = await makeBareRemote(remoteParent, "AcmeSoftware", "acme-frontend");
-  const manager = new ShieldManager();
-  // Round-2 release-blocker fix: enable() now resolves and persists the
-  // approved destination's REAL canonical SSH endpoint via a live
-  // `ssh -G` call (see ShieldManager.canonicalizeDestination). Threading
-  // the fake ssh's PATH-shadowing directory through here (via the new
-  // ShieldEnableInput.env, rather than mutating this test process's real
-  // global environment) is what makes that resolution see the fake
-  // "github-work -> github.com" route instead of failing to find a real
-  // `ssh` binary at all. `enableEnvOverrides` lets a scenario simulate
-  // "the alias already resolved to a non-default endpoint (e.g.
-  // ssh.github.com:443) when Shield was enabled" — i.e. the REALISTIC
-  // baseline for a test whose push later exercises that same endpoint,
-  // as opposed to a genuine post-enable repoint (covered separately in
-  // shieldEvaluator.test.ts and shieldCoexistenceAndIntegrity.test.ts).
-  const enableEnv = { ...repo.env, ...enableEnvOverrides, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
-  await enableShield(manager, repo, approvedFacts(repo), profiles, enableEnv);
+  // No SSH resolution happens at install time any more: the account is
+  // verified live, over the push's own route, on every push.
+  await enableShield(new ShieldManager(), repo, identity);
   await git(repo, ["remote", "add", "origin", `git@github-work:${bare}`]);
   return { repo, remoteParent, bare, fakeSshBin };
 }
@@ -328,7 +276,7 @@ test("authenticated as a different GitHub account -> push-account-mismatch, bloc
     });
     assert.notEqual(result.code, 0);
     assert.equal(await remoteRefSha(scenario.bare), null);
-    assert.match(result.stderr, /PUSH BLOCKED/);
+    assert.match(result.stderr, /Repo Identity Guard blocked this push/);
     assert.match(result.stderr, /push-account-mismatch/);
     assert.match(result.stderr, /danish-work/);
     assert.match(result.stderr, /danish-personal/);
@@ -447,27 +395,11 @@ test("route not strongly bound (IdentitiesOnly not set) -> unverified without ev
   }
 });
 
-// ==================== non-strict profile ====================
-
-test("a non-strict profile never runs account verification even with a mismatched account set up to respond", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
-  const relaxedProfile: Profile = { ...workProfile, strictPushSetup: false };
-  const scenario = await setUpScenario([relaxedProfile]);
-  try {
-    const result = await pushWithFakeSsh(scenario, {
-      FAKE_SSH_AUTH_OUTPUT: "Hi danish-personal! You've successfully authenticated, but GitHub does not provide shell access.\n",
-    });
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(await remoteRefSha(scenario.bare), await git(scenario.repo, ["rev-parse", "HEAD"]));
-  } finally {
-    await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
-  }
-});
-
 // ==================== no expectedGitHubLogin ====================
 
-test("a profile without expectedGitHubLogin never runs account verification (route trust alone is sufficient, unchanged from Phase 4)", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
-  const noLoginProfile: Profile = { ...workProfile, expectedGitHubLogin: undefined };
-  const scenario = await setUpScenario([noLoginProfile]);
+test("an identity without expectedGitHubLogin (commit-only lock) never runs account verification and never blocks a push", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
+  const noLoginProfile: Identity = { ...workProfile, expectedGitHubLogin: undefined };
+  const scenario = await setUpScenario(noLoginProfile);
   try {
     // No FAKE_SSH_AUTH_OUTPUT set at all -- if the evaluator incorrectly
     // attempted verification anyway, the fake ssh's default empty output
@@ -535,11 +467,7 @@ test("a look-alike hostname (github.com.evil.example) is not a GitHub endpoint",
 });
 
 test("GitHub's documented alternative endpoint (ssh.github.com on port 443) IS accepted", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
-  // The alias already resolved to ssh.github.com:443 when Shield was
-  // enabled (see setUpScenario's enableEnvOverrides doc comment) -- this
-  // test is about the alternate endpoint being ACCEPTED as a stable
-  // arrangement, not about a route that changed between enable and push.
-  const scenario = await setUpScenario([workProfile], { FAKE_SSH_HOSTNAME: "ssh.github.com", FAKE_SSH_PORT: "443" });
+  const scenario = await setUpScenario();
   try {
     const result = await pushWithFakeSsh(scenario, {
       FAKE_SSH_HOSTNAME: "ssh.github.com",
@@ -561,7 +489,7 @@ test("an `ssh -G` that reports no hostname at all -> unverified, never assumed f
       FAKE_SSH_AUTH_OUTPUT: "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.\n",
     });
     assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /could not resolve this SSH route's effective destination/);
+    assert.match(result.stderr, /reported no effective hostname/);
   } finally {
     await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
   }

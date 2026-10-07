@@ -1,140 +1,98 @@
-import { Profile } from "../types";
+import type { Identity } from "../identity/types";
 import { SHIELD_ACTIONS, ShieldAction } from "./types";
 
 /**
- * Bumped whenever ShieldPolicy's shape changes in a way that isn't purely
- * additive-optional. A hook (once one exists) reading a policy with an
- * unrecognized/newer version, or an older version it doesn't know how to
- * interpret, should treat that as `policy-corrupt` rather than guess.
+ * Lock policy schema version.
  *
- * v1 -> v2 (independent-review release blocker): `approvedPushDestination`
- * gained `canonicalHost`/`canonicalPort`, resolved via a real `ssh -G` at
- * enable/repair time and required for destination host matching — see
- * `destinationReasons()` in evaluator.ts. A v1 policy never captured this,
- * so treating one as v2 would let a repointed SSH alias masquerade as an
- * unchanged destination purely because its literal name never changed
- * (the exact hole this version bump exists to close). v1 policies are
- * therefore deliberately rejected as `policy-corrupt` rather than
- * silently reinterpreted — Shield fails closed on every commit/push until
- * "Repair Shield" regenerates a v2 policy with a real canonical
- * resolution.
+ * - v1/v2 were the retired "Shield Mode" policy: a profile matched by
+ *   remote owner, plus branch protection, an approved push destination,
+ *   and a user-facing `strictPushSetup` switch. They are never enforced by
+ *   this build — the shell evaluator rejects them as `policy-corrupt`
+ *   (fail closed), and `IdentityLockService.migrateLegacy` either converts
+ *   a provable explicit binding into a v3 lock or removes the legacy
+ *   installation (see `src/identity/legacyMigration.ts`).
+ * - v3 is the identity lock: one explicitly assigned identity, nothing
+ *   else. It is also the durable assignment record itself (see
+ *   `src/identity/assignment.ts`).
  */
-export const SHIELD_POLICY_VERSION = 2 as const;
+export const SHIELD_POLICY_VERSION = 3 as const;
+
+/** Policy versions written by earlier releases — recognized only so they can be migrated, never enforced. */
+export const LEGACY_SHIELD_POLICY_VERSIONS: readonly number[] = [1, 2];
 
 /**
- * Non-secret, non-cached intent for enforcing Git safety on one underlying
- * repository. This is deliberately a description of *what the user asked
- * for* — never a snapshot of the last computed SAFE/NOT SAFE result. See
- * docs/SHIELD_MODE.md "Policy represents intent, not cached status."
+ * Non-secret description of the identity one repository is locked to.
+ * Represents explicit user intent (the assignment), never a cached
+ * verdict. Every field is either already visible in settings.json (the
+ * identity fields) or random bookkeeping (`lockId`).
  *
- * Never include: access tokens, passwords, private SSH key material,
- * credential-helper output, or `.env` contents. Every field here is either
- * already visible in `settings.json` (profile fields) or is itself
- * non-secret Git-facts-derived data (a canonical repo key, a push
- * destination's host/owner/repo, a branch name) — nothing that couldn't be
- * read by anyone with read access to the repository and its remote.
+ * Never include: access tokens, passwords, private SSH key material or
+ * paths, credential-helper output, or `.env` contents.
  */
 export interface ShieldPolicy {
   policyVersion: typeof SHIELD_POLICY_VERSION;
-  /** Epoch milliseconds this policy was generated — lets a hook or the sidebar notice a policy that predates a later profile edit. */
+  /**
+   * Random id minted when the identity was assigned (kept stable across
+   * repairs and identity re-syncs of the same assignment, replaced when a
+   * different identity is assigned). Lets a UI/test tell "this exact
+   * assignment" apart from a later one; never a security boundary.
+   */
+  lockId: string;
+  /** Epoch milliseconds the assignment was made. */
+  assignedAt: number;
+  /** Epoch milliseconds this policy file was (re)generated. */
   generatedAt: number;
 
-  matchedProfileId: string;
-  profileLabel: string;
+  identityId: string;
+  identityLabel: string;
 
   expectedGitName?: string;
   expectedGitEmail: string;
 
-  /** Canonical `host/owner/repo` (lowercased) this policy is scoped to, when the repo has a resolvable remote. Never a disk path. */
-  approvedRepositoryKey?: string;
-
-  /** Where a plain push is expected to land, as non-secret facts only — never credentials for reaching it. */
-  approvedPushDestination?: {
-    /** Literal host/alias as it appeared in the push URL at enable/repair time — display only, never compared against for identity (see `canonicalHost`). */
-    host?: string;
-    owner?: string;
-    repo?: string;
-    /**
-     * The REAL physical endpoint `ssh -G` resolved this destination to at
-     * enable/repair time (or, for an HTTPS destination, the literal host
-     * itself — HTTPS has no local `~/.ssh/config` alias indirection to
-     * canonicalize away). This, never `host`, is what destination
-     * matching compares against: `host` can be a bare alias name
-     * (`github-work`) that `~/.ssh/config` can silently repoint to a
-     * different endpoint at any time without this policy's literal text
-     * ever changing — comparing literal `host` strings would miss exactly
-     * that repointing. Undefined means Shield could not establish a
-     * canonical endpoint when this policy was last built (an SSH
-     * transport override was in effect, `ssh` was unavailable, or
-     * resolution failed) — see `destinationReasons()` in evaluator.ts,
-     * which fails closed whenever this is absent, never treating it as a
-     * license to fall back to `host`.
-     */
-    canonicalHost?: string;
-    /** The effective port `canonicalHost` was resolved on, when it could affect destination identity (a non-default SSH port is part of "which physical endpoint," not incidental). Undefined exactly when `canonicalHost` is. */
-    canonicalPort?: string;
-  };
-
-  /** SSH host aliases this profile explicitly trusts as push routes (see Profile.trustedSshHostAliases). Never a private key or its fingerprint. */
+  /** github.com login every push must authenticate as. Absent = pushes are not account-checked. */
+  expectedGitHubLogin?: string;
+  /** SSH aliases accepted as push routes for `expectedGitHubLogin` (see `Identity.trustedSshHostAliases`). */
   trustedSshHostAliases: string[];
 
   /**
-   * The GitHub authenticated username a trusted SSH route is expected to
-   * prove itself as (Shield Mode Phase 5) — copied verbatim from
-   * `Profile.expectedGitHubLogin`. Distinct from `expectedGitEmail` (a
-   * local Git commit identity) and from `approvedPushDestination.owner`
-   * (the repository's owner/org) — see `Profile.expectedGitHubLogin`'s doc
-   * comment for why these three must never be conflated. Undefined means
-   * this profile doesn't request account-level verification; route trust
-   * alone (see `trustedSshHostAliases`) is all Shield checks in that case.
+   * Exactly the actions enforced: always `commit`; `push` if and only if
+   * `expectedGitHubLogin` is set. Validated for that consistency in both
+   * TypeScript and the shell evaluator, so a hand-edited policy cannot
+   * silently drop commit enforcement or claim push enforcement with no
+   * account to enforce.
    */
-  expectedGitHubLogin?: string;
-
-  strictPushSetup: boolean;
-
-  /** Local branch-protection list in effect when this policy was generated (global config, not profile-specific). */
-  protectedBranches: string[];
-  /** This profile's expected branch name patterns. */
-  expectedBranchPatterns: string[];
-
-  /** Which Shield actions this policy governs. An action not listed here is never blocked by this policy. */
-  enabledActions: ShieldAction[];
+  enforcedActions: ShieldAction[];
 }
 
 export interface ShieldPolicyInput {
-  profile: Profile;
-  approvedRepositoryKey?: string;
-  approvedPushDestination?: { host?: string; owner?: string; repo?: string; canonicalHost?: string; canonicalPort?: string };
-  protectedBranches: string[];
-  enabledActions: ShieldAction[];
+  identity: Identity;
+  lockId: string;
+  assignedAt: number;
   now?: number;
 }
 
-/**
- * Builds a policy purely from already-known, already-non-secret inputs —
- * no I/O, no Git invocation. The caller (a future phase) is responsible for
- * gathering `approvedRepositoryKey`/`approvedPushDestination` from
- * `RepoFacts` and for persisting the result; this function only shapes the
- * data.
- */
+/** The actions a lock for this identity enforces — see `ShieldPolicy.enforcedActions`. */
+export function enforcedActionsFor(identity: Pick<Identity, "expectedGitHubLogin">): ShieldAction[] {
+  return identity.expectedGitHubLogin ? ["commit", "push"] : ["commit"];
+}
+
+/** Builds a policy purely from already-validated, non-secret inputs — no I/O. */
 export function buildShieldPolicy(input: ShieldPolicyInput): ShieldPolicy {
-  const { profile } = input;
-  return {
+  const { identity } = input;
+  const policy: ShieldPolicy = {
     policyVersion: SHIELD_POLICY_VERSION,
+    lockId: input.lockId,
+    assignedAt: input.assignedAt,
     generatedAt: input.now ?? Date.now(),
-    matchedProfileId: profile.id,
-    profileLabel: profile.label,
-    expectedGitName: profile.gitName,
-    expectedGitEmail: profile.gitEmail,
-    approvedRepositoryKey: input.approvedRepositoryKey,
-    approvedPushDestination: input.approvedPushDestination,
-    trustedSshHostAliases: [...(profile.trustedSshHostAliases ?? [])],
-    expectedGitHubLogin: profile.expectedGitHubLogin,
-    strictPushSetup: !!profile.strictPushSetup,
-    protectedBranches: [...input.protectedBranches],
-    expectedBranchPatterns: [...(profile.expectedBranchPatterns ?? [])],
-    enabledActions: [...input.enabledActions],
+    identityId: identity.id,
+    identityLabel: identity.label,
+    expectedGitEmail: identity.gitEmail,
+    trustedSshHostAliases: [...(identity.trustedSshHostAliases ?? [])],
+    enforcedActions: enforcedActionsFor(identity),
   };
+  if (identity.gitName) policy.expectedGitName = identity.gitName;
+  if (identity.expectedGitHubLogin) policy.expectedGitHubLogin = identity.expectedGitHubLogin;
+  return policy;
 }
 
 export interface ShieldPolicyValidationError {
@@ -150,13 +108,17 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");
 }
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
 /**
  * Structurally validates an arbitrary value as a {@link ShieldPolicy}.
- * Deliberately hand-rolled (no schema library dependency) and deliberately
- * strict about `policyVersion`: a policy written by a future, newer version
- * of Repo Identity Guard must not be silently accepted and misinterpreted
- * by an older one — that's exactly the kind of silent-drift failure Shield
- * exists to prevent elsewhere, so it must not tolerate it in itself.
+ * Deliberately hand-rolled and strict about `policyVersion`: a policy from
+ * an older (legacy Shield) or newer release must never be silently
+ * reinterpreted. Mirrored 1:1 by the schema checks in
+ * `resources/shield/shield-evaluate.sh`; the parser fuzz suite keeps them
+ * in agreement.
  */
 export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResult {
   const errors: ShieldPolicyValidationError[] = [];
@@ -169,70 +131,59 @@ export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResu
   if (v.policyVersion !== SHIELD_POLICY_VERSION) {
     errors.push({
       path: "policyVersion",
-      message: `Expected policyVersion ${SHIELD_POLICY_VERSION}, got ${JSON.stringify(v.policyVersion)}.`,
+      message:
+        typeof v.policyVersion === "number" && LEGACY_SHIELD_POLICY_VERSIONS.includes(v.policyVersion)
+          ? `This is a legacy Shield policy (version ${v.policyVersion}); it must be migrated, not enforced.`
+          : `Expected policyVersion ${SHIELD_POLICY_VERSION}, got ${JSON.stringify(v.policyVersion)}.`,
     });
   }
-  if (typeof v.generatedAt !== "number" || !Number.isFinite(v.generatedAt)) {
-    errors.push({ path: "generatedAt", message: "generatedAt must be a finite number (epoch milliseconds)." });
+  if (!isNonEmptyString(v.lockId)) {
+    errors.push({ path: "lockId", message: "lockId must be a non-empty string." });
   }
-  if (typeof v.matchedProfileId !== "string" || v.matchedProfileId.length === 0) {
-    errors.push({ path: "matchedProfileId", message: "matchedProfileId must be a non-empty string." });
+  for (const key of ["assignedAt", "generatedAt"] as const) {
+    if (typeof v[key] !== "number" || !Number.isFinite(v[key])) {
+      errors.push({ path: key, message: `${key} must be a finite number (epoch milliseconds).` });
+    }
   }
-  if (typeof v.profileLabel !== "string" || v.profileLabel.length === 0) {
-    errors.push({ path: "profileLabel", message: "profileLabel must be a non-empty string." });
+  for (const key of ["identityId", "identityLabel", "expectedGitEmail"] as const) {
+    if (!isNonEmptyString(v[key])) {
+      errors.push({ path: key, message: `${key} must be a non-empty string.` });
+    }
   }
-  if (v.expectedGitName !== undefined && typeof v.expectedGitName !== "string") {
-    errors.push({ path: "expectedGitName", message: "expectedGitName must be a string when present." });
-  }
-  if (typeof v.expectedGitEmail !== "string" || v.expectedGitEmail.length === 0) {
-    errors.push({ path: "expectedGitEmail", message: "expectedGitEmail must be a non-empty string." });
-  }
-  if (v.approvedRepositoryKey !== undefined && typeof v.approvedRepositoryKey !== "string") {
-    errors.push({ path: "approvedRepositoryKey", message: "approvedRepositoryKey must be a string when present." });
-  }
-  if (v.approvedPushDestination !== undefined) {
-    const dest = v.approvedPushDestination;
-    if (typeof dest !== "object" || dest === null || Array.isArray(dest)) {
-      errors.push({ path: "approvedPushDestination", message: "approvedPushDestination must be an object when present." });
-    } else {
-      const d = dest as Record<string, unknown>;
-      for (const key of ["host", "owner", "repo", "canonicalHost", "canonicalPort"] as const) {
-        if (d[key] !== undefined && typeof d[key] !== "string") {
-          errors.push({ path: `approvedPushDestination.${key}`, message: `${key} must be a string when present.` });
-        }
-      }
+  for (const key of ["expectedGitName", "expectedGitHubLogin"] as const) {
+    if (v[key] !== undefined && typeof v[key] !== "string") {
+      errors.push({ path: key, message: `${key} must be a string when present.` });
     }
   }
   if (!isStringArray(v.trustedSshHostAliases)) {
     errors.push({ path: "trustedSshHostAliases", message: "trustedSshHostAliases must be an array of strings." });
   }
-  if (v.expectedGitHubLogin !== undefined && typeof v.expectedGitHubLogin !== "string") {
-    errors.push({ path: "expectedGitHubLogin", message: "expectedGitHubLogin must be a string when present." });
-  }
-  if (typeof v.strictPushSetup !== "boolean") {
-    errors.push({ path: "strictPushSetup", message: "strictPushSetup must be a boolean." });
-  }
-  if (!isStringArray(v.protectedBranches)) {
-    errors.push({ path: "protectedBranches", message: "protectedBranches must be an array of strings." });
-  }
-  if (!isStringArray(v.expectedBranchPatterns)) {
-    errors.push({ path: "expectedBranchPatterns", message: "expectedBranchPatterns must be an array of strings." });
-  }
-  if (!Array.isArray(v.enabledActions) || v.enabledActions.some((a) => !SHIELD_ACTIONS.includes(a as ShieldAction))) {
+
+  if (!Array.isArray(v.enforcedActions) || v.enforcedActions.some((a) => !SHIELD_ACTIONS.includes(a as ShieldAction))) {
     errors.push({
-      path: "enabledActions",
-      message: `enabledActions must be an array containing only ${SHIELD_ACTIONS.join(", ")}.`,
+      path: "enforcedActions",
+      message: `enforcedActions must be an array containing only ${SHIELD_ACTIONS.join(", ")}.`,
     });
+  } else {
+    const actions = v.enforcedActions as ShieldAction[];
+    if (!actions.includes("commit")) {
+      errors.push({ path: "enforcedActions", message: 'enforcedActions must include "commit" — a lock always enforces commit identity.' });
+    }
+    const hasLogin = isNonEmptyString(v.expectedGitHubLogin);
+    if (actions.includes("push") !== hasLogin) {
+      errors.push({
+        path: "enforcedActions",
+        message: 'enforcedActions must include "push" exactly when expectedGitHubLogin is set.',
+      });
+    }
   }
 
-  // Secret-shaped-field guard: reject known secret-ish keys outright, so a
-  // policy accidentally built from the wrong source object (e.g. one that
-  // still carries a token/password field) fails validation instead of
-  // silently persisting to disk.
+  // Secret-shaped-field guard: a policy accidentally built from the wrong
+  // source object must fail validation instead of silently persisting.
   const forbiddenKeys = ["token", "accessToken", "password", "privateKey", "sshKey", "credentials", "secret"];
   for (const key of forbiddenKeys) {
     if (key in v) {
-      errors.push({ path: key, message: `Policy must not contain a "${key}" field — Shield policy is non-secret by design.` });
+      errors.push({ path: key, message: `Policy must not contain a "${key}" field — the lock policy is non-secret by design.` });
     }
   }
 
@@ -240,37 +191,27 @@ export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResu
     return { ok: false, errors };
   }
 
-  return {
-    ok: true,
-    policy: {
-      policyVersion: SHIELD_POLICY_VERSION,
-      generatedAt: v.generatedAt as number,
-      matchedProfileId: v.matchedProfileId as string,
-      profileLabel: v.profileLabel as string,
-      expectedGitName: v.expectedGitName as string | undefined,
-      expectedGitEmail: v.expectedGitEmail as string,
-      approvedRepositoryKey: v.approvedRepositoryKey as string | undefined,
-      approvedPushDestination: v.approvedPushDestination as ShieldPolicy["approvedPushDestination"],
-      trustedSshHostAliases: v.trustedSshHostAliases as string[],
-      expectedGitHubLogin: v.expectedGitHubLogin as string | undefined,
-      strictPushSetup: v.strictPushSetup as boolean,
-      protectedBranches: v.protectedBranches as string[],
-      expectedBranchPatterns: v.expectedBranchPatterns as string[],
-      enabledActions: v.enabledActions as ShieldAction[],
-    },
+  const policy: ShieldPolicy = {
+    policyVersion: SHIELD_POLICY_VERSION,
+    lockId: v.lockId as string,
+    assignedAt: v.assignedAt as number,
+    generatedAt: v.generatedAt as number,
+    identityId: v.identityId as string,
+    identityLabel: v.identityLabel as string,
+    expectedGitEmail: v.expectedGitEmail as string,
+    trustedSshHostAliases: v.trustedSshHostAliases as string[],
+    enforcedActions: v.enforcedActions as ShieldAction[],
   };
+  if (typeof v.expectedGitName === "string") policy.expectedGitName = v.expectedGitName;
+  if (typeof v.expectedGitHubLogin === "string") policy.expectedGitHubLogin = v.expectedGitHubLogin;
+  return { ok: true, policy };
 }
 
 export function serializeShieldPolicy(policy: ShieldPolicy): string {
   return JSON.stringify(policy, null, 2);
 }
 
-/**
- * Parses and validates a policy from raw JSON text (as it would be read
- * from disk). Malformed JSON is reported the same shape as a structural
- * validation failure — both collapse to "policy-corrupt" for a caller,
- * without needing to distinguish JSON.parse failures from schema failures.
- */
+/** Parses and validates a policy from raw JSON text. Malformed JSON and schema failures collapse to the same shape. */
 export function parseShieldPolicy(json: string): ShieldPolicyValidationResult {
   let parsed: unknown;
   try {
@@ -282,4 +223,35 @@ export function parseShieldPolicy(json: string): ShieldPolicyValidationResult {
     };
   }
   return validateShieldPolicy(parsed);
+}
+
+/**
+ * The only two facts a legacy (v1/v2) Shield policy contributes to
+ * migration: which legacy profile it was enabled for, and which canonical
+ * `host/owner/repo` key it approved. Read leniently (anything missing is
+ * simply undefined) because a legacy policy is never enforced from here —
+ * it only ever serves as evidence that MIGHT prove an explicit binding.
+ * Returns `undefined` when the text is not a legacy policy at all.
+ */
+export interface LegacyPolicyInfo {
+  policyVersion: number;
+  matchedProfileId?: string;
+  approvedRepositoryKey?: string;
+}
+
+export function readLegacyPolicyInfo(json: string): LegacyPolicyInfo | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const v = parsed as Record<string, unknown>;
+  if (typeof v.policyVersion !== "number" || !LEGACY_SHIELD_POLICY_VERSIONS.includes(v.policyVersion)) return undefined;
+  return {
+    policyVersion: v.policyVersion,
+    matchedProfileId: isNonEmptyString(v.matchedProfileId) ? v.matchedProfileId : undefined,
+    approvedRepositoryKey: isNonEmptyString(v.approvedRepositoryKey) ? v.approvedRepositoryKey : undefined,
+  };
 }

@@ -6,14 +6,14 @@ import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { evaluatePush, resolveSshCommandOverrides } from "../shield/evaluator";
-import { ShieldPolicy, buildShieldPolicy, serializeShieldPolicy } from "../shield/policy";
+import { ShieldPolicy, serializeShieldPolicy } from "../shield/policy";
 import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
-import { Profile } from "../types";
+import { WORK_IDENTITY, WORK_IDENTITY_WITH_LOGIN, testPolicy } from "./testUtil/lockFixtures";
 import { makeFakeSshBin, withFakeSshOnPath } from "./testUtil/fakeSsh";
 import { runEvaluatorScript } from "./testUtil/evaluatorShell";
 
 /**
- * PART 3 — does Shield verify the SAME SSH route `git push` will use?
+ * PART 3 — does the identity lock verify the SAME SSH route `git push` will use?
  *
  * ## What was found
  *
@@ -60,24 +60,10 @@ import { runEvaluatorScript } from "./testUtil/evaluatorShell";
 const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
 
-const strictProfile: Profile = {
-  id: "work",
-  label: "Work",
-  gitEmail: "work@example.com",
-  gitName: "Danish Irfan",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  strictPushSetup: true,
-  trustedSshHostAliases: ["github-work"],
-};
-
+// A lock that expects a GitHub login is strict by definition: an
+// unprovable push route is blocked, never assumed correct.
 function policy(): ShieldPolicy {
-  return buildShieldPolicy({
-    profile: strictProfile,
-    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" },
-    protectedBranches: ["main"],
-    enabledActions: ["commit", "push"],
-    now: 1,
-  });
+  return testPolicy(WORK_IDENTITY_WITH_LOGIN);
 }
 
 const TRUSTED_URL = "git@github-work:AcmeSoftware/acme-frontend.git";
@@ -119,12 +105,10 @@ async function runPush(cwd: string, env: NodeJS.ProcessEnv, configArgs: string[]
   return { code, stderr };
 }
 
-// Memoized: the release-blocker destination-host-canonicalization fix
-// (resolve_canonical_ssh_host in resources/shield/shield-evaluate.sh) now
-// calls "ssh -G" unconditionally for every ssh-protocol push (not only
-// Phase 5 account verification), so these tests need a real `ssh` on PATH
-// to resolve TRUSTED_URL's "github-work" alias to the approved
-// "github.com" host — a fake shim stands in for a real ~/.ssh/config alias.
+// Memoized fake `ssh` answering the account probe (`ssh -G` -> github.com
+// with IdentitiesOnly, `ssh -T` -> authenticated as danish-work), standing
+// in for a real ~/.ssh/config alias, so the no-override baseline push is
+// genuinely ALLOWED and every block below is attributable to the override.
 let fakeSshBinPromise: Promise<string> | undefined;
 function fakeSshBin(): Promise<string> {
   if (!fakeSshBinPromise) fakeSshBinPromise = makeFakeSshBin();
@@ -134,6 +118,7 @@ function fakeSshBin(): Promise<string> {
 const baseEnv = async (): Promise<NodeJS.ProcessEnv> => {
   const env = { ...process.env };
   for (const key of ["GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_CONFIG_PARAMETERS"]) delete env[key];
+  env.FAKE_SSH_AUTH_OUTPUT = "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.";
   return withFakeSshOnPath(env, await fakeSshBin());
 };
 
@@ -144,11 +129,11 @@ async function cleanup(dir: string): Promise<void> {
 // ==================== the newly-detected divergence ====================
 
 for (const variant of ["plink", "tortoiseplink", "putty", "simple"]) {
-  test(`PART 3 — ssh.variant=${variant} makes the route UNVERIFIABLE and blocks a strict push (previously undetected)`, async () => {
+  test(`PART 3 — ssh.variant=${variant} makes the route UNVERIFIABLE and blocks the push (previously undetected)`, async () => {
     const repo = await makeRepo();
     try {
       // Without the variant, this exact push is allowed: the alias is
-      // trusted and there is no expectedGitHubLogin to verify.
+      // trusted and authenticates as the expected account.
       const allowed = await runPush(repo, (await baseEnv()));
       assert.equal(allowed.code, 0, allowed.stderr);
 
@@ -156,20 +141,13 @@ for (const variant of ["plink", "tortoiseplink", "putty", "simple"]) {
       assert.notEqual(blocked.code, 0);
       assert.match(blocked.stderr, /push-route-override/);
       assert.match(blocked.stderr, new RegExp(`ssh\\.variant=${variant}`));
-      // Release-blocker fix: the override also makes the aliased route's
-      // destination unprovable (canonicalizing "github-work" -> "github.com"
-      // via "ssh -G" can no longer be trusted), so a destination-mismatch
-      // reason now accompanies push-route-override — proven independently
-      // in the dedicated release-blocker test below.
-      assert.match(blocked.stderr, /push-destination-mismatch/);
 
       // The TypeScript reference reaches the same decision from the same facts.
       const overrides = resolveSshCommandOverrides({ sshVariantConfig: variant });
       assert.deepEqual(overrides, [`ssh.variant=${variant}`]);
       const decision = evaluatePush(policy(), { remoteName: "origin", remoteUrl: TRUSTED_URL, sshCommandOverrides: overrides });
       assert.equal(decision.allowed, false);
-      assert.ok(decision.reasons.some((r) => r.id === "push-route-override"));
-      assert.ok(decision.reasons.some((r) => r.id === "push-destination-mismatch"));
+      assert.deepEqual(decision.reasons.map((r) => r.id), ["push-route-override"]);
     } finally {
       await cleanup(repo);
     }
@@ -277,79 +255,21 @@ test("PART 3 — all four override families at once are reported together, in th
   }
 });
 
-// Round-2 release-blocker fix removed the ONE thing that used to let this
-// test isolate strictness gating for ROUTE/ACCOUNT trust from destination
-// canonicalization: a literal host-string match no longer satisfies SSH
-// destination matching AT ALL (see destinationReasons() in evaluator.ts) —
-// so a transport override now ALWAYS makes an SSH push's destination
-// unprovable too, regardless of whether the literal alias text happens to
-// match the policy's recorded host. That "regardless of strictPushSetup"
-// behavior is exactly what the very next test proves. What remains true,
-// and is what this test now proves instead, is the baseline it was built
-// to isolate: with NO override at all, a relaxed profile's unverified
-// route is genuinely non-blocking, and the SAME aliased destination
-// canonicalizes and matches normally.
-test("PART 3 — a non-strict profile's aliased route/destination is allowed with no transport override present (baseline for the override tests below)", async () => {
-  const repo = await fs.mkdtemp(path.join(os.tmpdir(), "shield-ssh-variant-lax-"));
+test("PART 3 — a commit-only lock (no expected GitHub login) makes no claim about pushes, so a transport override does not block", async () => {
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), "shield-ssh-variant-commit-only-"));
   try {
     await execFileAsync("git", ["init", "-q"], { cwd: repo });
     const { stdout } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo });
-    const commonDir = stdout.trim();
-    await fs.mkdir(shieldStorageDir(commonDir), { recursive: true });
-    await fs.writeFile(
-      shieldPolicyFilePath(commonDir),
-      serializeShieldPolicy(
-        buildShieldPolicy({
-          profile: { ...strictProfile, strictPushSetup: false },
-          approvedPushDestination: { host: "github-work", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" },
-          protectedBranches: ["main"],
-          enabledActions: ["commit", "push"],
-          now: 1,
-        }),
-      ),
-    );
-    const result = await runPush(repo, await baseEnv());
+    await fs.mkdir(shieldStorageDir(stdout.trim()), { recursive: true });
+    await fs.writeFile(shieldPolicyFilePath(stdout.trim()), serializeShieldPolicy(testPolicy(WORK_IDENTITY)));
+    const result = await runPush(repo, { ...(await baseEnv()), GIT_SSH_VARIANT: "plink", GIT_SSH_COMMAND: "ssh -v" });
     assert.equal(result.code, 0, result.stderr);
   } finally {
     await cleanup(repo);
   }
 });
 
-test("PART 3 — release-blocker fix: a transport override makes an ALIASED route's destination unprovable too, and blocks regardless of strictPushSetup", async () => {
-  // Same TRUSTED_URL/repo as the rest of this file: approvedPushDestination
-  // names "github.com", but TRUSTED_URL's literal host is the "github-work"
-  // alias -- ordinarily reconciled by canonicalizing the alias via "ssh -G"
-  // (see resolve_canonical_ssh_host). A transport override makes that
-  // resolution untrustworthy (a different program may actually speak SSH),
-  // so the destination itself becomes unprovable -- and per this fix, that
-  // fails closed independent of strictPushSetup, unlike route/account trust.
-  const repo = await fs.mkdtemp(path.join(os.tmpdir(), "shield-ssh-variant-lax-dest-"));
-  try {
-    await execFileAsync("git", ["init", "-q"], { cwd: repo });
-    const { stdout } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo });
-    const commonDir = stdout.trim();
-    await fs.mkdir(shieldStorageDir(commonDir), { recursive: true });
-    await fs.writeFile(
-      shieldPolicyFilePath(commonDir),
-      serializeShieldPolicy(
-        buildShieldPolicy({
-          profile: { ...strictProfile, strictPushSetup: false },
-          approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" },
-          protectedBranches: ["main"],
-          enabledActions: ["commit", "push"],
-          now: 1,
-        }),
-      ),
-    );
-    const result = await runPush(repo, { ...(await baseEnv()), GIT_SSH_VARIANT: "plink" });
-    assert.notEqual(result.code, 0, "a transport override must make an unresolved alias's destination fail closed");
-    assert.match(result.stderr, /push-destination-mismatch/);
-  } finally {
-    await cleanup(repo);
-  }
-});
-
-test("PART 3 — Shield never executes the VALUE of a transport override to inspect it", async () => {
+test("PART 3 — the lock never executes the VALUE of a transport override to inspect it", async () => {
   const repo = await makeRepo();
   const marker = path.join(repo, "SHOULD-NEVER-EXIST");
   try {

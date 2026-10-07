@@ -6,16 +6,17 @@ import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ShieldManager } from "../shield/manager";
-import { Profile, RepoFacts } from "../types";
+import { WORK_IDENTITY, enableLock } from "./testUtil/lockFixtures";
 
 /**
- * PART 15 — the bypasses Shield does NOT close, proven and kept honest.
+ * PART 15 — the bypasses the identity lock does NOT close, proven and kept honest.
  *
  * These tests exist to FAIL if someone ever "fixes" one of them, or starts
- * describing Shield as something it is not. Shield is a safety net against
- * ordinary accidental unsafe Git operations. It is not, and cannot be, a
+ * describing the lock as something it is not. It is a safety net against
+ * ACCIDENTAL use of the wrong identity. It is not, and cannot be, a
  * defence against a user or process willing to pass a flag or run a shell
- * command — no client-side hook mechanism can be.
+ * command — no client-side hook mechanism can be — and that is explicitly
+ * outside the threat model.
  *
  * The three documented boundaries:
  *
@@ -35,16 +36,8 @@ import { Profile, RepoFacts } from "../types";
 
 const execFileAsync = promisify(execFile);
 const EVALUATOR_SOURCE = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
+void execFileAsync;
 const REPO_ROOT = path.join(__dirname, "..", "..");
-
-const profile: Profile = {
-  id: "work",
-  label: "Work",
-  gitName: "Danish Irfan",
-  gitEmail: "work@example.com",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  strictPushSetup: false,
-};
 
 interface Repo {
   dir: string;
@@ -83,25 +76,11 @@ async function makeShieldedRepo(): Promise<Repo> {
   gitSync(repo, ["add", "f.txt"]);
   gitSync(repo, ["commit", "-q", "-m", "init"]);
 
-  const facts: RepoFacts = {
-    isGitRepo: true,
-    repoRoot: dir,
-    currentBranch: "main",
-    remoteHost: "github.com",
-    remoteOwner: "AcmeSoftware",
-    remoteRepo: "thing",
-    pushRemoteHost: "github.com",
-    pushRemoteOwner: "AcmeSoftware",
-    pushRemoteRepo: "thing",
-  };
-  const result = await new ShieldManager().enable(dir, EVALUATOR_SOURCE, {
-    facts,
-    profiles: [profile],
-    // "main" protected, so an ordinary commit on main is blocked and the
-    // bypass is unambiguous: it is the flag doing it, not a lenient policy.
-    protectedBranches: ["main"],
-  });
+  const result = await enableLock(new ShieldManager(), dir, WORK_IDENTITY);
   assert.equal(result.inspection.state, "active", result.inspection.reasons.join(" | "));
+  // The WRONG identity is configured from here on, so an ordinary commit is
+  // blocked and every bypass below is unambiguously the flag's doing.
+  gitSync(repo, ["config", "user.email", "personal@example.com"]);
   return repo;
 }
 
@@ -111,28 +90,28 @@ async function cleanup(repo: Repo): Promise<void> {
 
 // ==================== the bypasses themselves ====================
 
-test("PART 15 — Shield genuinely blocks the ordinary case, so the bypasses below are attributable to the flag", async () => {
+test("PART 15 — the lock genuinely blocks the ordinary case, so the bypasses below are attributable to the flag", async () => {
   const repo = await makeShieldedRepo();
   try {
     await fs.writeFile(path.join(repo.dir, "a.txt"), "x\n");
     gitSync(repo, ["add", "a.txt"]);
     const blocked = await gitTry(repo, ["commit", "-q", "-m", "ordinary"]);
-    assert.notEqual(blocked.code, 0, "Shield did not block a commit on a protected branch");
-    assert.match(blocked.stderr, /COMMIT BLOCKED/);
-    assert.match(blocked.stderr, /protected-branch/);
+    assert.notEqual(blocked.code, 0, "the lock did not block a commit with the wrong identity");
+    assert.match(blocked.stderr, /REPO_IDENTITY_GUARD_BLOCK/);
+    assert.match(blocked.stderr, /commit-identity-mismatch/);
   } finally {
     await cleanup(repo);
   }
 });
 
-test("KNOWN BYPASS (PART 15): `git commit -n` — the SHORT form of --no-verify — skips Shield exactly the same way", async () => {
+test("KNOWN BYPASS (PART 15): `git commit -n` — the SHORT form of --no-verify — skips the lock exactly the same way", async () => {
   const repo = await makeShieldedRepo();
   try {
     await fs.writeFile(path.join(repo.dir, "a.txt"), "x\n");
     gitSync(repo, ["add", "a.txt"]);
     const result = await gitTry(repo, ["commit", "-q", "-n", "-m", "bypassed with the short flag"]);
     assert.equal(result.code, 0, result.stderr);
-    assert.doesNotMatch(result.stderr, /COMMIT BLOCKED/);
+    assert.doesNotMatch(result.stderr, /REPO_IDENTITY_GUARD_BLOCK/);
     // Documented Git behavior, identical to --no-verify. Recorded here so
     // that "we block --no-verify" can never be believed on the strength of
     // a test that only ever tried the long form.
@@ -156,22 +135,22 @@ test("KNOWN BYPASS (PART 15): `git merge --no-verify` skips the pre-merge-commit
     gitSync(repo, ["add", "main.txt"]);
     gitSync(repo, ["commit", "-q", "-n", "-m", "main"]);
 
-    // Without the flag, Shield blocks it (main is protected).
+    // Without the flag, the lock blocks it (wrong identity).
     const blocked = await gitTry(repo, ["merge", "--no-ff", "-m", "merge", "side"]);
-    assert.notEqual(blocked.code, 0, "Shield did not block a merge commit on a protected branch");
-    assert.match(blocked.stderr, /COMMIT BLOCKED/);
+    assert.notEqual(blocked.code, 0, "the lock did not block a merge commit with the wrong identity");
+    assert.match(blocked.stderr, /REPO_IDENTITY_GUARD_BLOCK/);
     await gitTry(repo, ["merge", "--abort"]);
 
     // With it, the merge commit is created unchecked.
     const bypassed = await gitTry(repo, ["merge", "--no-ff", "--no-verify", "-m", "merge", "side"]);
     assert.equal(bypassed.code, 0, bypassed.stderr);
-    assert.doesNotMatch(bypassed.stderr, /COMMIT BLOCKED/);
+    assert.doesNotMatch(bypassed.stderr, /REPO_IDENTITY_GUARD_BLOCK/);
   } finally {
     await cleanup(repo);
   }
 });
 
-test("KNOWN BYPASS (PART 15): deleting Shield's hook files by hand disables enforcement, and Shield reports that honestly", async () => {
+test("KNOWN BYPASS (PART 15): deleting the lock's hook files by hand disables enforcement, and the lock reports that honestly", async () => {
   const repo = await makeShieldedRepo();
   try {
     const hooksDir = gitSync(repo, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"]);
@@ -204,11 +183,13 @@ const SHIPPED_TEXT_FILES = [
   "src/shield/artifacts.ts",
   "src/shield/manager.ts",
   "src/shield/reasonCatalog.ts",
-  "src/webview/client/settingsView.ts",
+  "docs/IDENTITY_LOCK.md",
+  "src/webview/client/placeholderView.ts",
+  "src/identity/identityLockService.ts",
   "resources/shield/shield-evaluate.sh",
 ];
 
-test("PART 15 — nothing anywhere claims Shield cannot be bypassed", async () => {
+test("PART 15 — nothing anywhere claims the lock cannot be bypassed", async () => {
   const overclaims: Array<[RegExp, string]> = [
     [/\bunbypassable\b/i, "\"unbypassable\""],
     [/\bcannot be bypassed\b/i, "\"cannot be bypassed\""],
@@ -236,7 +217,7 @@ test("PART 15 — nothing anywhere claims Shield cannot be bypassed", async () =
 });
 
 test("PART 15 — the three documented bypasses are still named, in the user-facing docs", async () => {
-  for (const relative of ["README.md", "docs/SHIELD_MODE.md"]) {
+  for (const relative of ["README.md", "docs/IDENTITY_LOCK.md", "docs/SHIELD_MODE.md"]) {
     const text = await fs.readFile(path.join(REPO_ROOT, relative), "utf8");
     assert.match(text, /--no-verify/, `${relative} no longer documents the --no-verify bypass`);
     assert.match(text, /core\.hooksPath/, `${relative} no longer documents the core.hooksPath bypass`);

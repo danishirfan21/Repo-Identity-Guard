@@ -10,7 +10,8 @@ import { ShieldInspection, ShieldManager } from "../shield/manager";
 import { shieldEvaluatorScriptFilePath, shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
 import { shieldInstallRecordFilePath } from "../shield/installRecord";
 import { fuzzSeed, rngFrom } from "./fuzzHarness";
-import { Profile, RepoFacts } from "../types";
+import type { Identity } from "../identity/types";
+import { WORK_IDENTITY } from "./testUtil/lockFixtures";
 
 /**
  * PART 10 — lifecycle state-machine torture test.
@@ -62,15 +63,14 @@ const HOOK_NAMES = ["pre-commit", "pre-merge-commit", "pre-push"] as const;
  */
 const INSPECT_OPTIONS = { evaluatorScriptSource: EVALUATOR_SOURCE } as const;
 
-const profileA: Profile = {
-  id: "work",
-  label: "Work",
-  gitName: "Danish Irfan",
-  gitEmail: "work@example.com",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  strictPushSetup: false,
-};
-const profileB: Profile = { ...profileA, gitEmail: "work2@example.com", strictPushSetup: true, expectedGitHubLogin: "danish-work" };
+// A commit-only identity, and one that also enforces push identity (all
+// three hooks governed) — repairs alternate between them.
+const profileA: Identity = WORK_IDENTITY;
+const profileB: Identity = { ...WORK_IDENTITY, gitEmail: "work2@example.com", expectedGitHubLogin: "danish-work" };
+
+function lockInput(identity: Identity, chainForeignHooks?: boolean) {
+  return { identity, lockId: "torture", assignedAt: 1, chainForeignHooks };
+}
 
 interface Repo {
   dir: string;
@@ -115,20 +115,6 @@ async function makeRepo(): Promise<Repo> {
 
 async function hooksDirOf(repo: Repo): Promise<string> {
   return git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"]);
-}
-
-function factsFor(repo: Repo, owner = "AcmeSoftware"): RepoFacts {
-  return {
-    isGitRepo: true,
-    repoRoot: repo.dir,
-    currentBranch: "main",
-    remoteHost: "github.com",
-    remoteOwner: owner,
-    remoteRepo: "thing",
-    pushRemoteHost: "github.com",
-    pushRemoteOwner: owner,
-    pushRemoteRepo: "thing",
-  };
 }
 
 async function readBytes(file: string): Promise<Buffer | null> {
@@ -198,9 +184,11 @@ async function assertInvariants(repo: Repo, manager: ShieldManager, inspection: 
     assert.equal(inspection.evaluatorModified, false, `active with a modified evaluator\n${where}`);
     assert.equal(inspection.evaluatorVersion, SHIELD_ARTIFACT_VERSION, `active with an outdated evaluator\n${where}`);
     assert.deepEqual(inspection.orphanedHookPaths, [], `active with recorded orphans\n${where}`);
-    assert.equal(inspection.policyProfileDrift, false, `active with profile drift\n${where}`);
-    assert.equal(inspection.pushDestinationDrift, false, `active with push-destination drift\n${where}`);
-    for (const hook of inspection.hooks) {
+    assert.equal(inspection.identityDrift, false, `active with identity drift\n${where}`);
+    const enforced = inspection.policySnapshot?.enforcedActions ?? ["commit", "push"];
+    // Every hook governing an ENFORCED action is the lock's own. (A
+    // commit-only lock may leave a foreign pre-push hook alone.)
+    for (const hook of inspection.hooks.filter((h) => enforced.includes(h.action))) {
       assert.equal(hook.ownership, "shield", `active with a ${hook.ownership} ${hook.fileName}\n${where}`);
       assert.equal(hook.contentModified, false, `active with a modified ${hook.fileName}\n${where}`);
       assert.equal(hook.version, SHIELD_ARTIFACT_VERSION, `active with an outdated ${hook.fileName}\n${where}`);
@@ -236,23 +224,13 @@ function operations(rng: ReturnType<typeof rngFrom>): Op[] {
     {
       name: "enable",
       run: async (repo, manager) => {
-        await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-          facts: factsFor(repo),
-          profiles: [profileA],
-          protectedBranches: ["main"],
-          chainForeignHooks: rng.bool(0.4),
-        });
+        await manager.enable(repo.dir, EVALUATOR_SOURCE, lockInput(profileA, rng.bool(0.4)));
       },
     },
     {
       name: "repair",
       run: async (repo, manager) => {
-        await manager.repair(repo.dir, EVALUATOR_SOURCE, {
-          facts: factsFor(repo),
-          profiles: [rng.bool() ? profileA : profileB],
-          protectedBranches: ["main"],
-          chainForeignHooks: rng.bool(0.4),
-        });
+        await manager.repair(repo.dir, EVALUATOR_SOURCE, lockInput(rng.bool() ? profileA : profileB, rng.bool(0.4)));
       },
     },
     { name: "disable", run: async (repo, manager) => void (await manager.disable(repo.dir)) },
@@ -413,11 +391,7 @@ test("PART 10 — randomized lifecycle sequences never break Shield's invariants
         await fs.rm(file, { force: true });
         repo.foreign.delete(file);
       }
-      const repaired = await manager.repair(repo.dir, EVALUATOR_SOURCE, {
-        facts: factsFor(repo),
-        profiles: [profileA],
-        protectedBranches: ["main"],
-      });
+      const repaired = await manager.repair(repo.dir, EVALUATOR_SOURCE, lockInput(profileB));
       assert.equal(
         repaired.inspection.state,
         "active",
@@ -426,11 +400,7 @@ test("PART 10 — randomized lifecycle sequences never break Shield's invariants
       await assertInvariants(repo, manager, repaired.inspection, `seed ${SEED}, sequence ${sequence}, final repair`);
 
       // Idempotence: a second repair changes nothing.
-      const again = await manager.repair(repo.dir, EVALUATOR_SOURCE, {
-        facts: factsFor(repo),
-        profiles: [profileA],
-        protectedBranches: ["main"],
-      });
+      const again = await manager.repair(repo.dir, EVALUATOR_SOURCE, lockInput(profileB));
       assert.equal(again.inspection.state, "active");
 
       const off = await manager.disable(repo.dir);
@@ -480,11 +450,9 @@ test("PART 10 — a corrupted state never reports ACTIVE, for every single-fault
   for (const [label, corrupt] of corruptions) {
     const repo = await makeRepo();
     try {
-      const enabled = await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-        facts: factsFor(repo),
-        profiles: [profileA],
-        protectedBranches: ["main"],
-      });
+      // profileB enforces push too, so all three hooks are governed and
+      // every single-fault corruption below must surface.
+      const enabled = await manager.enable(repo.dir, EVALUATOR_SOURCE, lockInput(profileB));
       assert.equal(enabled.inspection.state, "active", `precondition failed for "${label}"`);
 
       await corrupt(repo);
@@ -494,11 +462,7 @@ test("PART 10 — a corrupted state never reports ACTIVE, for every single-fault
 
       // ...and every one of them is recoverable, then cleanly removable.
       await git(repo, ["config", "--unset", "core.hooksPath"]).catch(() => undefined);
-      const repaired = await manager.repair(repo.dir, EVALUATOR_SOURCE, {
-        facts: factsFor(repo),
-        profiles: [profileA],
-        protectedBranches: ["main"],
-      });
+      const repaired = await manager.repair(repo.dir, EVALUATOR_SOURCE, lockInput(profileB));
       assert.equal(repaired.inspection.state, "active", `"${label}" was not repairable: ${repaired.inspection.reasons.join(" | ")}`);
       assert.equal((await manager.disable(repo.dir)).state, "off", `"${label}" was not cleanly disableable`);
       assert.deepEqual(await liveShieldHooks(repo), [], `"${label}" left Shield hooks behind after disable`);
@@ -520,7 +484,7 @@ test("PART 10 — a foreign hook is never deleted by enable, repair, or disable,
       repo.foreign.set(path.join(hooksDir, name), foreignBody);
     }
 
-    const input = { facts: factsFor(repo), profiles: [profileA], protectedBranches: ["main"] };
+    const input = lockInput(profileB);
     for (const step of ["enable", "repair", "disable", "enable"] as const) {
       if (step === "disable") await manager.disable(repo.dir);
       else await manager[step](repo.dir, EVALUATOR_SOURCE, input);

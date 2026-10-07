@@ -1,75 +1,135 @@
 #!/bin/sh
-# shield-evaluate.sh — Shield Mode's standalone enforcement evaluator.
-# repo-identity-guard-shield-artifact v5 (evaluator)
+# shield-evaluate.sh — Repo Identity Guard's standalone identity-lock evaluator.
+# repo-identity-guard-shield-artifact v6 (evaluator)
 #
-# This is the actual runtime artifact a future Git hook (pre-commit /
-# pre-push) invokes. It has NO dependency on Node, VS Code, or any running
-# extension host — only `git` itself plus the POSIX shell utilities that
-# ship alongside `git` on every platform Git runs on (sh, awk, sed, grep,
-# tr). See docs/SHIELD_MODE.md "Evaluator runtime decision" for why this
-# is sufficient and why a Node/Python/jq/gh dependency would be wrong here.
+# This is the runtime artifact the identity lock's Git hooks (pre-commit,
+# pre-merge-commit, pre-push) invoke. It has NO dependency on Node, VS
+# Code, or any running extension host — only `git` itself plus the POSIX
+# shell utilities that ship alongside `git` on every platform Git runs on
+# (sh, awk, sed, grep, tr). That is what makes the lock work with VS Code
+# closed: from any terminal, GUI, or AI agent that runs ordinary `git`.
+#
+# (The file keeps its historical "shield" name: the engine was previously
+# a user-facing feature called Shield Mode. Renaming it would buy nothing
+# and would orphan every installed copy's ownership marker.)
 #
 # Usage:
 #   shield-evaluate.sh commit
-#   shield-evaluate.sh push <remote-name> <remote-url>   [ref lines on stdin, as a real pre-push hook receives — read but not yet used]
+#   shield-evaluate.sh push <remote-name> <remote-url>   [ref lines on stdin, as a real pre-push hook receives — drained, never needed]
 #
 # Exit code is the entire contract: 0 = allow the Git action, non-zero =
-# block it. A concise reason is always written to stderr, never stdout
-# (stdout is reserved for a future machine-readable mode; nothing writes
-# there today). This script never installs itself, never mutates Git
-# config, and never touches anything outside read-only `git` plumbing
-# commands, its own policy file, and -- as of Phase 5, and only under the
-# narrow conditions `verify_github_account` documents -- the single
-# ordinary SSH connection ("ssh -G", then "ssh -T") the push itself would
-# use anyway, to ask GitHub who it authenticated. No key material is ever
-# read, no SSH config is ever written, and no other network call is ever
-# made.
+# block it. On a block, ONE message is written to stderr (never stdout),
+# starting with a stable machine-readable prelude:
 #
-# This script's semantics are intentionally mirrored 1:1 by the pure
-# TypeScript reference implementation in src/shield/evaluator.ts — that
-# module exists for exhaustive, fast unit testing of the *decision logic*;
-# this script is what actually ships and runs at hook time. Both are
-# exercised against the same real temporary repositories in
-# src/test/shieldEvaluatorScript.test.ts to keep them from silently
-# drifting apart.
+#   REPO_IDENTITY_GUARD_BLOCK
+#   ACTION: commit | push
+#   REASON: <short code, e.g. wrong_identity>
+#   REASON_ID: <stable reason id, e.g. commit-identity-mismatch>
+#   IDENTITY: <assigned identity label>      (when the policy could be read)
+#   ...KEY: value lines specific to the reason...
 #
-# Policy parsing (Phase 8): this script now performs a STRICT
-# recursive-descent JSON parse of the policy file in POSIX awk, plus the
-# same schema validation validateShieldPolicy() applies in TypeScript --
-# see the long "policy parsing (strict)" comment below for what changed,
-# for the two fail-OPEN holes the previous line-scanning parser had, and
-# for the exact trust boundary that remains. Any malformed, truncated, or
-# ambiguous policy is now `policy-corrupt`, which fails CLOSED.
+# followed by a blank line and a human explanation: what was blocked, why,
+# the expected vs. found identity/account, what to do next, and that
+# bypassing the check (--no-verify) is not the intended fix. Nothing
+# printed here is secret: no token, credential-helper output, key path or
+# key material, and never a raw remote URL (which can embed credentials).
+#
+# What it evaluates — and nothing else:
+#  - commit: the EFFECTIVE author and committer identity (`git var`, which
+#    sees GIT_AUTHOR_*/GIT_COMMITTER_* env vars, `git -c user.*=...`, and
+#    `--author`) must equal the assigned identity.
+#  - push, only when the assigned identity declares an expected GitHub
+#    login: the push must travel a trusted SSH alias with no transport
+#    override, and a live `ssh -G` + `ssh -T` probe over that exact route
+#    must authenticate as the expected login. Anything unprovable blocks.
+# Branch names, merge/rebase state, and which repository a push goes to
+# are deliberately never consulted.
+#
+# This script never installs itself, never mutates Git config, and never
+# touches anything outside read-only `git` plumbing, its own policy file,
+# and — only for push verification — the single ordinary SSH connection
+# the push itself would use. No key material is ever read, no SSH config
+# is ever written, and no other network call is ever made.
+#
+# Its decisions are mirrored 1:1 by the pure TypeScript reference in
+# src/shield/evaluator.ts, and the two are cross-checked by the
+# differential test suites so they cannot silently drift apart.
+#
+# Deliberate bypasses (`git commit --no-verify`, `git push --no-verify`,
+# deleting the hooks by hand) are outside the threat model: this protects
+# against accidental and ordinary misuse, not a local user intentionally
+# defeating their own Git setup.
 
 set -eu
 
 ACTION="${1:-}"
 if [ "$ACTION" != "commit" ] && [ "$ACTION" != "push" ]; then
-  echo "Shield: usage: shield-evaluate.sh <commit|push> [remote-name remote-url]" >&2
+  echo "Repo Identity Guard: usage: shield-evaluate.sh <commit|push> [remote-name remote-url]" >&2
   exit 2
 fi
 
-REASON_IDS=""
-REASON_MESSAGES=""
+# Filled in once the policy has been read; empty before that.
+IDENTITY_LABEL=""
 
-add_reason() {
-  # $1 = stable reason id, $2 = human-readable message
-  REASON_IDS="$REASON_IDS $1"
-  REASON_MESSAGES="$REASON_MESSAGES
-Shield: [$1] $2"
+# Collapses any CR/LF/TAB to a space so a value can never break the
+# one-field-per-line prelude format.
+one_line() {
+  printf '%s' "$1" | tr '\r\n\t' '   '
 }
 
-fail_immediately() {
-  # For failures that make any further evaluation meaningless
-  # (policy-missing, policy-corrupt, inspection-failed): report and exit
-  # without evaluating anything else, matching evaluateFromPolicyLoad's
-  # short-circuit behavior in src/shield/evaluator.ts. Deliberately the same
-  # "Shield: [id] message" shape add_reason's lines use below (not prefixed
-  # "Shield: BLOCKED" the way the final summary line is) -- a caller (e.g.
-  # a hook shim) that strips that one summary line by matching
-  # "^Shield: BLOCKED" must never accidentally swallow this line too.
-  echo "Shield: [$1] $2" >&2
+# Short machine code for each stable reason id. Kept 1:1 with
+# SHIELD_REASON_CATALOG in src/shield/reasonCatalog.ts (asserted by
+# src/test/identityLockOutput.test.ts).
+reason_code() {
+  case "$1" in
+    commit-identity-mismatch) echo wrong_identity ;;
+    commit-identity-override) echo identity_override ;;
+    push-route-unverified) echo push_route_unverified ;;
+    push-route-override) echo push_route_override ;;
+    push-account-mismatch) echo wrong_push_account ;;
+    push-account-unverified) echo push_account_unverified ;;
+    policy-missing) echo policy_missing ;;
+    policy-corrupt) echo policy_corrupt ;;
+    *) echo inspection_failed ;;
+  esac
+}
+
+BYPASS_NOTE="Do not bypass this check (for example with --no-verify): it exists so this repository is never used with the wrong identity by accident. If this repository should no longer be locked, run \"Repo Identity Guard: Unlock Current Repository\" in VS Code instead."
+
+# block <reason-id> <extra prelude lines, may be empty> <human message>
+#
+# Prints the single block message and exits non-zero. Every block — policy
+# problems, inspection failures, identity mismatches — goes through here,
+# so the prelude format is guaranteed identical for all of them.
+block() {
+  {
+    echo "REPO_IDENTITY_GUARD_BLOCK"
+    echo "ACTION: $ACTION"
+    echo "REASON: $(reason_code "$1")"
+    echo "REASON_ID: $1"
+    if [ -n "$IDENTITY_LABEL" ]; then
+      echo "IDENTITY: $(one_line "$IDENTITY_LABEL")"
+    fi
+    if [ -n "$2" ]; then
+      printf '%s\n' "$2"
+    fi
+    echo ""
+    echo "Repo Identity Guard blocked this $ACTION."
+    echo ""
+    printf '%s\n' "$3"
+    echo ""
+    echo "$BYPASS_NOTE"
+  } >&2
   exit 1
+}
+
+# For failures that make any further evaluation meaningless
+# (policy-missing, policy-corrupt, inspection-failed) — mirrors
+# evaluateFromPolicyLoad's short-circuit in src/shield/evaluator.ts.
+fail_immediately() {
+  block "$1" "" "$2
+
+What to do: open this repository in VS Code and run \"Repo Identity Guard: Repair Identity Lock\" (or \"Unlock Current Repository\" if it should not be locked)."
 }
 
 lower() {
@@ -79,110 +139,50 @@ lower() {
   # every line into one and silently break every array-membership check).
   #
   # Leading/trailing whitespace is STRIPPED as well as case being folded
-  # (Phase 9 / Part 7). This function is the shell half of
-  # `normalize()` in src/shield/evaluator.ts, which has always done
-  # `.trim().toLocaleLowerCase()` -- and the differential fuzzer caught the
-  # two drifting apart: a profile whose `expectedGitName` carried a stray
-  # leading space (a plain settings typo) matched in TypeScript and did NOT
-  # match here, so the shipped evaluator blocked every commit with a
-  # baffling `Expected:   Danish Irfan / Found: Danish Irfan`.
-  #
-  # This is a whitespace-only normalization and loses no safety property:
-  # Git itself strips leading/trailing whitespace from an ident's name, so
-  # the two spellings were never two different identities to begin with.
-  # Nothing about non-whitespace content compares any more leniently.
+  # (Phase 9 / Part 7): this is the shell half of `normalize()` in
+  # src/shield/evaluator.ts, which does `.trim().toLocaleLowerCase()`. Git
+  # itself strips leading/trailing whitespace from an ident's name, so the
+  # two spellings were never two different identities to begin with.
   printf '%s\n' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]'
-}
-
-# Shell half of normalizeHost() in src/shield/evaluator.ts: same as
-# lower(), but ALSO strips one matching pair of enclosing "[...]" brackets
-# first -- "[2001:db8::1]" and "2001:db8::1" name the SAME IPv6 address,
-# and different "ssh" implementations/versions are not guaranteed to
-# report "ssh -G"'s "hostname" line with brackets one way or the other.
-# Comparing host strings without this would risk an UNCHANGED destination
-# reading as "changed" purely because of a bracket-formatting difference
-# between two resolutions of the same address. Used ONLY for host
-# comparisons, never for owner/repo/git-identity fields.
-normalize_host() {
-  NH_LOWERED=$(lower "$1")
-  case "$NH_LOWERED" in
-    \[*\])
-      printf '%s\n' "$NH_LOWERED" | sed -E 's/^\[//; s/\]$//'
-      ;;
-    *)
-      printf '%s\n' "$NH_LOWERED"
-      ;;
-  esac
 }
 
 # ==================== locate + load policy ====================
 
 GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
-  || fail_immediately inspection-failed "could not resolve the repository's common git directory"
+  || fail_immediately inspection-failed "Could not resolve the repository's common git directory."
 
 POLICY_FILE="$GIT_COMMON_DIR/repo-identity-guard/shield-policy.json"
 
 if [ ! -f "$POLICY_FILE" ]; then
-  fail_immediately policy-missing "Shield is enabled but no policy file was found at $POLICY_FILE"
+  fail_immediately policy-missing "The identity-lock hook is installed, but no lock policy was found at $POLICY_FILE, so the assigned identity cannot be checked. Failing closed."
 fi
 
 
 # ==================== policy parsing (strict) ====================
 #
 # Phase 8 hardening. The previous parser was two small awk one-liners that
-# scanned for `"key":` line-wise. Adversarial testing found two ways to
-# make it FAIL OPEN -- i.e. exit 0 and allow the action -- neither of which
-# required any cleverness:
-#
-#   1. A policy whose arrays are packed onto one line
-#      (`"enabledActions": ["commit","push"]`) made `policy_array` return
-#      NOTHING, so the `enabledActions` membership test failed and the
-#      script exited 0. It "worked" only because serializeShieldPolicy
-#      happens to emit one element per line; any other formatting of the
-#      same valid JSON disabled enforcement silently.
-#   2. A truncated policy (an interrupted write, a full disk) kept a valid
-#      `policyVersion` and a non-empty `expectedGitEmail` prefix, hit the
-#      same empty-`enabledActions` path, and again exited 0.
-#
-# Two further weaknesses were fail-closed but wrong: a one-line nested
-# object made `policy_scalar host/owner/repo` return the entire object
-# blob, and any non-`true` text in `strictPushSetup` (`"yes"`, `1`,
-# `True`) silently downgraded the profile to non-strict, skipping every
-# route and account check.
-#
-# So this is now a real, strict JSON parser: a recursive-descent parse in
-# POSIX awk -- no jq, no Node, no Python, nothing beyond the awk that
-# already ships everywhere `git` does. It parses the WHOLE document, and
-# rejects (policy-corrupt, which fails closed) anything that is not
-# exactly one well-formed JSON value: truncation, trailing garbage,
-# unterminated strings or containers, bad escapes, raw control characters
-# inside strings, invalid numbers, and DUPLICATE KEYS within one object
-# (JSON permits those; Shield refuses to guess which of two
-# `"owner"` fields was meant). Formatting is now irrelevant -- one line or
-# a hundred, any indentation, any whitespace -- because nothing is
-# line-oriented any more.
+# scanned for `"key":` line-wise. Adversarial testing found ways to make it
+# FAIL OPEN -- i.e. exit 0 and allow the action -- (a policy whose arrays
+# are packed onto one line, and a truncated policy), so this is a real,
+# strict JSON parser: a recursive-descent parse in POSIX awk -- no jq, no
+# Node, no Python, nothing beyond the awk that already ships everywhere
+# `git` does. It parses the WHOLE document, and rejects (policy-corrupt,
+# which fails closed) anything that is not exactly one well-formed JSON
+# value: truncation, trailing garbage, unterminated strings or containers,
+# bad escapes, raw control characters inside strings, invalid numbers, and
+# DUPLICATE KEYS within one object (JSON permits those; the evaluator
+# refuses to guess which of two `"expectedGitEmail"` fields was meant).
 #
 # ## Trust boundary, stated explicitly
 #
-# The parser is strict about STRUCTURE and about the schema checks below.
-# The flattened form it emits is one `path<TAB>type<TAB>value` line per
-# node, so a string value that contains a literal tab or newline could not
-# be represented faithfully; JSON forbids raw control characters inside
-# strings (this parser enforces that), and the only way to smuggle one in
-# is an explicit `\n`/`\t`/`	` escape, which is normalized to a
-# single space in the emitted value. No field Shield compares
-# (`expectedGitEmail`, owner, repo, host, aliases, branch names, actions,
-# logins) can legitimately contain a control character, so this affects
-# only the human-readable `profileLabel` echoed in a block message. What
-# remains outside the boundary is unchanged and unchangeable from here:
-# anyone who can write this policy file can also write the hook that reads
-# it, so the file is not a security boundary against a local attacker --
-# it is protected against CORRUPTION and MALFORMEDNESS, and corruption now
-# fails closed instead of silently disabling enforcement.
-#
-# The one-line invariant holds for `serializeShieldPolicy`'s own output
-# too, so this is a strict superset of what the previous parser accepted,
-# minus the shapes that were unsafe.
+# The flattened form the parser emits is one `path<TAB>type<TAB>value`
+# line per node; an explicit `\n`/`\t` escape in a string is normalized to
+# a single space. No field the evaluator compares (`expectedGitEmail`,
+# `expectedGitName`, aliases, logins, actions) can legitimately contain a
+# control character. Anyone who can write this policy file can also write
+# the hook that reads it, so the file is not a security boundary against a
+# local attacker -- it is protected against CORRUPTION and MALFORMEDNESS,
+# and corruption fails closed instead of silently disabling enforcement.
 
 POLICY_DUMP=$(awk '
 function err(msg) { printf("!ERROR\t%s\n", msg); failed = 1; exit 1 }
@@ -287,7 +287,7 @@ function parse_object(path,   key, childpath, first) {
     childpath = path "." key
     # Duplicate keys are legal JSON and a genuine ambiguity -- refuse
     # rather than let "first wins" or "last wins" decide an enforcement
-    # value (e.g. two "owner" fields in approvedPushDestination).
+    # value (e.g. two "expectedGitEmail" fields).
     if (childpath in seen) { err("duplicate key \"" key "\" in the same object") }
     seen[childpath] = 1
     skipws()
@@ -345,10 +345,10 @@ END {
 # parsed successfully always emits at least its root node.
 POLICY_PARSE_ERROR=$(printf '%s\n' "$POLICY_DUMP" | awk -F'\t' '$1 == "!ERROR" { print $2; exit }')
 if [ -n "$POLICY_PARSE_ERROR" ]; then
-  fail_immediately policy-corrupt "Shield's policy file at $POLICY_FILE is not valid JSON and cannot be trusted ($POLICY_PARSE_ERROR). Run \"Repo Identity Guard: Repair Shield\"."
+  fail_immediately policy-corrupt "The identity-lock policy at $POLICY_FILE is not valid JSON and cannot be trusted ($POLICY_PARSE_ERROR). Failing closed."
 fi
 if [ -z "$POLICY_DUMP" ]; then
-  fail_immediately policy-corrupt "Shield's policy file at $POLICY_FILE could not be read or parsed at all. Run \"Repo Identity Guard: Repair Shield\"."
+  fail_immediately policy-corrupt "The identity-lock policy at $POLICY_FILE could not be read or parsed at all. Failing closed."
 fi
 
 # ---- accessors over the flattened dump ----
@@ -400,98 +400,91 @@ require_optional_string() {
 
 # ---- schema validation, 1:1 with validateShieldPolicy() ----
 #
-# Previously only `policyVersion` and `expectedGitEmail` were checked, and
-# a policy that failed anything else simply behaved unpredictably. Every
-# check below fails CLOSED (policy-corrupt, exit 1), so a malformed policy
-# blocks the action and says why, instead of quietly enforcing a subset.
+# Every check below fails CLOSED (policy-corrupt, exit 1), so a malformed
+# policy blocks the action and says why, instead of quietly enforcing a
+# subset.
 
 if [ "$(policy_type "")" != "object" ]; then
-  fail_immediately policy-corrupt "Shield's policy file must contain a JSON object"
+  fail_immediately policy-corrupt "The identity-lock policy must contain a JSON object. Failing closed."
 fi
 
-# v1 -> v2 (independent-review release blocker): approvedPushDestination
-# gained canonicalHost/canonicalPort, resolved via a real "ssh -G" at
-# enable/repair time. A v1 policy never captured this, so accepting one
-# here would let a repointed SSH alias masquerade as an unchanged
-# destination purely because its literal name never changed -- exactly
-# the hole this version bump exists to close. Deliberately rejected, not
-# reinterpreted: run "Repair Shield" to regenerate a v2 policy.
-if [ "$(policy_type .policyVersion)" != "number" ] || [ "$(policy_scalar .policyVersion)" != "2" ]; then
-  fail_immediately policy-corrupt "unexpected or missing policyVersion (got: '$(policy_scalar .policyVersion)'; Shield now requires policyVersion 2, which records a canonically-resolved SSH push endpoint -- run \"Repo Identity Guard: Repair Shield\" to upgrade)"
+# v3 is the identity-lock policy. v1/v2 were the retired "Shield Mode"
+# policy (profile matching, branch protection, approved push
+# destinations): they are never enforced by this evaluator. Opening the
+# repository in VS Code migrates it -- into a v3 lock when an explicit
+# legacy binding is provable, otherwise by removing the legacy hooks.
+POLICY_VERSION_VALUE=$(policy_scalar .policyVersion)
+if [ "$(policy_type .policyVersion)" != "number" ] || [ "$POLICY_VERSION_VALUE" != "3" ]; then
+  case "$POLICY_VERSION_VALUE" in
+    1|2)
+      fail_immediately policy-corrupt "This repository still has a legacy Repo Identity Guard \"Shield\" policy (version $POLICY_VERSION_VALUE), which this version no longer enforces. Failing closed until it is migrated."
+      ;;
+    *)
+      fail_immediately policy-corrupt "The identity-lock policy has an unexpected or missing policyVersion (got: '$POLICY_VERSION_VALUE'; expected 3). Failing closed."
+      ;;
+  esac
 fi
 
-if [ "$(policy_type .generatedAt)" != "number" ]; then
-  fail_immediately policy-corrupt "policy is missing a numeric generatedAt"
-fi
+for numeric_field in .generatedAt .assignedAt; do
+  if [ "$(policy_type "$numeric_field")" != "number" ]; then
+    fail_immediately policy-corrupt "The identity-lock policy is missing a numeric ${numeric_field#.}."
+  fi
+done
 
-for required_field in .matchedProfileId .profileLabel .expectedGitEmail; do
+for required_field in .lockId .identityId .identityLabel .expectedGitEmail; do
   if [ "$(policy_type "$required_field")" != "string" ] || [ -z "$(policy_scalar "$required_field")" ]; then
-    fail_immediately policy-corrupt "policy is missing required non-empty string field ${required_field#.}"
+    fail_immediately policy-corrupt "The identity-lock policy is missing required non-empty string field ${required_field#.}."
   fi
 done
 
 require_optional_string .expectedGitName
-require_optional_string .approvedRepositoryKey
 require_optional_string .expectedGitHubLogin
 
-case "$(policy_type .approvedPushDestination)" in
-  absent|object) ;;
-  *) fail_immediately policy-corrupt "policy field approvedPushDestination must be an object when present" ;;
-esac
-require_optional_string .approvedPushDestination.host
-require_optional_string .approvedPushDestination.owner
-require_optional_string .approvedPushDestination.repo
-require_optional_string .approvedPushDestination.canonicalHost
-require_optional_string .approvedPushDestination.canonicalPort
-
-# A non-boolean strictPushSetup used to read as "not strict", silently
-# turning OFF every route and account check. It is now corruption.
-if [ "$(policy_type .strictPushSetup)" != "bool" ]; then
-  fail_immediately policy-corrupt "policy field strictPushSetup must be a boolean (true or false)"
-fi
-
 require_string_array .trustedSshHostAliases
-require_string_array .protectedBranches
-require_string_array .expectedBranchPatterns
-require_string_array .enabledActions
+require_string_array .enforcedActions
 
-# ...and every element must be one of the two actions Shield knows about.
-#
-# Phase 9 / Part 8 finding, found by the adversarial parser fuzzer: only the
-# "array of strings" shape was checked here, so `["commit","push","rebase"]`
-# parsed fine and was honoured, while validateShieldPolicy() in TypeScript
-# rejects it (`enabledActions must be an array containing only commit,
-# push`). That is a fail-OPEN disagreement in the exact field that decides
-# whether Shield governs an action at all: a policy written by a newer or
-# foreign version of the extension, naming an action this build cannot
-# enforce, was silently accepted as if it named only the ones it does know.
+# Every element must be one of the two actions the evaluator knows about.
 # An unrecognized action is corruption, and corruption fails closed.
-policy_array .enabledActions | while IFS= read -r declared_action; do
+policy_array .enforcedActions | while IFS= read -r declared_action; do
   case "$declared_action" in
     commit|push) ;;
     *) exit 7 ;;
   esac
-done || fail_immediately policy-corrupt "policy field enabledActions must contain only \"commit\" and \"push\""
+done || fail_immediately policy-corrupt "The identity-lock policy field enforcedActions must contain only \"commit\" and \"push\"."
+
+# A lock ALWAYS enforces commit identity, and enforces push identity
+# exactly when an expected GitHub login is declared -- so a hand-edited
+# policy can neither silently drop commit enforcement nor claim push
+# enforcement with no account to enforce.
+if ! policy_array .enforcedActions | grep -qxF commit; then
+  fail_immediately policy-corrupt "The identity-lock policy field enforcedActions must include \"commit\"."
+fi
+EXPECTED_GH_LOGIN=$(policy_scalar .expectedGitHubLogin)
+if policy_array .enforcedActions | grep -qxF push; then
+  ENFORCES_PUSH=1
+else
+  ENFORCES_PUSH=0
+fi
+if { [ "$ENFORCES_PUSH" = 1 ] && [ -z "$EXPECTED_GH_LOGIN" ]; } || { [ "$ENFORCES_PUSH" = 0 ] && [ -n "$EXPECTED_GH_LOGIN" ]; }; then
+  fail_immediately policy-corrupt "The identity-lock policy field enforcedActions must include \"push\" exactly when expectedGitHubLogin is set."
+fi
 
 # Secret-shaped-field guard -- mirrors validateShieldPolicy()'s own list.
-# A policy carrying any of these was built from the wrong source object and
-# must never be honoured, let alone left sitting on disk unremarked.
 for forbidden_field in token accessToken password privateKey sshKey credentials secret; do
   if [ "$(policy_type ".$forbidden_field")" != "absent" ]; then
-    fail_immediately policy-corrupt "policy must not contain a \"$forbidden_field\" field -- Shield policy is non-secret by design"
+    fail_immediately policy-corrupt "The identity-lock policy must not contain a \"$forbidden_field\" field -- it is non-secret by design."
   fi
 done
 
 EXPECTED_EMAIL=$(policy_scalar .expectedGitEmail)
 EXPECTED_NAME=$(policy_scalar .expectedGitName)
-PROFILE_LABEL=$(policy_scalar .profileLabel)
-STRICT_PUSH=$(policy_scalar .strictPushSetup)
+IDENTITY_LABEL=$(policy_scalar .identityLabel)
 
-if ! policy_array .enabledActions | grep -qxF "$ACTION"; then
-  # This policy does not govern this action at all -- never block it.
-  # Reaching here now means enabledActions was verified to be a
-  # well-formed array of strings that genuinely does not list this action,
-  # NOT that the array failed to parse.
+if ! policy_array .enforcedActions | grep -qxF "$ACTION"; then
+  # This lock does not govern this action (a push, for an identity with no
+  # expected GitHub login) -- never block it. Reaching here means
+  # enforcedActions was verified to be a well-formed, consistent array
+  # that genuinely does not list this action, NOT that it failed to parse.
   exit 0
 fi
 
@@ -499,10 +492,15 @@ fi
 
 evaluate_commit() {
   # ---- identity: re-read fresh, right now — never a cached scan ----
+  # `git var` reports the EFFECTIVE identity: it already reflects
+  # GIT_AUTHOR_*/GIT_COMMITTER_*/EMAIL environment overrides, a
+  # command-scoped `git -c user.name=/user.email=` (via
+  # GIT_CONFIG_PARAMETERS), and `git commit --author=...` (Git exports it
+  # to the hook's environment), exactly as the commit will record it.
   AUTHOR_IDENT=$(git var GIT_AUTHOR_IDENT 2>/dev/null) \
-    || fail_immediately inspection-failed "git var GIT_AUTHOR_IDENT failed"
+    || fail_immediately inspection-failed "Git could not determine the author identity for this commit (\"git var GIT_AUTHOR_IDENT\" failed -- is user.name/user.email configured?). The assigned identity cannot be checked, so the commit is blocked."
   COMMITTER_IDENT=$(git var GIT_COMMITTER_IDENT 2>/dev/null) \
-    || fail_immediately inspection-failed "git var GIT_COMMITTER_IDENT failed"
+    || fail_immediately inspection-failed "Git could not determine the committer identity for this commit (\"git var GIT_COMMITTER_IDENT\" failed). The assigned identity cannot be checked, so the commit is blocked."
 
   ident_name() { printf '%s' "$1" | sed -E 's/^(.*) <[^>]*> [0-9]+ [+-][0-9]+[[:space:]]*$/\1/'; }
   ident_email() { printf '%s' "$1" | sed -E 's/^.*<([^>]*)>.*$/\1/'; }
@@ -512,8 +510,8 @@ evaluate_commit() {
   COMMITTER_NAME=$(ident_name "$COMMITTER_IDENT")
   COMMITTER_EMAIL=$(ident_email "$COMMITTER_IDENT")
 
-  # worktree ?? local ?? global — same precedence RepoFacts collection
-  # uses (see gitService.ts); read fresh here, not passed in.
+  # worktree ?? local ?? global — read fresh here, only to tell a config
+  # mismatch apart from an environment/command-line override.
   CONFIGURED_NAME=$(git config --worktree user.name 2>/dev/null || git config --local user.name 2>/dev/null || git config --global user.name 2>/dev/null || true)
   CONFIGURED_EMAIL=$(git config --worktree user.email 2>/dev/null || git config --local user.email 2>/dev/null || git config --global user.email 2>/dev/null || true)
 
@@ -530,169 +528,119 @@ evaluate_commit() {
   COMMITTER_OK=1
   name_matches "$COMMITTER_NAME" && email_matches "$COMMITTER_EMAIL" || COMMITTER_OK=0
 
-  if [ "$AUTHOR_OK" = 0 ] || [ "$COMMITTER_OK" = 0 ]; then
-    # Which identity (author, committer, or both) actually mismatched —
-    # reported so "Found:" never has to guess.
-    WHO=""
-    [ "$AUTHOR_OK" = 0 ] && WHO="author ${AUTHOR_NAME:-(unknown)} <${AUTHOR_EMAIL:-(unknown)}>"
-    if [ "$COMMITTER_OK" = 0 ]; then
-      if [ -n "$WHO" ]; then
-        WHO="$WHO; committer ${COMMITTER_NAME:-(unknown)} <${COMMITTER_EMAIL:-(unknown)}>"
-      else
-        WHO="committer ${COMMITTER_NAME:-(unknown)} <${COMMITTER_EMAIL:-(unknown)}>"
-      fi
-    fi
-    EXPECTED_DISPLAY="${EXPECTED_NAME:+$EXPECTED_NAME }<$EXPECTED_EMAIL>"
-
-    if name_matches "$CONFIGURED_NAME" && email_matches "$CONFIGURED_EMAIL"; then
-      add_reason commit-identity-override "Profile: $PROFILE_LABEL
-Expected: $EXPECTED_DISPLAY
-Found: $WHO
-(Git config for this repo already matches $PROFILE_LABEL — the effective identity above is overridden by the environment or an explicit command-line option.)"
-    else
-      add_reason commit-identity-mismatch "Profile: $PROFILE_LABEL
-Expected: $EXPECTED_DISPLAY
-Found: $WHO"
-    fi
-  fi
-
-  # ---- branch / detached HEAD ----
-  BRANCH=$(git symbolic-ref -q --short HEAD 2>/dev/null || true)
-  if [ -z "$BRANCH" ]; then
-    add_reason detached-head "HEAD is detached. Commits made here aren't tracked by any branch and are easy to lose."
-  else
-    LOWER_BRANCH=$(lower "$BRANCH")
-    if policy_array .protectedBranches | while IFS= read -r b; do lower "$b"; done | grep -qxF "$LOWER_BRANCH"; then
-      add_reason protected-branch "\"$BRANCH\" is locally protected. Committing directly on it is not allowed by this policy."
-    fi
-    # Branch-pattern mismatch (expectedBranchPatterns) is intentionally NOT
-    # checked here: it's a non-blocking warning in the main safety engine
-    # (branchPolicyPatternMismatchResult), and Shield must not silently
-    # upgrade that into a hard block.
-  fi
-
-  # ---- repo operation state (current worktree's own git-dir, not the
-  # shared common dir — merge/rebase state is per-worktree) ----
-  WT_GIT_DIR=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) \
-    || fail_immediately inspection-failed "could not resolve this worktree's git directory"
-
-  if [ -f "$WT_GIT_DIR/MERGE_HEAD" ]; then
-    add_reason repo-operation-in-progress "A merge is already in progress. Committing now could interfere with it."
-  elif [ -d "$WT_GIT_DIR/rebase-merge" ] || [ -d "$WT_GIT_DIR/rebase-apply" ]; then
-    add_reason repo-operation-in-progress "A rebase is already in progress. Committing now could interfere with it."
-  elif [ -f "$WT_GIT_DIR/CHERRY_PICK_HEAD" ]; then
-    add_reason repo-operation-in-progress "A cherry-pick is already in progress. Committing now could interfere with it."
-  elif [ -f "$WT_GIT_DIR/REVERT_HEAD" ]; then
-    add_reason repo-operation-in-progress "A revert is already in progress. Committing now could interfere with it."
-  fi
-
-  # Unresolved conflicts, independent of the above (a rebase can have
-  # conflicts and both facts matter).
-  if git status --porcelain=v2 2>/dev/null | grep -q '^u '; then
-    add_reason merge-conflicts "There are unresolved merge conflicts in the working tree."
-  fi
-  # Ordinary uncommitted changes alone (no conflicts, no in-progress
-  # operation) are deliberately never checked here — must never block.
-}
-
-# ==================== push: canonical SSH route resolution (release-blocker fix, round 2) ====================
-#
-# Resolves the EFFECTIVE hostname AND port `ssh -G <user>@<host>` reports
-# for a given host/alias -- purely local (reads the effective client SSH
-# configuration, makes no network connection, reads no key material,
-# writes nothing). Never falls back to trusting the input string itself as
-# evidence: when `ssh` isn't available, or produces no hostname line, the
-# caller gets EMPTY output (no lines at all) and must treat that as
-# "unresolved" (fail closed), exactly like `verify_github_account`'s
-# separate, identical-shaped resolution below.
-#
-# Prints exactly two lines on success -- hostname, then port -- or nothing
-# at all on failure/no resolution. Callers read them with `sed -n '1p'`/
-# `'2p'` rather than two separate `ssh -G` invocations, so a route is only
-# ever resolved once per call site.
-#
-# Used by `evaluate_push`'s destination check to resolve the CURRENT push
-# URL's real endpoint. Deliberately NEVER used to re-resolve the policy's
-# OWN recorded (approved) alias name: doing that would resolve a possibly
-# attacker-repointed alias through TODAY's ~/.ssh/config and trivially
-# "agree" with an equally freshly-resolved current host -- see
-# `evaluate_push`'s destination-check comment for the full writeup of why
-# that was the round-1 fix's remaining hole. The APPROVED side of the
-# comparison is instead the CANONICAL endpoint Shield resolved and
-# persisted once, durably, at enable/repair time (`approvedPushDestination
-# .canonicalHost`/`.canonicalPort` in the policy) -- never re-derived here.
-resolve_canonical_ssh_route() {
-  RCSR_HOST="$1"
-  RCSR_USER="$2"
-  RCSR_PORT="${3:-}"
-  if [ -z "$RCSR_HOST" ]; then
+  if [ "$AUTHOR_OK" = 1 ] && [ "$COMMITTER_OK" = 1 ]; then
     return 0
   fi
-  # An EMPTY user means the URL never named one -- pass the bare host to
-  # `ssh -G`, exactly like the real push transport would, and let OpenSSH
-  # itself determine the effective user (its own default, or a
-  # config-driven `User` directive). Silently inventing "git" here would
-  # canonicalize a DIFFERENT target than the one Git will actually connect
-  # as whenever `Match user`/a per-user `Host` block makes the effective
-  # route user-sensitive -- see docs/SHIELD_MODE.md's "SSH user must never
-  # be invented" section for the full writeup.
-  if [ -n "$RCSR_USER" ]; then
-    RCSR_TARGET="${RCSR_USER}@${RCSR_HOST}"
+
+  # Which identity (author, committer, or both) actually mismatched, and
+  # the first mismatching one's values for the machine-readable prelude.
+  if [ "$AUTHOR_OK" = 0 ] && [ "$COMMITTER_OK" = 0 ]; then
+    FOUND_ROLE="author,committer"
+  elif [ "$AUTHOR_OK" = 0 ]; then
+    FOUND_ROLE="author"
   else
-    RCSR_TARGET="$RCSR_HOST"
+    FOUND_ROLE="committer"
   fi
-  if [ -n "$RCSR_PORT" ]; then
-    RCSR_CONFIG=$(ssh -G -p "$RCSR_PORT" "$RCSR_TARGET" 2>/dev/null) || RCSR_CONFIG=""
+  if [ "$AUTHOR_OK" = 0 ]; then
+    FOUND_NAME="$AUTHOR_NAME"
+    FOUND_EMAIL="$AUTHOR_EMAIL"
   else
-    RCSR_CONFIG=$(ssh -G "$RCSR_TARGET" 2>/dev/null) || RCSR_CONFIG=""
+    FOUND_NAME="$COMMITTER_NAME"
+    FOUND_EMAIL="$COMMITTER_EMAIL"
   fi
-  RCSR_LOWER=$(printf '%s\n' "$RCSR_CONFIG" | tr '[:upper:]' '[:lower:]')
-  RCSR_HOSTNAME=$(printf '%s\n' "$RCSR_LOWER" | awk '$1 == "hostname" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }')
-  if [ -z "$RCSR_HOSTNAME" ]; then
-    return 0
+
+  EXPECTED_DISPLAY="${EXPECTED_NAME:+$EXPECTED_NAME }<$EXPECTED_EMAIL>"
+  PRELUDE=""
+  if [ -n "$EXPECTED_NAME" ]; then
+    PRELUDE="EXPECTED_NAME: $(one_line "$EXPECTED_NAME")
+"
   fi
-  RCSR_RESOLVED_PORT=$(printf '%s\n' "$RCSR_LOWER" | awk '$1 == "port" { $1 = ""; sub(/^[[:space:]]+/, ""); print; exit }')
-  printf '%s\n%s\n' "$RCSR_HOSTNAME" "${RCSR_RESOLVED_PORT:-22}"
+  PRELUDE="${PRELUDE}EXPECTED_EMAIL: $(one_line "$EXPECTED_EMAIL")
+FOUND_NAME: $(one_line "$FOUND_NAME")
+FOUND_EMAIL: $(one_line "$FOUND_EMAIL")
+FOUND_ROLE: $FOUND_ROLE"
+
+  FOUND_LINES=""
+  [ "$AUTHOR_OK" = 0 ] && FOUND_LINES="  author:    ${AUTHOR_NAME:-(unknown)} <${AUTHOR_EMAIL:-(unknown)}>"
+  if [ "$COMMITTER_OK" = 0 ]; then
+    FOUND_LINES="${FOUND_LINES:+$FOUND_LINES
+}  committer: ${COMMITTER_NAME:-(unknown)} <${COMMITTER_EMAIL:-(unknown)}>"
+  fi
+
+  if name_matches "$CONFIGURED_NAME" && email_matches "$CONFIGURED_EMAIL"; then
+    block commit-identity-override "$PRELUDE" "This repository is locked to the identity \"$IDENTITY_LABEL\" ($EXPECTED_DISPLAY).
+Git config for this repository already uses that identity, but this commit would be recorded as:
+$FOUND_LINES
+
+Something is overriding the configured identity for this commit: an environment variable
+(GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL, EMAIL),
+a \"git -c user.name=...\" / \"git -c user.email=...\" option, or \"git commit --author=...\".
+
+What to do: remove that override (unset the variable, or drop the option), then retry the commit."
+  fi
+
+  block commit-identity-mismatch "$PRELUDE" "This repository is locked to the identity \"$IDENTITY_LABEL\" ($EXPECTED_DISPLAY),
+but this commit would be recorded as:
+$FOUND_LINES
+
+What to do: switch this repository to the assigned identity, then retry the commit:${EXPECTED_NAME:+
+  git config user.name \"$EXPECTED_NAME\"}
+  git config user.email \"$EXPECTED_EMAIL\"
+(In VS Code: \"Repo Identity Guard: Use Assigned Identity in Git Config\".)"
 }
 
-# ==================== push: GitHub SSH account verification (Phase 5) ====================
+# ==================== push: GitHub SSH account verification ====================
 #
-# Goes beyond "this route is a trusted alias" (route trust, Phase 0-4) to
-# "this route currently authenticates to the specific GitHub login this
-# profile expects" -- but ONLY when the policy actually asked for it
-# (expectedGitHubLogin set) and the route already resolved to a trusted
-# SSH alias with no overrides; an untrusted/unverified/overridden route
-# already has its own blocking reason above, and this function is never
-# reached for those. Only for SSH. Never reads private key contents,
-# copies keys, edits SSH config, touches ssh-agent, or stores a
-# password/passphrase. The only network activity here is the ordinary SSH
-# connection this push would use anyway.
+# Establishes which GitHub account this push authenticates as, over the
+# exact route the push itself will take, and compares it with the
+# assigned identity's expected login. Only reached when the route is
+# already a trusted SSH alias with no transport override (an untrusted or
+# overridden route is blocked before this). Never reads private key
+# contents, copies keys, edits SSH config, touches ssh-agent, or stores a
+# password/passphrase. The only network activity is the ordinary SSH
+# connection this push would make anyway.
+
+# push_block <reason-id> <found-login-or-"unverified"> <detail-code> <human message>
+push_block() {
+  block "$1" "EXPECTED_GITHUB_LOGIN: $(one_line "$EXPECTED_GH_LOGIN")
+FOUND_GITHUB_LOGIN: $(one_line "$2")
+DETAIL: $3
+REMOTE: $(one_line "${REMOTE_NAME:-(none)}")
+ROUTE_HOST: $(one_line "${HOST:-(unknown)}")" "$4"
+}
+
+account_unverified() {
+  # $1 = detail code, $2 = specific reason sentence
+  push_block push-account-unverified unverified "$1" "This repository is locked to the identity \"$IDENTITY_LABEL\", which must push as the GitHub account \"$EXPECTED_GH_LOGIN\".
+Repo Identity Guard could not verify which account this push would authenticate as:
+  $2
+
+What to do: fix the SSH route for \"${HOST}\" so it can be verified (see below), then retry the push.
+  - Its ~/.ssh/config Host entry must point at github.com (or ssh.github.com) and set \"IdentitiesOnly yes\"
+    with the IdentityFile of the $EXPECTED_GH_LOGIN key.
+  - Its host key must already be in known_hosts (run \"ssh -T git@${HOST}\" once yourself and verify the fingerprint).
+  - Check that the key is added to the $EXPECTED_GH_LOGIN GitHub account."
+}
+
 verify_github_account() {
   ALIAS="$1"
   SSH_USER_LOCAL="$2"
   EXPECTED="$3"
-  URL_PORT="${4:-}"
+  URL_PORT_LOCAL="${4:-}"
 
   # ---- effective route resolution (Phase 8) ----
   #
   # An SSH alias is just a label in the user's own ~/.ssh/config. Nothing
   # stops `Host github-work` from carrying `HostName something-else`, and
   # nothing stops whatever answers there from replying with a
-  # GitHub-shaped greeting ("Hi octocat! You've successfully
-  # authenticated..."). Before Phase 8 that combination -- trusted alias
-  # name + IdentitiesOnly + GitHub-shaped greeting -- was sufficient to
-  # report the GitHub account VERIFIED, without Shield ever establishing
-  # that the route goes to GitHub at all.
-  #
-  # So the effective route is resolved first, with `ssh -G` (purely local:
-  # it reads the effective client configuration and makes no network
-  # connection, reads no key material, and writes nothing), and the probe
-  # below is then required to travel that same route:
+  # GitHub-shaped greeting. So the effective route is resolved first, with
+  # `ssh -G` (purely local: reads the effective client configuration, makes
+  # no network connection, reads no key material, writes nothing), and the
+  # probe below is then required to travel that same route:
   #
   #   * the same alias, so every Host/Match block applies identically;
   #   * the same port -- if the remote URL carried an explicit port, git
-  #     would pass it, so `-p` is passed to BOTH `ssh -G` and `ssh -T`,
-  #     making the resolved configuration and the probe agree;
+  #     would pass it, so `-p` is passed to BOTH `ssh -G` and `ssh -T`;
   #   * the same login user, taken from the URL when it names one --
   #     and, when the URL named NONE, the bare alias, so OpenSSH itself
   #     determines the effective user exactly as the real push transport
@@ -708,10 +656,10 @@ verify_github_account() {
     TARGET="$ALIAS"
   fi
   PORT_ARGS_SET=0
-  if [ -n "$URL_PORT" ]; then PORT_ARGS_SET=1; fi
+  if [ -n "$URL_PORT_LOCAL" ]; then PORT_ARGS_SET=1; fi
 
   if [ "$PORT_ARGS_SET" = 1 ]; then
-    CONFIG_OUTPUT=$(ssh -G -p "$URL_PORT" "$TARGET" 2>/dev/null) || CONFIG_OUTPUT=""
+    CONFIG_OUTPUT=$(ssh -G -p "$URL_PORT_LOCAL" "$TARGET" 2>/dev/null) || CONFIG_OUTPUT=""
   else
     CONFIG_OUTPUT=$(ssh -G "$TARGET" 2>/dev/null) || CONFIG_OUTPUT=""
   fi
@@ -724,35 +672,24 @@ verify_github_account() {
   EFFECTIVE_HOSTNAME=$(ssh_config_value hostname)
   EFFECTIVE_PORT=$(ssh_config_value port)
   [ -z "$EFFECTIVE_PORT" ] && EFFECTIVE_PORT=22
-  # The effective `user` is deliberately NOT read back and compared
-  # (ShellCheck SC2034 flagged the dead assignment that used to be here,
-  # correctly). `ssh -G` is asked about the very same
-  # "<user>@<alias>" string that the `ssh -T` probe below connects with, so
-  # its answer for `user` is a restatement of the input, not independent
-  # evidence -- unlike `hostname`/`port`, which resolve through the user's
-  # ~/.ssh/config and CAN differ from what the URL implied. Comparing it
-  # would look like a check while proving nothing.
+  # The effective `user` is deliberately NOT read back and compared:
+  # `ssh -G` is asked about the very same "<user>@<alias>" string that the
+  # `ssh -T` probe below connects with, so its answer for `user` is a
+  # restatement of the input, not independent evidence.
 
   if [ -z "$EFFECTIVE_HOSTNAME" ]; then
-    add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: Shield could not resolve this SSH route's effective destination (\"ssh -G\" reported no hostname), so it cannot confirm that its verification probe takes the same route the push itself would."
-    return
+    account_unverified route_unresolvable "\"ssh -G\" reported no effective hostname for this route, so the verification probe cannot be shown to take the same route the push would."
   fi
 
   # Must actually be GitHub. Mirrors isGitHubSshEndpoint() in
   # src/shield/githubSshVerification.ts exactly -- github.com,
   # ssh.github.com (GitHub's documented port-443 endpoint), or any
   # *.github.com. A GitHub Enterprise Server host is deliberately NOT
-  # accepted: expectedGitHubLogin names a github.com username, and
-  # comparing it against a different namespace would be a guess.
+  # accepted: expectedGitHubLogin names a github.com username.
   case "$EFFECTIVE_HOSTNAME" in
     github.com|ssh.github.com|*.github.com) ;;
     *)
-      add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: This SSH route's effective destination is ${EFFECTIVE_HOSTNAME}:${EFFECTIVE_PORT}, which is not a GitHub SSH endpoint, so nothing it reports can confirm a GitHub account. (Shield resolves the alias with \"ssh -G\" rather than trusting its name.)"
-      return
+      account_unverified route_not_github "This SSH route's effective destination is ${EFFECTIVE_HOSTNAME}:${EFFECTIVE_PORT}, which is not a GitHub SSH endpoint, so nothing it reports can confirm a GitHub account. (The alias is resolved with \"ssh -G\" rather than trusted by name.)"
       ;;
   esac
 
@@ -760,28 +697,21 @@ Reason: This SSH route's effective destination is ${EFFECTIVE_HOSTNAME}:${EFFECT
   # silently substitute a different key -- IdentitiesOnly must be in
   # effect for this alias. Local config inspection only, no network call.
   if [ "$(ssh_config_value identitiesonly)" != "yes" ]; then
-    add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: This SSH route's effective configuration does not set \"IdentitiesOnly yes\", so ssh-agent could offer a different, unrelated key than the one this route is meant to use -- the route cannot be strongly bound to an expected account without it."
-    return
+    account_unverified identities_not_isolated "This SSH route's effective configuration does not set \"IdentitiesOnly yes\", so ssh-agent could offer a different, unrelated key than the one this route is meant to use."
   fi
 
   # GitHub's SSH endpoint replies to a noninteractive self-test even
   # though it commonly exits 1 on FULLY SUCCESSFUL authentication (it has
-  # no shell to hand back) -- so the exit code below is deliberately never
+  # no shell to hand back) -- so the exit code is deliberately never
   # consulted, only the response text is. StrictHostKeyChecking=yes means
   # an unknown/changed host key fails the connection rather than silently
-  # (or interactively) trusting it -- Shield must never auto-accept a host
-  # key on the user's behalf.
-  #
-  # The alias (not the resolved HostName) is what is connected to, so the
-  # probe reproduces the push's route exactly rather than an approximation
-  # of it; `-p` is passed only when the URL itself carried a port, for the
-  # same reason.
+  # (or interactively) trusting it -- the lock never auto-accepts a host
+  # key on the user's behalf. BatchMode=yes means no prompt can ever hang
+  # a hook waiting for input.
   TIMEOUT="${REPO_IDENTITY_GUARD_SHIELD_SSH_TIMEOUT:-5}"
   set +e
   if [ "$PORT_ARGS_SET" = 1 ]; then
-    AUTH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout="$TIMEOUT" -p "$URL_PORT" "$TARGET" 2>&1)
+    AUTH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout="$TIMEOUT" -p "$URL_PORT_LOCAL" "$TARGET" 2>&1)
   else
     AUTH_OUTPUT=$(ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout="$TIMEOUT" "$TARGET" 2>&1)
   fi
@@ -792,47 +722,36 @@ Reason: This SSH route's effective configuration does not set \"IdentitiesOnly y
       AUTH_ID=$(printf '%s' "$AUTH_OUTPUT" | sed -nE 's/.*Hi ([^!]+)!.*successfully authenticated.*/\1/p' | head -n1)
       case "$AUTH_ID" in
         "")
-          add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: SSH's response while verifying the account could not be parsed."
+          account_unverified malformed "SSH's response while verifying the account could not be parsed."
           ;;
         */*)
           # GitHub names deploy-key/App-installation identities as
           # "owner/repo", never a personal username -- never comparable to
           # expectedGitHubLogin, so always unverifiable, never guessed at.
-          add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: This route authenticated using a deploy-key-style identity (\"$AUTH_ID\") rather than a personal GitHub account, so it cannot be confirmed against the expected account."
+          account_unverified deploy_key "This route authenticated using a deploy-key-style identity (\"$AUTH_ID\") rather than a personal GitHub account."
           ;;
         *)
           if [ "$(lower "$AUTH_ID")" != "$(lower "$EXPECTED")" ]; then
-            add_reason push-account-mismatch "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Authenticated GitHub account: $AUTH_ID
-Reason: The configured SSH route is authenticating as the wrong GitHub account."
+            push_block push-account-mismatch "$AUTH_ID" account_mismatch "This repository is locked to the identity \"$IDENTITY_LABEL\", which must push as the GitHub account \"$EXPECTED\",
+but the SSH route \"${HOST}\" authenticated as \"$AUTH_ID\".
+
+What to do: push through an SSH host alias whose key belongs to \"$EXPECTED\" (one of: $TRUSTED_ALIASES_DISPLAY),
+or fix the IdentityFile of \"Host ${HOST}\" in ~/.ssh/config, then retry the push."
           fi
           ;;
       esac
       ;;
     *"Permission denied"*)
-      add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: SSH authentication to GitHub was refused (permission denied), so the account could not be confirmed."
+      account_unverified permission_denied "SSH authentication to GitHub was refused (permission denied), so the account could not be confirmed."
       ;;
     *"Host key verification failed"*|*"know the"*"key fingerprint"*|*"host key is known"*)
-      add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: This SSH host's key is not already trusted in known_hosts, so Shield refused to connect automatically. Verify the host key fingerprint yourself (e.g. run \"ssh -T $TARGET\" once interactively) and accept it before relying on strict account verification."
+      account_unverified host_key_unverified "This SSH host's key is not already trusted in known_hosts, so Repo Identity Guard refused to connect automatically."
       ;;
     *"timed out"*)
-      add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: The SSH connection timed out while verifying the account."
+      account_unverified timeout "The SSH connection timed out while verifying the account."
       ;;
     *)
-      add_reason push-account-unverified "Profile: $PROFILE_LABEL
-Expected GitHub account: $EXPECTED
-Reason: SSH's response while verifying the account could not be parsed."
+      account_unverified malformed "SSH's response while verifying the account could not be parsed."
       ;;
   esac
 }
@@ -840,33 +759,28 @@ Reason: SSH's response while verifying the account could not be parsed."
 # ==================== push ====================
 
 evaluate_push() {
-  # shellcheck disable=SC2034
-  # SC2034 (REMOTE_NAME appears unused) is INTENTIONAL and narrowly
-  # suppressed here. Git's pre-push contract passes the remote NAME as $1
-  # and its location as $2; Shield deliberately evaluates only the
-  # location, because the name is just a local label that can be pointed
-  # anywhere and is therefore not evidence about the destination. The
-  # named assignment is kept as the executable documentation of that
-  # positional contract -- removing it would make $2 look arbitrary and
-  # invite someone to renumber it.
+  # Git's pre-push contract passes the remote NAME as $1 and its location
+  # as $2. Only the location decides the route; the name is reported in
+  # the block message for orientation only.
   REMOTE_NAME="${1:-}"
   REMOTE_URL="${2:-}"
-  # Drain stdin (the real pre-push hook's <local-ref> <local-sha>
-  # <remote-ref> <remote-sha> lines) without acting on it yet — accepted
-  # now so the interface matches the real hook contract from day one; see
-  # PushEvalFacts.refLines in src/shield/evaluator.ts.
+  # Drain stdin (the real pre-push hook's ref lines) -- an identity
+  # decision never needs them.
   cat >/dev/null 2>&1 || true
 
   if [ -z "$REMOTE_URL" ]; then
-    fail_immediately inspection-failed "no remote URL was provided to evaluate (expected: shield-evaluate.sh push <remote-name> <remote-url>)"
+    fail_immediately inspection-failed "No remote URL was provided to evaluate (expected: shield-evaluate.sh push <remote-name> <remote-url>)."
   fi
 
   # ---- parse the ACTUAL action-time remote URL (never a value predicted
   # earlier by an extension scan) — mirrors parseRemoteUrl() in
-  # src/services/gitService.ts ----
+  # src/services/gitService.ts. Only the protocol, host, SSH user and
+  # explicit port matter to an identity decision (they decide which route
+  # the push authenticates over); the repository owner/path is
+  # deliberately never parsed or compared -- the lock does not care WHICH
+  # repository a push goes to, only WHO it authenticates as. ----
   PROTOCOL=unknown
   HOST=""
-  REPO_PATH=""
   # The scheme is detected with an ANCHORED match, exactly like
   # parseRemoteUrl()'s `/^[a-z][a-z0-9+.-]*:\/\//i` test -- not with a
   # `*://*` glob, which matches anywhere in the string.
@@ -898,7 +812,6 @@ evaluate_push() {
         # An authority-less form (file:///path) has no host at all --
         # matching `new URL(...).hostname` being "" for that shape.
         HOST=""
-        REPO_PATH="$rest"
         ;;
       *)
         # A bracketed IPv6 literal ("[2001:db8::1]") contains colons itself,
@@ -906,7 +819,7 @@ evaluate_push() {
         # one -- e.g. it read "[2001" as the entire host of
         # "ssh://git@[2001:db8::1]/acme/repo.git". Found by the PART 9
         # differential corpus once the release-blocker fix made host
-        # identity part of the destination check. `new URL(...).hostname`
+        # identity part of the (since removed) destination check. `new URL(...).hostname`
         # (the TypeScript side) keeps the brackets, so this matches that
         # exactly, brackets included.
         case "$rest" in
@@ -917,7 +830,6 @@ evaluate_push() {
             HOST=$(printf '%s' "$rest" | sed -E 's#^([^/@]*@)?([^/:]+).*#\2#')
             ;;
         esac
-        REPO_PATH=$(printf '%s' "$rest" | sed -E 's#^[^/]*/##')
         ;;
     esac
   else
@@ -936,36 +848,23 @@ evaluate_push() {
       #
       # TypeScript's scp-like regex requires a NON-EMPTY host containing
       # neither "/" nor whitespace, so both parsed to `{protocol:
-      # "unknown"}` with no owner and no repo, and the push was blocked as
-      # a destination mismatch. The shell happily produced
-      # owner="acme", repo="repo" for both and ALLOWED the push -- i.e. an
-      # unparseable, hostless destination satisfied an approved one.
+      # "unknown"}` with no host, while the shell produced a host for both
+      # -- an unparseable, hostless URL must never read as a usable route.
       #
       # This now mirrors
       #   /^(?:[^@\/\s]+@)?([^:\/\s]+):(.+)$/
       # exactly: non-empty host, no "/" or whitespace in it, non-empty
       # path, whole-string anchored. No match leaves PROTOCOL "unknown"
-      # with an empty host and path, which fails closed on both the
-      # destination check and the route check.
+      # with an empty host, which fails closed on the route check.
       SCP_LIKE='^([^@/[:space:]]+@)?([^:/[:space:]]+):(.+)$'
       SCP_HOST=$(printf '%s' "$REMOTE_URL" | sed -nE "s#$SCP_LIKE#\\2#p")
       if [ -n "$SCP_HOST" ]; then
         PROTOCOL=ssh
         HOST="$SCP_HOST"
-        REPO_PATH=$(printf '%s' "$REMOTE_URL" | sed -nE "s#$SCP_LIKE#\\3#p")
       fi
       ;;
     esac
   fi
-  REPO_PATH=$(printf '%s' "$REPO_PATH" | sed -E 's#^/+##; s#/+$##')
-  # The ".git" suffix is stripped CASE-INSENSITIVELY, matching
-  # parseRemoteUrl()'s `.replace(/\.git$/i, "")`. Phase 9 / Part 9: this
-  # used to be a case-sensitive `s/\.git$//`, so a remote written
-  # "git@GITHUB.COM:ACME/REPO.GIT" yielded repo "REPO.GIT" here and "REPO"
-  # in TypeScript -- Shield blocked a legitimate push and told the user its
-  # destination had "changed since Shield approval".
-  PARSED_REPO=$(printf '%s' "$REPO_PATH" | awk -F/ '{print $NF}' | sed -E 's/\.[Gg][Ii][Tt]$//')
-  PARSED_OWNER=$(printf '%s' "$REPO_PATH" | awk -F/ '{ if (NF>=2) print $(NF-1) }')
 
   # SSH connection user, e.g. "git" in "git@github-work:owner/repo.git" --
   # left EMPTY when the URL/alias doesn't specify one. Never defaulted to
@@ -975,9 +874,8 @@ evaluate_push() {
   # push transport would, and canonicalizing against an invented "git"
   # would ask `ssh -G` a DIFFERENT question than the one the actual push
   # answers whenever that resolution is user-sensitive. See
-  # resolve_canonical_ssh_route's and verify_github_account's own
-  # empty-user handling, and docs/SHIELD_MODE.md's "SSH user must never be
-  # invented" section.
+  # verify_github_account's own empty-user handling, and
+  # docs/SHIELD_MODE.md's "SSH user must never be invented" section.
   SSH_USER=$(printf '%s' "$REMOTE_URL" | sed -nE 's#^(ssh://)?([^@/:]+)@.*#\2#p')
 
   # Explicit port, e.g. `ssh://git@github-work:2222/owner/repo.git`. Only
@@ -1016,14 +914,12 @@ evaluate_push() {
     github.com|gitlab.com|bitbucket.org) IS_GENERIC=1 ;;
   esac
 
-  # ---- SSH transport overrides, computed BEFORE the destination check
-  # below (moved up from "route trust"): host canonicalization must know
-  # whether the resolution it's about to trust is itself trustworthy. An
-  # SSH command override can redirect the connection regardless of what
-  # the URL's host claims -- check this BEFORE trusting any alias, since a
-  # "trusted" alias (and a canonicalized host) prove nothing once the
-  # program that actually speaks SSH for this push might not be the one
-  # ~/.ssh/config implies. None of these inspect key material, touch SSH
+  # ---- SSH transport overrides, computed BEFORE the route check below.
+  # An SSH command override can redirect the connection regardless of
+  # what the URL's host claims -- check this BEFORE trusting any alias,
+  # since a "trusted" alias (and a live `ssh -T` probe through it) prove
+  # nothing once the program that actually speaks SSH for this push might
+  # not be the one ~/.ssh/config implies. None of these inspect key material, touch SSH
   # config, or make a network call -- they only check whether an override
   # is present.
   SSH_OVERRIDES=""
@@ -1035,7 +931,7 @@ evaluate_push() {
   # Phase 9 / Part 3 finding: `ssh.variant` (and its GIT_SSH_VARIANT
   # environment form) changes HOW git invokes the ssh transport even when
   # NO command override is set at all -- so a route could diverge from what
-  # Shield probes with none of the three checks above noticing.
+  # the account probe checks with none of the three checks above noticing.
   #
   # Empirically confirmed against git 2.43.0, with a fake `ssh` on PATH and
   # no GIT_SSH/GIT_SSH_COMMAND/core.sshCommand set anywhere:
@@ -1046,13 +942,13 @@ evaluate_push() {
   #   GIT_SSH_VARIANT=tortoiseplink  ssh -batch                   git@host git-upload-pack '/o/r.git'
   #
   # i.e. git is driving that program under PuTTY/plink/"simple" argument
-  # conventions, not OpenSSH's. Shield's verification probe below is
+  # conventions, not OpenSSH's. The verification probe below is
   # unconditionally OpenSSH syntax (`ssh -G`, `-o BatchMode=yes`,
   # `-o StrictHostKeyChecking=yes`, `-p <port>`; plink spells the port
   # `-P` and has no `-G` at all). Under a non-OpenSSH variant the probe
   # therefore cannot be shown to reproduce the transport the push will use
-  # -- and an unprovable route must read as UNVERIFIED and block under a
-  # strict profile, never be assumed equivalent.
+  # -- and an unprovable route must read as UNVERIFIED and block for a
+  # lock that expects a GitHub login, never be assumed equivalent.
   #
   # Only a genuinely non-OpenSSH variant counts: "auto" is git's default
   # and "ssh" explicitly asserts OpenSSH semantics, which is exactly what
@@ -1076,168 +972,54 @@ evaluate_push() {
     *) SSH_OVERRIDES="${SSH_OVERRIDES:+$SSH_OVERRIDES, }$SSH_VARIANT_SOURCE=$EFFECTIVE_SSH_VARIANT" ;;
   esac
 
-  # ---- destination: owner/repo AND canonical host (release-blocker fix)
-  # -- see destinationReasons() in src/shield/evaluator.ts for the full
-  # writeup. Owner/repo matching alone used to be the entire check, which
-  # let a push to an entirely different host (e.g. "evil.example") sharing
-  # the approved owner/repo path text be reported "destination confirmed",
-  # with only the (non-blocking under a relaxed profile) push_account
-  # check standing in the way. Fails CLOSED throughout: if Shield never
-  # recorded an approved destination for this repo (no remote resolvable
-  # the last time it was enabled/repaired), or the current route's host
-  # cannot be proven to be the same one, that is treated as a mismatch,
-  # not silently allowed. ----
-  APPROVED_HOST=$(policy_scalar .approvedPushDestination.host)
-  APPROVED_CANONICAL_HOST=$(policy_scalar .approvedPushDestination.canonicalHost)
-  APPROVED_CANONICAL_PORT=$(policy_scalar .approvedPushDestination.canonicalPort)
-  APPROVED_OWNER=$(policy_scalar .approvedPushDestination.owner)
-  APPROVED_REPO=$(policy_scalar .approvedPushDestination.repo)
-  EXPECTED_DESTINATION_DISPLAY="${APPROVED_CANONICAL_HOST:-${APPROVED_HOST:-(unknown host)}}:${APPROVED_OWNER:-?}${APPROVED_REPO:+/$APPROVED_REPO}"
+  # ---- route: can this push carry account evidence at all? ----
+  #
+  # Only an SSH push, with no transport override, through one of the
+  # identity's explicitly trusted aliases (never a generic shared host
+  # such as github.com) can be bound to a specific GitHub account. Every
+  # other route is unprovable, and an unprovable push identity is blocked
+  # for a lock that expects a GitHub login -- never assumed correct.
+  TRUSTED_ALIASES_DISPLAY=$(policy_array .trustedSshHostAliases | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')
+  [ -z "$TRUSTED_ALIASES_DISPLAY" ] && TRUSTED_ALIASES_DISPLAY="(none configured)"
 
-  if [ -z "$APPROVED_OWNER" ]; then
-    add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
-Shield has no approved push destination on file for this repository (none was resolved the last time Shield was enabled or repaired).
-Reason: Refresh Shield after confirming the intended remote before pushing."
-  else
-    OWNER_REPO_MISMATCH=0
-    # MISSING EVIDENCE IS NOT A MATCH (Phase 8, kept 1:1 with
-    # destinationReasons() in src/shield/evaluator.ts). The `[ -n
-    # "$PARSED_REPO" ]` guard used to sit on the repo comparison, so a push
-    # URL that yielded an owner but NO repository name satisfied a policy
-    # that names a specific repository -- it matched purely because the
-    # owner happened to parse. An unparseable owner was likewise compared
-    # as the empty string. Both now require the push URL to actually
-    # produce the evidence the policy asks for.
-    if [ -z "$PARSED_OWNER" ] \
-      || [ "$(lower "$PARSED_OWNER")" != "$(lower "$APPROVED_OWNER")" ] \
-      || { [ -n "$APPROVED_REPO" ] && { [ -z "$PARSED_REPO" ] || [ "$(lower "$PARSED_REPO")" != "$(lower "$APPROVED_REPO")" ]; }; }; then
-      OWNER_REPO_MISMATCH=1
-    fi
+  ROUTE_FIX="What to do: push over SSH through one of the identity's trusted SSH host aliases ($TRUSTED_ALIASES_DISPLAY),
+e.g. point the remote at git@<alias>:<owner>/<repo>.git, then retry the push.
+If no alias is configured yet, add a Host entry for the $EXPECTED_GH_LOGIN key to ~/.ssh/config and list it
+in the identity's trustedSshHostAliases setting."
 
-    # Host identity -- CANONICAL ONLY (round 2 of the release-blocker fix).
-    # A literal string match between the push URL's host and the policy's
-    # OWN recorded host/alias is NEVER sufficient on its own for SSH: both
-    # could be the identical alias NAME while ~/.ssh/config has since
-    # repointed it to a different physical endpoint. The previous version
-    # of this check accepted a literal match without resolution -- which
-    # covers the common unchanged-remote case, but ALSO covers the exact
-    # attack this exists to close: enable Shield while "github-work"
-    # resolves to "github.com", then repoint "github-work" to
-    # "evil.example" in ~/.ssh/config -- the push URL's literal text never
-    # changes, so the old literal-fast-path kept reporting the destination
-    # confirmed.
-    #
-    # So the ONLY thing ever compared now is:
-    #  - HTTPS (no local alias indirection to canonicalize away): the
-    #    literal current host against APPROVED_CANONICAL_HOST, which was
-    #    set to the literal host verbatim when the destination was
-    #    approved -- a literal comparison here IS a canonical comparison.
-    #  - SSH: the CURRENT push URL's host/alias, freshly resolved via
-    #    "ssh -G" RIGHT NOW (never by trusting its NAME, and never by
-    #    running GIT_SSH_COMMAND/core.sshCommand to "discover" what it
-    #    does), against APPROVED_CANONICAL_HOST. The policy's OWN recorded
-    #    alias name is NEVER re-resolved here -- doing that would resolve
-    #    the (possibly attacker-repointed) alias through TODAY's
-    #    ~/.ssh/config and trivially "agree" with an equally
-    #    freshly-resolved current host, which is exactly how the previous
-    #    version of this fix still missed the repointing case.
-    # Missing canonical evidence on either side -- no APPROVED_CANONICAL_HOST
-    # at all (a pre-canonicalization policy, impossible once policyVersion
-    # 2 is enforced, but defended here anyway), an unresolvable current
-    # route (no "ssh" available), or an SSH transport override in effect --
-    # is never a match.
-    HOST_MATCH=0
-    PORT_MATCH=1
-    if [ -n "$APPROVED_CANONICAL_HOST" ]; then
-      if [ "$PROTOCOL" != "ssh" ]; then
-        # Only SSH has local ~/.ssh/config alias indirection an attacker
-        # could silently repoint after Shield approved a destination --
-        # HTTPS, and any other/unrecognized protocol Git itself accepts
-        # (git://, file://, ...), have no such ambiguity: the literal host
-        # IS the canonical host.
-        if [ "$(normalize_host "$HOST")" = "$(normalize_host "$APPROVED_CANONICAL_HOST")" ]; then
-          HOST_MATCH=1
-        fi
-      elif [ -n "$HOST" ] && [ -z "$SSH_OVERRIDES" ]; then
-        CURRENT_ROUTE=$(resolve_canonical_ssh_route "$HOST" "$SSH_USER" "$URL_PORT")
-        CANONICAL_CURRENT_HOST=$(printf '%s\n' "$CURRENT_ROUTE" | sed -n '1p')
-        CANONICAL_CURRENT_PORT=$(printf '%s\n' "$CURRENT_ROUTE" | sed -n '2p')
-        if [ -n "$CANONICAL_CURRENT_HOST" ] && [ "$(normalize_host "$CANONICAL_CURRENT_HOST")" = "$(normalize_host "$APPROVED_CANONICAL_HOST")" ]; then
-          HOST_MATCH=1
-          if [ -n "$APPROVED_CANONICAL_PORT" ] && [ -n "$CANONICAL_CURRENT_PORT" ] && [ "$CANONICAL_CURRENT_PORT" != "$APPROVED_CANONICAL_PORT" ]; then
-            PORT_MATCH=0
-          fi
-        fi
-      fi
-    fi
+  route_block() {
+    # $1 = reason id, $2 = detail code, $3 = specific reason sentence
+    push_block "$1" unverified "$2" "This repository is locked to the identity \"$IDENTITY_LABEL\", which must push as the GitHub account \"$EXPECTED_GH_LOGIN\".
+$3
 
-    if [ "$OWNER_REPO_MISMATCH" = 1 ] || [ "$HOST_MATCH" != 1 ] || [ "$PORT_MATCH" != 1 ]; then
-      DESTINATION_REASON="Push destination changed since Shield approval (this push would go to ${HOST:-an unknown host}:${PARSED_OWNER:-an unknown owner}${PARSED_REPO:+/$PARSED_REPO})."
-      if [ -z "$APPROVED_CANONICAL_HOST" ]; then
-        DESTINATION_REASON="Shield has no canonically-resolved push endpoint on file for this profile (the destination predates canonical resolution, or it could not be established the last time Shield was enabled or repaired). Run \"Repo Identity Guard: Repair Shield\" after confirming the intended remote."
-      elif [ "$PROTOCOL" = "ssh" ] && [ -n "$SSH_OVERRIDES" ]; then
-        DESTINATION_REASON="This push's SSH endpoint could not be safely resolved right now (an SSH transport override is in effect: $SSH_OVERRIDES), so it cannot be confirmed against the approved destination."
-      elif [ "$PROTOCOL" = "ssh" ] && [ "$HOST_MATCH" = 1 ] && [ "$PORT_MATCH" != 1 ]; then
-        DESTINATION_REASON="Push destination's port changed since Shield approval (this push would use port ${CANONICAL_CURRENT_PORT:-unknown}, approved: $APPROVED_CANONICAL_PORT)."
-      fi
-      add_reason push-destination-mismatch "Profile: $PROFILE_LABEL
-Expected approved destination: $EXPECTED_DESTINATION_DISPLAY
-Reason: $DESTINATION_REASON"
-    fi
-  fi
+$ROUTE_FIX"
+  }
 
-  ROUTE_UNVERIFIED=1
-  ROUTE_REASON_ID=push-route-unverified
-  ROUTE_MESSAGE="This push's protocol could not be determined, so the account that would authenticate it cannot be verified locally."
   if [ "$PROTOCOL" = "ssh" ] && [ -n "$SSH_OVERRIDES" ]; then
-    ROUTE_REASON_ID=push-route-override
-    ROUTE_MESSAGE="An SSH command override ($SSH_OVERRIDES) was detected, so the route this push would actually use cannot be verified against the $PROFILE_LABEL profile's trusted SSH host aliases -- even though the URL's host (\"$HOST\") might otherwise be trusted."
+    route_block push-route-override ssh_transport_override "An SSH transport override ($SSH_OVERRIDES) is in effect, so the route this push would actually use cannot be verified -- even though the URL's host (\"$HOST\") might otherwise be trusted. Remove the override for this push."
   elif [ "$PROTOCOL" = "https" ]; then
-    ROUTE_MESSAGE="This push is over HTTPS. The account that authenticates it cannot be verified locally."
+    route_block push-route-unverified https "This push is over HTTPS. The GitHub account that authenticates it cannot be verified locally."
   elif [ "$PROTOCOL" = "ssh" ] && [ "$IS_GENERIC" = 1 ]; then
-    ROUTE_MESSAGE="This push uses the generic SSH host \"$HOST\", which authenticates with whichever key is used by default."
+    route_block push-route-unverified generic_ssh_host "This push uses the generic SSH host \"$HOST\", which authenticates with whichever key is used by default."
   elif [ "$PROTOCOL" = "ssh" ]; then
     LOWER_HOST=$(lower "$HOST")
-    if policy_array .trustedSshHostAliases | while IFS= read -r a; do lower "$a"; done | grep -qxF "$LOWER_HOST"; then
-      ROUTE_UNVERIFIED=0
-    else
-      ROUTE_MESSAGE="This push uses SSH host alias \"$HOST\", which is not listed as trusted by the $PROFILE_LABEL profile."
+    if ! policy_array .trustedSshHostAliases | while IFS= read -r a; do lower "$a"; done | grep -qxF "$LOWER_HOST"; then
+      route_block push-route-unverified untrusted_alias "This push uses the SSH host alias \"$HOST\", which the identity does not list as a trusted alias."
     fi
+  else
+    route_block push-route-unverified unknown_protocol "This push's protocol could not be determined, so the account that would authenticate it cannot be verified."
   fi
 
-  # An unverified/untrusted/unverifiable route only blocks when the
-  # profile is strict — a destination mismatch (added above,
-  # unconditionally) always blocks regardless of strictness.
-  if [ "$ROUTE_UNVERIFIED" = 1 ] && [ "$STRICT_PUSH" = "true" ]; then
-    add_reason "$ROUTE_REASON_ID" "$ROUTE_MESSAGE"
-  fi
-
-  # ---- account verification (Phase 5) ----
-  # Only ever attempted when: strict, the route above is otherwise already
-  # trusted (ROUTE_UNVERIFIED=0 -- an untrusted/overridden route already
-  # has its own blocking reason and this must never duplicate or override
-  # that), and the profile actually asked for a specific account
-  # (expectedGitHubLogin set). No expectedGitHubLogin means Shield makes
-  # no claim about WHO authenticated -- route trust alone, same as
-  # Phase 0-4.
-  EXPECTED_GH_LOGIN=$(policy_scalar .expectedGitHubLogin)
-  if [ "$STRICT_PUSH" = "true" ] && [ "$ROUTE_UNVERIFIED" = 0 ] && [ -n "$EXPECTED_GH_LOGIN" ]; then
-    verify_github_account "$HOST" "$SSH_USER" "$EXPECTED_GH_LOGIN" "$URL_PORT"
-  fi
+  # ---- account: live verification over the exact route ----
+  verify_github_account "$HOST" "$SSH_USER" "$EXPECTED_GH_LOGIN" "$URL_PORT"
 }
 
-# ==================== run + report ====================
+# ==================== run ====================
 
 if [ "$ACTION" = "commit" ]; then
   evaluate_commit
 else
   evaluate_push "${2:-}" "${3:-}"
-fi
-
-if [ -n "$REASON_IDS" ]; then
-  echo "Shield: BLOCKED ($ACTION) —$REASON_IDS" >&2
-  printf '%s\n' "$REASON_MESSAGES" >&2
-  exit 1
 fi
 
 exit 0

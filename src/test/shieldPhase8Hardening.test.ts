@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { collectRepoFacts } from "../services/gitService";
 import { SHIELD_CHAIN_ORIGINAL_SUFFIX } from "../shield/artifacts";
 import {
   SHIELD_MIN_GIT_VERSION_DISPLAY,
@@ -28,7 +27,8 @@ import {
 import { ShieldManager } from "../shield/manager";
 import { parseShieldPolicy } from "../shield/policy";
 import { shieldStorageDir } from "../shield/storage";
-import { Profile, RepoFacts } from "../types";
+import type { Identity } from "../identity/types";
+import { WORK_IDENTITY } from "./testUtil/lockFixtures";
 
 /**
  * Phase 8 — core correctness hardening.
@@ -40,11 +40,8 @@ import { Profile, RepoFacts } from "../types";
  * Shield's own behavior.
  *
  * Areas covered:
- *  - approved push destination is built from the plain-push destination,
- *    not origin's fetch URL (`branch.<name>.pushRemote`,
- *    `remote.pushDefault`, `remote.<name>.pushurl`, asymmetric fetch/push);
- *  - full-integrity health checks (evaluator drift, profile drift, push
- *    destination drift) and `inspect()` staying strictly read-only;
+ *  - full-integrity health checks (evaluator drift, identity drift) and
+ *    `inspect()` staying strictly read-only;
  *  - durable installation metadata, `core.hooksPath` drift, orphaned
  *    hooks, and worktrees;
  *  - foreign-hook chaining safety (binary, symlink, non-executable);
@@ -55,15 +52,7 @@ import { Profile, RepoFacts } from "../types";
 const execFileAsync = promisify(execFile);
 const EVALUATOR_SOURCE = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
 
-const workProfile: Profile = {
-  id: "work",
-  label: "Work",
-  gitName: "Danish Irfan",
-  gitEmail: "work@example.com",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  strictPushSetup: true,
-  trustedSshHostAliases: ["github-work"],
-};
+const workProfile: Identity = WORK_IDENTITY;
 
 interface Repo {
   dir: string;
@@ -109,76 +98,17 @@ async function exists(p: string): Promise<boolean> {
 }
 
 /**
- * A fake `ssh -G` that echoes back whatever host/alias it was asked
- * about, matching real unconfigured-OpenSSH passthrough behavior. Used so
- * that `approvedPushDestination.canonicalHost/canonicalPort` resolve to a
- * deterministic value regardless of whether the machine running these
- * tests has a real `ssh` binary on PATH at all (CI images do; this
- * sandbox does not).
- */
-let identityFakeSshBinPromise: Promise<string> | undefined;
-async function identityFakeSshBin(): Promise<string> {
-  if (!identityFakeSshBinPromise) {
-    identityFakeSshBinPromise = (async () => {
-      const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p8-identity-ssh-"));
-      const implPath = path.join(binDir, "impl.js");
-      await fs.writeFile(
-        implPath,
-        `"use strict";
-const args = process.argv.slice(2);
-const joined = " " + args.join(" ") + " ";
-if (joined.includes(" -G ")) {
-  const target = args[args.length - 1] || "";
-  const at = target.lastIndexOf("@");
-  const host = at !== -1 ? target.slice(at + 1) : target;
-  let port = "22";
-  const pIdx = args.indexOf("-p");
-  if (pIdx !== -1 && args[pIdx + 1]) port = args[pIdx + 1];
-  process.stdout.write("user git\\nhostname " + host.toLowerCase() + "\\nport " + port + "\\n");
-  process.exit(0);
-}
-process.stderr.write("fake-ssh-identity: unexpected invocation: " + joined + "\\n");
-process.exit(1);
-`,
-      );
-      await fs.writeFile(path.join(binDir, "ssh"), `#!/usr/bin/env node\nrequire(${JSON.stringify(implPath)});\n`, { mode: 0o755 });
-      await fs.writeFile(path.join(binDir, "ssh.cmd"), `@echo off\r\nnode "${implPath}" %*\r\n`);
-      return binDir;
-    })();
-  }
-  return identityFakeSshBinPromise;
-}
-
-function withIdentityFakeSshPath(env: NodeJS.ProcessEnv, fakeSshBin: string): NodeJS.ProcessEnv {
-  const result: NodeJS.ProcessEnv = {};
-  let existingPath: string | undefined;
-  for (const [key, value] of Object.entries(env)) {
-    if (key.toUpperCase() === "PATH") {
-      existingPath = existingPath ?? value;
-      continue;
-    }
-    result[key] = value;
-  }
-  result.PATH = `${fakeSshBin}${path.delimiter}${existingPath ?? ""}`;
-  return result;
-}
-
-/**
- * Enables Shield from facts collected FRESH off the real repository, the
- * way the extension command now does — so what these tests assert about
- * `approvedPushDestination` reflects the real `git config` arrangement
- * each test set up, not a hand-written fixture that could quietly disagree
- * with it.
+ * Assigns `identity` (the lock's only input — there are no repository
+ * "facts" any more: the lock never depends on remotes, branches or owners).
  */
 async function enableFromRealRepo(
   manager: ShieldManager,
   repo: Repo,
-  profiles: Profile[] = [workProfile],
-  env?: NodeJS.ProcessEnv,
-): Promise<{ facts: RepoFacts; result: Awaited<ReturnType<ShieldManager["enable"]>> }> {
-  const facts = await collectRepoFacts(repo.dir);
-  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles, protectedBranches: [], env });
-  return { facts, result };
+  identity: Identity = workProfile,
+  chainForeignHooks?: boolean,
+): Promise<{ result: Awaited<ReturnType<ShieldManager["enable"]>> }> {
+  const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, { identity, lockId: "phase8", assignedAt: 1, chainForeignHooks });
+  return { result };
 }
 
 async function readPolicy(repo: Repo) {
@@ -192,147 +122,11 @@ async function readPolicy(repo: Repo) {
 }
 
 // ====================================================================
-// FINDING 4 — approved push destination must come from the plain-push
-// destination, never from origin's fetch URL.
-//
-// Confirmed defect: buildPolicyForRepo built approvedPushDestination from
-// facts.remoteHost/remoteOwner/remoteRepo (origin FETCH). Git offers four
-// separate ways for the push destination to differ from origin's fetch
-// URL, and in every one of them Shield approved the wrong place.
-// ====================================================================
-
-test("push destination: an ordinary repo whose only remote is origin approves origin's owner/repo (baseline)", async () => {
-  const repo = await makeTempRepo();
-  try {
-    await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
-    const manager = new ShieldManager();
-    const env = withIdentityFakeSshPath(repo.env, await identityFakeSshBin());
-    const { result } = await enableFromRealRepo(manager, repo, [workProfile], env);
-    assert.equal(result.ok, true, result.inspection.reasons.join("; "));
-
-    const policy = await readPolicy(repo);
-    assert.deepEqual(policy.approvedPushDestination, {
-      host: "github-work",
-      owner: "AcmeSoftware",
-      repo: "acme-frontend",
-      canonicalHost: "github-work",
-      canonicalPort: "22",
-    });
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("push destination: branch.<name>.pushRemote is what gets approved, NOT origin's fetch URL", async () => {
-  const repo = await makeTempRepo();
-  try {
-    await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
-    await git(repo, ["remote", "add", "elsewhere", "git@github-work:AcmeSoftware/acme-mirror.git"]);
-    await git(repo, ["config", "branch.main.pushRemote", "elsewhere"]);
-
-    const manager = new ShieldManager();
-    await enableFromRealRepo(manager, repo);
-    const policy = await readPolicy(repo);
-
-    assert.equal(policy.approvedPushDestination?.repo, "acme-mirror", "must approve where a plain push ACTUALLY lands");
-    // The canonical repository identity is still origin-based — the two
-    // facts are deliberately not conflated.
-    assert.match(policy.approvedRepositoryKey as string, /acme-frontend/);
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("push destination: remote.pushDefault is what gets approved", async () => {
-  const repo = await makeTempRepo();
-  try {
-    await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
-    await git(repo, ["remote", "add", "publish", "git@github-work:AcmeSoftware/acme-published.git"]);
-    await git(repo, ["config", "remote.pushDefault", "publish"]);
-
-    const manager = new ShieldManager();
-    await enableFromRealRepo(manager, repo);
-    const policy = await readPolicy(repo);
-    assert.equal(policy.approvedPushDestination?.repo, "acme-published");
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("push destination: remote.<name>.pushurl (asymmetric fetch/push URL) is what gets approved, not the fetch URL", async () => {
-  const repo = await makeTempRepo();
-  try {
-    await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
-    await git(repo, ["config", "remote.origin.pushurl", "git@github-work:AcmeSoftware/acme-writable.git"]);
-
-    const manager = new ShieldManager();
-    const { facts } = await enableFromRealRepo(manager, repo);
-    // Sanity: the fact collection itself really did separate the two.
-    assert.equal(facts.remoteRepo, "acme-frontend");
-    assert.equal(facts.pushRemoteRepo, "acme-writable");
-
-    const policy = await readPolicy(repo);
-    assert.equal(policy.approvedPushDestination?.repo, "acme-writable");
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("push destination: an origin fetch remote under a DIFFERENT owner than the push destination approves the push owner", async () => {
-  const repo = await makeTempRepo();
-  try {
-    // The classic fork arrangement inverted: fetch from upstream's URL on
-    // origin, push to the user's own fork.
-    await git(repo, ["remote", "add", "origin", "git@github-work:UpstreamOrg/acme-frontend.git"]);
-    await git(repo, ["config", "remote.origin.pushurl", "git@github-work:AcmeSoftware/acme-frontend.git"]);
-
-    const manager = new ShieldManager();
-    // The profile has to match the repo's canonical (origin) identity for
-    // Shield to be enableable at all — which is precisely the point: the
-    // profile is chosen by origin, the approved push destination is not.
-    const forkProfile: Profile = { ...workProfile, expectedRemoteOwners: ["UpstreamOrg", "AcmeSoftware"] };
-    const { result } = await enableFromRealRepo(manager, repo, [forkProfile]);
-    assert.equal(result.ok, true, result.inspection.reasons.join("; "));
-
-    const policy = await readPolicy(repo);
-    assert.equal(policy.approvedPushDestination?.owner, "AcmeSoftware");
-    assert.notEqual(policy.approvedPushDestination?.owner, "UpstreamOrg");
-    // Canonical identity still tracks origin's fetch URL.
-    assert.match(policy.approvedRepositoryKey as string, /upstreamorg/i);
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("push destination: repair after an intentional push-destination change re-approves the NEW destination", async () => {
-  const repo = await makeTempRepo();
-  try {
-    await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
-    const manager = new ShieldManager();
-    await enableFromRealRepo(manager, repo);
-    assert.equal((await readPolicy(repo)).approvedPushDestination?.repo, "acme-frontend");
-
-    // Deliberately move the push destination, then repair.
-    await git(repo, ["config", "remote.origin.pushurl", "git@github-work:AcmeSoftware/acme-next.git"]);
-    const freshFacts = await collectRepoFacts(repo.dir);
-    const repaired = await manager.repair(repo.dir, EVALUATOR_SOURCE, {
-      facts: freshFacts,
-      profiles: [workProfile],
-      protectedBranches: [],
-    });
-    assert.equal(repaired.ok, true, repaired.inspection.reasons.join("; "));
-    assert.equal((await readPolicy(repo)).approvedPushDestination?.repo, "acme-next");
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-// ====================================================================
 // FINDING 2 — health check must perform FULL integrity checks.
 //
 // Confirmed defect: extension.ts called healthCheck(repoRoot) with no
-// options, so all three of inspect()'s opt-in drift checks were silently
-// skipped and a drifted Shield reported a confident "active".
+// options, so inspect()'s opt-in drift checks were silently skipped and a
+// drifted lock reported a confident "active".
 // ====================================================================
 
 test("health check: with NO drift inputs supplied, a hand-edited evaluator that keeps the marker still reports active (the shape of the original defect)", async () => {
@@ -367,10 +161,10 @@ test("health check: trustedSshHostAliases changed after enable -> degraded", asy
     const manager = new ShieldManager();
     await enableFromRealRepo(manager, repo);
 
-    const edited: Profile = { ...workProfile, trustedSshHostAliases: ["github-work", "github-extra"] };
+    const edited: Identity = { ...workProfile, trustedSshHostAliases: ["github-work", "github-extra"] };
     const health = await manager.healthCheck(repo.dir, {
       evaluatorScriptSource: EVALUATOR_SOURCE,
-      currentProfiles: [edited],
+      currentIdentities: [edited],
     });
     assert.equal(health.state, "degraded");
     assert.match(health.summary, /trustedSshHostAliases/);
@@ -379,7 +173,7 @@ test("health check: trustedSshHostAliases changed after enable -> degraded", asy
   }
 });
 
-test("health check: expectedGitHubLogin / strictPushSetup / Git identity changes each report degraded with the changed field named", async () => {
+test("health check: expectedGitHubLogin / label / Git identity changes each report degraded with the changed field named", async () => {
   const repo = await makeTempRepo();
   try {
     await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
@@ -388,38 +182,17 @@ test("health check: expectedGitHubLogin / strictPushSetup / Git identity changes
 
     for (const [field, edited] of [
       ["expectedGitHubLogin", { ...workProfile, expectedGitHubLogin: "danish-work" }],
-      ["strictPushSetup", { ...workProfile, strictPushSetup: false }],
+      ["label", { ...workProfile, label: "Work (renamed)" }],
       ["gitEmail", { ...workProfile, gitEmail: "other@example.com" }],
       ["gitName", { ...workProfile, gitName: "Someone Else" }],
     ] as const) {
       const health = await manager.healthCheck(repo.dir, {
         evaluatorScriptSource: EVALUATOR_SOURCE,
-        currentProfiles: [edited],
+        currentIdentities: [edited],
       });
       assert.equal(health.state, "degraded", `${field} drift should be degraded`);
       assert.match(health.summary, new RegExp(field), `${field} should be named in the reason`);
     }
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("health check: a push destination that moved after enable -> degraded", async () => {
-  const repo = await makeTempRepo();
-  try {
-    await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
-    const manager = new ShieldManager();
-    await enableFromRealRepo(manager, repo);
-
-    await git(repo, ["remote", "set-url", "origin", "git@github-work:SomeoneElse/acme-frontend.git"]);
-    const moved = await collectRepoFacts(repo.dir);
-    const health = await manager.healthCheck(repo.dir, {
-      evaluatorScriptSource: EVALUATOR_SOURCE,
-      currentProfiles: [workProfile],
-      currentPushDestination: { host: moved.pushRemoteHost, owner: moved.pushRemoteOwner, repo: moved.pushRemoteRepo },
-    });
-    assert.equal(health.state, "degraded");
-    assert.match(health.summary, /push destination/i);
   } finally {
     await cleanup(repo.dir);
   }
@@ -451,8 +224,7 @@ test("health check: inspect() with every drift check enabled still writes NOTHIN
     const before = await Promise.all(watched.map(async (p) => [p, await fs.readFile(p).then((b) => b.toString("latin1"))] as const));
     const inspection = await manager.inspect(repo.dir, {
       evaluatorScriptSource: EVALUATOR_SOURCE,
-      currentProfiles: [{ ...workProfile, strictPushSetup: false }],
-      currentPushDestination: { host: "github-work", owner: "SomeoneElse", repo: "other" },
+      currentIdentities: [{ ...workProfile, gitEmail: "changed@example.com" }],
     });
     assert.equal(inspection.state, "degraded");
 
@@ -466,66 +238,25 @@ test("health check: inspect() with every drift check enabled still writes NOTHIN
 });
 
 // ====================================================================
-// FINDING 3 — no durable policy may be built from stale/cached UI facts.
+// FINDING 3 — no durable policy may be built from stale/cached UI inputs.
 // ====================================================================
 
-test("stale facts: a policy built from facts captured by an EARLIER scan differs from one built from facts collected immediately before enable — the fresh facts must win", async () => {
-  const repo = await makeTempRepo();
-  try {
-    await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/old-repo.git"]);
-
-    // What a sidebar scan / background watcher captured earlier.
-    const staleFacts = await collectRepoFacts(repo.dir);
-    assert.equal(staleFacts.pushRemoteRepo, "old-repo");
-
-    // The world moves on before the user runs Enable Shield.
-    await git(repo, ["remote", "set-url", "origin", "git@github-work:AcmeSoftware/new-repo.git"]);
-
-    const manager = new ShieldManager();
-
-    // (a) The defect, reproduced: enabling from the cached snapshot bakes
-    // the OLD destination into the durable policy.
-    const withStale = await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-      facts: staleFacts,
-      profiles: [workProfile],
-      protectedBranches: [],
-    });
-    assert.equal(withStale.ok, true, withStale.inspection.reasons.join("; "));
-    assert.equal((await readPolicy(repo)).approvedPushDestination?.repo, "old-repo");
-
-    // (b) The fix, as the command now behaves: re-collect immediately
-    // before the write, and the fresh facts win.
-    const freshFacts = await collectRepoFacts(repo.dir);
-    assert.equal(freshFacts.pushRemoteRepo, "new-repo");
-    const withFresh = await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-      facts: freshFacts,
-      profiles: [workProfile],
-      protectedBranches: [],
-    });
-    assert.equal(withFresh.ok, true, withFresh.inspection.reasons.join("; "));
-    assert.equal((await readPolicy(repo)).approvedPushDestination?.repo, "new-repo");
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("stale facts: a profile edited after the last scan is honoured when the policy is built from fresh inputs", async () => {
+test("stale inputs: an identity edited after the last scan is honoured when the lock is (re)built from the live definition", async () => {
   const repo = await makeTempRepo();
   try {
     await git(repo, ["remote", "add", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
     const manager = new ShieldManager();
-    const facts = await collectRepoFacts(repo.dir);
 
-    const editedProfile: Profile = { ...workProfile, expectedGitHubLogin: "danish-work", strictPushSetup: false };
-    await manager.enable(repo.dir, EVALUATOR_SOURCE, { facts, profiles: [editedProfile], protectedBranches: [] });
+    const editedIdentity: Identity = { ...workProfile, expectedGitHubLogin: "danish-work" };
+    await enableFromRealRepo(manager, repo, editedIdentity);
 
     const policy = await readPolicy(repo);
     assert.equal(policy.expectedGitHubLogin, "danish-work");
-    assert.equal(policy.strictPushSetup, false);
-    // And a health check against the same live profile sees no drift.
+    assert.deepEqual(policy.enforcedActions, ["commit", "push"]);
+    // And a health check against the same live identity sees no drift.
     const health = await manager.healthCheck(repo.dir, {
       evaluatorScriptSource: EVALUATOR_SOURCE,
-      currentProfiles: [editedProfile],
+      currentIdentities: [editedIdentity],
     });
     assert.equal(health.state, "active", health.summary);
   } finally {
@@ -784,13 +515,7 @@ test("chaining: an executable regular foreign hook is preserved BYTE-FOR-BYTE, i
     await fs.writeFile(hookPath, binary, { mode: 0o755 });
 
     const manager = new ShieldManager();
-    const facts = await collectRepoFacts(repo.dir);
-    await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-      facts,
-      profiles: [workProfile],
-      protectedBranches: [],
-      chainForeignHooks: true,
-    });
+    await enableFromRealRepo(manager, repo, workProfile, true);
 
     const sidecar = await fs.readFile(`${hookPath}${SHIELD_CHAIN_ORIGINAL_SUFFIX}`);
     assert.ok(sidecar.equals(binary), `bytes must round-trip exactly; got ${sidecar.toString("hex")}`);
@@ -810,13 +535,7 @@ test("chaining: a SYMLINKED foreign hook is refused, left exactly as a symlink, 
     await fs.symlink(target, hookPath);
 
     const manager = new ShieldManager();
-    const facts = await collectRepoFacts(repo.dir);
-    const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-      facts,
-      profiles: [workProfile],
-      protectedBranches: [],
-      chainForeignHooks: true,
-    });
+    const { result } = await enableFromRealRepo(manager, repo, workProfile, true);
 
     assert.equal((await fs.lstat(hookPath)).isSymbolicLink(), true, "the symlink must still be a symlink");
     assert.equal(await fs.readlink(hookPath), target, "and must still point at the same target");
@@ -840,13 +559,7 @@ test("chaining: a NON-EXECUTABLE foreign hook is refused rather than chained int
     await fs.writeFile(hookPath, contents, { mode: 0o644 });
 
     const manager = new ShieldManager();
-    const facts = await collectRepoFacts(repo.dir);
-    const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-      facts,
-      profiles: [workProfile],
-      protectedBranches: [],
-      chainForeignHooks: true,
-    });
+    const { result } = await enableFromRealRepo(manager, repo, workProfile, true);
 
     assert.equal(await fs.readFile(hookPath, "utf8"), contents, "left completely untouched");
     assert.equal(await exists(`${hookPath}${SHIELD_CHAIN_ORIGINAL_SUFFIX}`), false);
@@ -872,13 +585,7 @@ test("chaining: an executable shell foreign hook is chained and actually RUNS af
     await fs.writeFile(hookPath, `#!/bin/sh\necho ran > ${JSON.stringify(marker)}\nexit 0\n`, { mode: 0o755 });
 
     const manager = new ShieldManager();
-    const facts = await collectRepoFacts(repo.dir);
-    const result = await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-      facts,
-      profiles: [workProfile],
-      protectedBranches: [],
-      chainForeignHooks: true,
-    });
+    const { result } = await enableFromRealRepo(manager, repo, workProfile, true);
     assert.equal(result.inspection.state, "active", result.inspection.reasons.join("; "));
 
     await fs.writeFile(path.join(repo.dir, "a.txt"), "x");
@@ -906,13 +613,7 @@ test("chaining: an existing Shield sidecar is never overwritten by chaining a se
     await fs.writeFile(hookPath, "#!/bin/sh\n# a SECOND foreign hook\nexit 0\n", { mode: 0o755 });
 
     const manager = new ShieldManager();
-    const facts = await collectRepoFacts(repo.dir);
-    await manager.enable(repo.dir, EVALUATOR_SOURCE, {
-      facts,
-      profiles: [workProfile],
-      protectedBranches: [],
-      chainForeignHooks: true,
-    });
+    await enableFromRealRepo(manager, repo, workProfile, true);
 
     assert.match(await fs.readFile(sidecarPath, "utf8"), /the FIRST original/, "the existing sidecar must be preserved");
     assert.match(await fs.readFile(hookPath, "utf8"), /a SECOND foreign hook/, "and the foreign hook left alone");
@@ -930,7 +631,7 @@ test("pre-push shim: contains no predictable PID-based temp fallback, and fails 
   const script = buildPrePushHookScript();
   assert.doesNotMatch(script, /prepush-stdin\.\$\$/, "the guessable $$-based fallback path must be gone");
   assert.match(script, /mktemp/);
-  assert.match(script, /PUSH BLOCKED \(Shield internal error\)/);
+  assert.match(script, /blocked this push \(internal error\)/);
   // The failure path must not create OR truncate anything.
   const failureBlock = script.slice(script.indexOf("STDIN_CAPTURE=$(mktemp"), script.indexOf("chmod 600"));
   assert.doesNotMatch(failureBlock, /: > "\$STDIN_CAPTURE"/, "must never truncate a path it did not securely create");
@@ -945,7 +646,7 @@ test("pre-push shim: contains no predictable PID-based temp fallback, and fails 
  * tested is entirely inside the shim, and this way the assertion cannot be
  * confused by transport/remote setup.
  */
-test("pre-push shim: with mktemp forced to fail, the push is BLOCKED as a Shield internal error and no predictable path is created", { skip: SKIP_ON_WINDOWS }, async () => {
+test("pre-push shim: with mktemp forced to fail, the push is BLOCKED as an internal error and no predictable path is created", { skip: SKIP_ON_WINDOWS }, async () => {
   const repo = await makeTempRepo();
   const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p8-bin-"));
   const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "shield-p8-tmp-"));
@@ -978,7 +679,8 @@ test("pre-push shim: with mktemp forced to fail, the push is BLOCKED as a Shield
     });
 
     assert.notEqual(run.code, 0, "a push must never proceed when no secure temp file can be created");
-    assert.match(run.stderr, /Shield internal error/);
+    assert.match(run.stderr, /blocked this push \(internal error\)/);
+    assert.match(run.stderr, /^REASON: internal_error$/m);
     assert.match(run.stderr, /predictable temporary file name/);
     // Nothing at all may have been created in the temp directory — in
     // particular not the old `...prepush-stdin.<pid>` shape.

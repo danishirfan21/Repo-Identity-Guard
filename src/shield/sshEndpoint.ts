@@ -1,83 +1,79 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { parseSshEffectiveRoute } from "./githubSshVerification";
-
-const execFileAsync = promisify(execFile);
+import { SshEffectiveRoute, parseSshEffectiveRoute } from "./githubSshVerification";
 
 /**
- * The canonical physical SSH endpoint Shield persists into a policy's
- * `approvedPushDestination` (at enable/repair time) and compares the
- * CURRENT route against (at push/health-check time) — see
- * docs/SHIELD_MODE.md's "canonical physical push endpoint" section for the
- * full writeup of why a literal alias-name comparison is not sufficient.
+ * Runs `ssh` with an exact argv (never through a shell) and reports what
+ * happened. Injectable so tests can substitute a deterministic in-process
+ * fake instead of shadowing a fake `ssh` binary onto PATH — which Windows'
+ * process spawning does not resolve the way a POSIX shell does (see
+ * docs/SHIELD_MODE.md's Windows evaluator-testing notes). Production code
+ * always uses {@link defaultSshRunner}.
  */
-export interface CanonicalSshEndpoint {
-  /** The real host `ssh` will connect to — never the alias/literal host asked about. */
-  host: string;
-  /** Effective port, as a string (`ssh -G` always reports one; "22" when nothing set it). */
-  port: string;
+export type SshRunner = (
+  args: string[],
+  options: { env: NodeJS.ProcessEnv; timeoutMs: number },
+) => Promise<{ stdout: string; stderr: string; timedOut: boolean; spawnFailed: boolean }>;
+
+export const defaultSshRunner: SshRunner = (args, options) =>
+  new Promise((resolve) => {
+    execFile(
+      "ssh",
+      args,
+      { encoding: "utf8", timeout: options.timeoutMs, windowsHide: true, env: options.env, maxBuffer: 1024 * 1024 },
+      (error, stdout, stderr) => {
+        const err = error as (NodeJS.ErrnoException & { killed?: boolean; signal?: string }) | null;
+        resolve({
+          stdout: stdout ?? "",
+          stderr: stderr ?? "",
+          timedOut: !!err && (err.killed === true || err.signal === "SIGTERM"),
+          spawnFailed: !!err && typeof err.code === "string",
+        });
+      },
+    );
+  });
+
+/**
+ * The exact `ssh` target and port arguments for a route, built with the
+ * same rules `shield-evaluate.sh`'s `verify_github_account` uses:
+ *
+ *  - an explicit URL port is passed as `-p <port>` and ONLY then — an
+ *    absent port must ask OpenSSH "whatever this host's effective config
+ *    says", never a guessed 22;
+ *  - an explicit URL user becomes `<user>@<host>`; an absent one leaves the
+ *    target BARE so OpenSSH itself determines the effective user (its own
+ *    default or a `User`/`Match user` directive) exactly as the real push
+ *    transport would — never an invented "git".
+ */
+export function sshTargetArgs(hostOrAlias: string, options: { port?: string; user?: string } = {}): string[] {
+  const host = hostOrAlias.trim();
+  const user = options.user?.trim();
+  const target = user ? `${user}@${host}` : host;
+  return options.port ? ["-p", options.port, target] : [target];
 }
 
 /**
- * Resolves the REAL endpoint `ssh` would connect to for a given host or
- * alias, via `ssh -G` — purely local (reads the effective `~/.ssh/config`,
- * opens no network connection) and never trusts the input string's own
- * name as evidence of where it goes.
+ * Resolves the effective route `ssh` itself would use for a host or alias,
+ * via `ssh -G` — purely local (reads the effective client configuration,
+ * opens no network connection, reads no key material) and never trusting
+ * the alias's own name as evidence of where it goes.
  *
- * Returns `undefined` when `ssh` isn't on PATH, the call times out, or it
- * reports no hostname at all — every one of those is "unresolved," and
- * every caller of this function must treat that the same way: as evidence
- * that could not be gathered, never as a route that happens to be fine.
- *
- * Deliberately takes no way to run a caller-supplied command or shell
- * snippet: this spawns exactly `ssh -G <hostOrAlias>` via `execFile` (no
- * shell interpretation of `hostOrAlias`) and nothing else. It never
- * executes `GIT_SSH_COMMAND`/`core.sshCommand` to "discover" what they
- * would do — the presence of either makes the endpoint unprovable by
- * design (see the transport-override check in manager.ts/evaluator.ts),
- * never something this function tries to resolve around.
+ * Returns `undefined` when `ssh` is unavailable, times out, or reports no
+ * hostname — every caller must treat that as "unresolved" (fail closed),
+ * never as a route that happens to be fine. Never executes
+ * `GIT_SSH_COMMAND`/`core.sshCommand`: the presence of either makes a
+ * route unprovable by design (see `resolveSshCommandOverrides`), never
+ * something to resolve around.
  */
-export async function resolveCanonicalSshEndpoint(
+export async function resolveSshEffectiveRoute(
   hostOrAlias: string,
-  options: { timeoutMs?: number; env?: NodeJS.ProcessEnv; port?: string; user?: string } = {},
-): Promise<CanonicalSshEndpoint | undefined> {
-  const trimmed = hostOrAlias.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  // Matches shield-evaluate.sh's resolve_canonical_ssh_route exactly: `-p
-  // <port>` is passed ONLY when the caller supplied an explicit port (from
-  // the URL itself, e.g. `ssh://git@host:443/...`) — an absent port here
-  // must ask `ssh -G` with no `-p` at all, the same "whatever this host's
-  // effective config says" question the real push transport asks, never a
-  // guessed default. Passing the two sides of a comparison through
-  // DIFFERENT port semantics (one with an explicit `-p`, one without) is
-  // exactly what let an unchanged approved SSH destination read as a port
-  // mismatch — see docs/SHIELD_MODE.md's explicit-SSH-URL-port section.
-  //
-  // The SAME reasoning applies to the user: an absent `options.user` means
-  // the URL never named one, and the target passed to `ssh -G` must stay
-  // BARE (no invented "user@") so OpenSSH itself determines the effective
-  // user exactly as the real push transport would — never a hardcoded
-  // "git", which would ask a different question whenever the effective
-  // user is config-sensitive (`Match user`, a per-user `Host` block). See
-  // docs/SHIELD_MODE.md's "SSH user must never be invented" section.
-  const user = options.user?.trim();
-  const target = user ? `${user}@${trimmed}` : trimmed;
-  const args = options.port ? ["-G", "-p", options.port, target] : ["-G", target];
-  try {
-    const { stdout } = await execFileAsync("ssh", args, {
-      encoding: "utf8",
-      timeout: options.timeoutMs ?? 5000,
-      windowsHide: true,
-      env: options.env ?? process.env,
-    });
-    const route = parseSshEffectiveRoute(stdout);
-    if (!route) {
-      return undefined;
-    }
-    return { host: route.hostname, port: route.port };
-  } catch {
-    return undefined;
-  }
+  options: { port?: string; user?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; runner?: SshRunner } = {},
+): Promise<SshEffectiveRoute | undefined> {
+  if (!hostOrAlias.trim()) return undefined;
+  const runner = options.runner ?? defaultSshRunner;
+  const result = await runner(["-G", ...sshTargetArgs(hostOrAlias, options)], {
+    env: options.env ?? process.env,
+    timeoutMs: options.timeoutMs ?? 5000,
+  });
+  if (result.timedOut || result.spawnFailed) return undefined;
+  return parseSshEffectiveRoute(result.stdout);
 }

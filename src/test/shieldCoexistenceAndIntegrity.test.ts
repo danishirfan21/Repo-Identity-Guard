@@ -6,11 +6,13 @@ import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SHIELD_ARTIFACT_MARKER } from "../shield/artifacts";
-import { ShieldManager, SshResolver } from "../shield/manager";
-import { Profile, RepoFacts } from "../types";
+import { ShieldManager } from "../shield/manager";
+import type { Identity } from "../identity/types";
+import { serializeShieldPolicy } from "../shield/policy";
+import { WORK_IDENTITY, testPolicy } from "./testUtil/lockFixtures";
 
 /**
- * Integration tests for Shield Mode Phase 6: hook coexistence (chaining a
+ * Integration tests for the identity lock's hook coexistence (chaining a
  * pre-existing foreign hook rather than refusing to install alongside
  * it), worktree correctness, integrity detection, and install/uninstall
  * lifecycle robustness. Real temporary Git repositories throughout —
@@ -20,15 +22,7 @@ import { Profile, RepoFacts } from "../types";
 const execFileAsync = promisify(execFile);
 const EVALUATOR_SOURCE = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
 
-const workProfile: Profile = {
-  id: "work",
-  label: "Work",
-  gitName: "Danish Irfan",
-  gitEmail: "work@example.com",
-  expectedRemoteOwners: ["AcmeSoftware"],
-  strictPushSetup: true,
-  trustedSshHostAliases: ["github-work"],
-};
+const workProfile: Identity = WORK_IDENTITY;
 
 interface Repo {
   dir: string;
@@ -114,29 +108,6 @@ async function cleanup(...dirs: string[]): Promise<void> {
   await Promise.all(dirs.map((dir) => fs.rm(dir, { recursive: true, force: true }).catch(() => undefined)));
 }
 
-function baseFacts(repo: Repo, overrides: Partial<RepoFacts> = {}): RepoFacts {
-  return {
-    isGitRepo: true,
-    repoRoot: repo.dir,
-    repoName: path.basename(repo.dir),
-    remoteHost: "github.com",
-    remoteOwner: "AcmeSoftware",
-    remoteRepo: "acme-frontend",
-    // Phase 8: `approvedPushDestination` is built from the pushRemote*
-    // facts (the destination a plain `git push` actually reaches), never
-    // from origin's fetch facts. These fixtures describe the ordinary
-    // "origin is also the push destination" arrangement, so both sets
-    // agree; tests that deliberately separate them override pushRemote*.
-    pushRemoteName: "origin",
-    pushRemoteUrl: "git@github.com:AcmeSoftware/acme-frontend.git",
-    pushRemoteProtocol: "ssh" as const,
-    pushRemoteHost: "github.com",
-    pushRemoteOwner: "AcmeSoftware",
-    pushRemoteRepo: "acme-frontend",
-    ...overrides,
-  };
-}
-
 async function hooksDirFor(repo: Repo): Promise<string> {
   return git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "hooks"]);
 }
@@ -145,46 +116,16 @@ async function enableShield(
   manager: ShieldManager,
   repo: Repo,
   overrides: {
-    profiles?: Profile[];
-    facts?: Partial<RepoFacts>;
+    identity?: Identity;
     chainForeignHooks?: boolean;
-    fakeSshBin?: string;
-    sshResolver?: SshResolver;
   } = {},
 ) {
-  // Round-2 release-blocker fix: enable() now resolves and persists the
-  // approved destination's REAL canonical SSH endpoint via a live
-  // `ssh -G` call. Threading the fake ssh's PATH-shadowing directory
-  // through here (via ShieldEnableInput.env, never this test process's
-  // real global environment) is what makes that resolution see the fake
-  // "github-work -> github.com" route.
-  const env = overrides.fakeSshBin
-    ? { ...repo.env, PATH: `${overrides.fakeSshBin}${path.delimiter}${repo.env.PATH}` }
-    : undefined;
   return manager.enable(repo.dir, EVALUATOR_SOURCE, {
-    facts: baseFacts(repo, overrides.facts),
-    profiles: overrides.profiles ?? [workProfile],
-    protectedBranches: ["main", "master"],
+    identity: overrides.identity ?? workProfile,
+    lockId: "coexistence",
+    assignedAt: 1,
     chainForeignHooks: overrides.chainForeignHooks,
-    env,
-    sshResolver: overrides.sshResolver,
   });
-}
-
-/**
- * A deterministic, in-process stand-in for a real `ssh -G` resolution —
- * always resolves to `hostname` on port "22", regardless of platform.
- * Injected via `ShieldEnableInput.sshResolver`/
- * `ShieldInspectOptions.sshResolver` instead of shadowing a fake `ssh`
- * binary onto PATH, which is NOT deterministic across platforms: real
- * Windows process spawning does not resolve a PATH-shadowed fake `ssh`
- * the same way a POSIX shell does (see docs/SHIELD_MODE.md's Windows
- * evaluator-testing section). This makes the underlying Shield behavior
- * — not just the shell evaluator's own parsing — verifiable identically
- * on all three platforms.
- */
-function fakeResolverFor(hostname: string): SshResolver {
-  return async () => ({ host: hostname, port: "22" });
 }
 
 // ==================== hook coexistence: chaining ====================
@@ -290,7 +231,7 @@ test("execution order: Shield's own check runs FIRST — a chained hook never ru
     const result = await run(repo, ["commit", "-q", "-m", "should be blocked by Shield, not reach the chained hook"]);
 
     assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /COMMIT BLOCKED/);
+    assert.match(result.stderr, /REPO_IDENTITY_GUARD_BLOCK/);
     await assert.rejects(fs.access(markerFile), "the chained hook must never have run");
   } finally {
     await cleanup(repo.dir);
@@ -319,19 +260,17 @@ async function makeFakeSshBin(): Promise<string> {
 const { execFileSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const joined = " " + args.join(" ") + " ";
-// Round-2 release-blocker fix: enable()/repair() now resolve the approved
-// destination's canonical endpoint via a real "ssh -G" call. This fake
-// ssh answers it the same way the alias is expected to behave throughout
-// this file ("github-work" -> "github.com") so that resolution succeeds
-// under the fake instead of failing to parse a bare "-G" invocation as a
-// push transport command.
+// The lock's push check resolves the alias's effective route ("ssh -G")
+// and then asks GitHub who is authenticating ("ssh -T"); this fake answers
+// both the way a correctly configured "github-work" alias would, then
+// executes the real transport command locally.
 if (joined.includes(" -G ")) {
-  process.stdout.write(
-    "user " + (process.env.FAKE_SSH_USER || "git") + "\\n" +
-    "hostname " + (process.env.FAKE_SSH_HOSTNAME || "github.com") + "\\n" +
-    "port " + (process.env.FAKE_SSH_PORT || "22") + "\\n"
-  );
+  process.stdout.write("user git\\nhostname github.com\\nport 22\\nidentitiesonly yes\\n");
   process.exit(0);
+}
+if (joined.includes(" -T ")) {
+  process.stdout.write("Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.\\n");
+  process.exit(1);
 }
 const remoteCommand = args[args.length - 1] || "";
 const match = /^(\\S+)\\s+'(.*)'$/.exec(remoteCommand);
@@ -386,22 +325,15 @@ test("a chained pre-push hook receives the same argv AND the same stdin ref line
     );
 
     const manager = new ShieldManager();
-    // Trusted alias route, matching this profile's trustedSshHostAliases,
-    // so Shield's own strict route check allows the push through to the
-    // chained hook (the point of this test is the chaining plumbing, not
-    // route/destination enforcement, already covered elsewhere).
-    await enableShield(manager, repo, {
+    // An account-verifying lock over the trusted alias route, so the lock's
+    // own push check runs AND passes before the chained hook (the point of
+    // this test is the chaining plumbing, not route enforcement, which is
+    // covered elsewhere).
+    const enabled = await enableShield(manager, repo, {
       chainForeignHooks: true,
-      fakeSshBin,
-      facts: {
-        remoteHost: "github-work",
-        remoteOwner: "AcmeSoftware",
-        remoteRepo: "acme-frontend",
-        pushRemoteHost: "github-work",
-        pushRemoteOwner: "AcmeSoftware",
-        pushRemoteRepo: "acme-frontend",
-      },
+      identity: { ...workProfile, expectedGitHubLogin: "danish-work" },
     });
+    assert.equal(enabled.ok, true, enabled.inspection.reasons.join(" | "));
 
     await git(repo, ["remote", "add", "origin", `git@github-work:${bareDir}`]);
     const env = { ...repo.env, PATH: `${fakeSshBin}${path.delimiter}${repo.env.PATH}` };
@@ -656,7 +588,7 @@ test("integrity: an outdated Shield hook version is degraded (repair recommended
 
     const inspection = await manager.inspect(repo.dir);
     assert.equal(inspection.state, "degraded");
-    assert.match(inspection.reasons.join(" "), /newer Shield pre-commit hook is available/);
+    assert.match(inspection.reasons.join(" "), /newer identity-lock pre-commit hook is available/);
   } finally {
     await cleanup(repo.dir);
   }
@@ -711,165 +643,44 @@ test("integrity: a foreign hook that appears AFTER activation is detected on the
     assert.equal((await manager.inspect(repo.dir)).state, "active");
 
     const hooksDir = await hooksDirFor(repo);
-    await fs.writeFile(path.join(hooksDir, "pre-push"), "#!/bin/sh\necho takeover\nexit 0\n", { mode: 0o755 });
+    await fs.writeFile(path.join(hooksDir, "pre-commit"), "#!/bin/sh\necho takeover\nexit 0\n", { mode: 0o755 });
 
     const inspection = await manager.inspect(repo.dir);
     assert.equal(inspection.state, "degraded");
-    assert.match(inspection.reasons.join(" "), /pre-push.*did not create/);
+    assert.match(inspection.reasons.join(" "), /pre-commit.*did not create/);
   } finally {
     await cleanup(repo.dir);
   }
 });
 
-test("integrity: approved push destination drift is detected only when the caller supplies the current destination, and never auto-repaired", async () => {
-  const repo = await makeTempRepo();
-  try {
-    const manager = new ShieldManager();
-    await enableShield(manager, repo, { facts: { remoteOwner: "AcmeSoftware", remoteRepo: "acme-frontend" } });
-
-    const withoutCheck = await manager.inspect(repo.dir);
-    assert.equal(withoutCheck.pushDestinationDrift, false);
-    assert.equal(withoutCheck.state, "active");
-
-    const withDrift = await manager.inspect(repo.dir, { currentPushDestination: { owner: "SomeoneElse", repo: "other-repo" } });
-    assert.equal(withDrift.pushDestinationDrift, true);
-    assert.equal(withDrift.state, "degraded");
-
-    // inspect() never writes anything -- checking again changes nothing.
-    const stillDrifted = await manager.inspect(repo.dir, { currentPushDestination: { owner: "SomeoneElse", repo: "other-repo" } });
-    assert.equal(stillDrifted.state, "degraded");
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-// Review finding: `pushDestinationDrift` used to compare owner/repo ONLY,
-// ignoring host entirely -- so a push destination that moved to a different
-// HOST while keeping the same owner/repo text read as unchanged, and Shield
-// stayed "active" rather than "degraded". Health status and hook
-// enforcement (which DOES require host identity, independent of
-// strictPushSetup -- see the release-blocker fix in evaluator.ts) must
-// agree about whether the approved destination changed.
-test("integrity: a host-only change in the push destination IS drift, even with the same owner/repo (health must agree with hook enforcement)", async () => {
-  const repo = await makeTempRepo();
-  try {
-    const manager = new ShieldManager();
-    // approvedPushDestination is built from pushRemoteHost/Owner/Repo — see
-    // baseFacts(), host "github.com".
-    await enableShield(manager, repo);
-    assert.equal((await manager.inspect(repo.dir)).state, "active");
-
-    const withHostDrift = await manager.inspect(repo.dir, {
-      currentPushDestination: { host: "evil.example", owner: "AcmeSoftware", repo: "acme-frontend" },
-    });
-    assert.equal(withHostDrift.pushDestinationDrift, true, "same owner/repo, different host, must still be drift");
-    assert.equal(withHostDrift.state, "degraded");
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("integrity: missing repo evidence in the current push destination is drift, never silently treated as unchanged", async () => {
-  const repo = await makeTempRepo();
-  try {
-    const manager = new ShieldManager();
-    await enableShield(manager, repo);
-    assert.equal((await manager.inspect(repo.dir)).state, "active");
-
-    // approved.repo is set ("acme-frontend") but current.repo is missing —
-    // the old `!!current.repo &&` guard treated this as "can't compare, so
-    // not changed"; missing evidence must never be silently equal.
-    const withMissingRepo = await manager.inspect(repo.dir, {
-      currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: undefined },
-    });
-    assert.equal(withMissingRepo.pushDestinationDrift, true);
-    assert.equal(withMissingRepo.state, "degraded");
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-// Review case F: health inspection after an SSH alias's endpoint changes
-// must report DEGRADED — but only via the EXPLICIT, on-demand canonical
-// check (resolveCanonicalDestinationDrift), since that is what actually
-// re-resolves the current route through a real "ssh -G" call rather than
-// comparing literal host text (see the class-level doc comment on
-// ShieldInspectOptions.resolveCanonicalDestinationDrift for why routine
-// background scans intentionally do NOT pay that cost automatically).
-//
-// Windows finding, now fixed rather than skipped: a PATH-shadowed fake
-// `ssh` binary is not reached identically across platforms by the
-// manager's own direct `execFile("ssh", ...)` call (Windows process
-// spawning does not resolve it the same way a POSIX shell does). Rather
-// than skip this test on Windows, it now drives the SAME manager code
-// through `ShieldEnableInput.sshResolver`/`ShieldInspectOptions.sshResolver`
-// dependency injection (`fakeResolverFor`, above) — no PATH shadowing, no
-// real subprocess, deterministic on all three platforms, and it still
-// exercises Shield's actual `canonicalizeDestination`/drift-comparison
-// logic, not a re-implementation of it.
-test("integrity: an SSH alias's endpoint changing since enable() is caught by the explicit canonical health check (case F), never by the cheap literal check alone", async () => {
-  const repo = await makeTempRepo();
-  try {
-    const manager = new ShieldManager();
-    await enableShield(manager, repo, { sshResolver: fakeResolverFor("github.com") });
-    assert.equal((await manager.inspect(repo.dir)).state, "active");
-
-    // Literal host/owner/repo text is UNCHANGED (still "github.com" per
-    // baseFacts) -- only what the alias ACTUALLY resolves to right now
-    // has changed, simulating a ~/.ssh/config edit since enable().
-    const cheapCheck = await manager.inspect(repo.dir, {
-      currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
-    });
-    assert.equal(cheapCheck.pushDestinationDrift, false, "the cheap literal check cannot see an alias repoint by design");
-    assert.equal(cheapCheck.state, "active");
-
-    const canonicalCheck = await manager.inspect(repo.dir, {
-      currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
-      resolveCanonicalDestinationDrift: true,
-      sshResolver: fakeResolverFor("evil.example"),
-    });
-    assert.equal(canonicalCheck.pushDestinationDrift, true, "the explicit canonical check must catch the repoint");
-    assert.equal(canonicalCheck.state, "degraded");
-
-    // Sanity: the SAME explicit canonical check, with NO repoint, must not
-    // false-positive.
-    const canonicalCheckUnchanged = await manager.inspect(repo.dir, {
-      currentPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend", protocol: "ssh" },
-      resolveCanonicalDestinationDrift: true,
-      sshResolver: fakeResolverFor("github.com"),
-    });
-    assert.equal(canonicalCheckUnchanged.pushDestinationDrift, false);
-    assert.equal(canonicalCheckUnchanged.state, "active");
-  } finally {
-    await cleanup(repo.dir);
-  }
-});
-
-test("integrity: account verification configuration drift (expectedGitHubLogin changed) is detected via currentProfiles, and repair() re-syncs it", async () => {
+test("integrity: identity drift (the assigned identity was edited in settings) is detected via currentIdentities, and repair() re-syncs it", async () => {
   const repo = await makeTempRepo();
   try {
     const manager = new ShieldManager();
     await enableShield(manager, repo); // workProfile has no expectedGitHubLogin
 
-    const updatedProfile: Profile = { ...workProfile, expectedGitHubLogin: "danish-work" };
+    const updatedIdentity: Identity = { ...workProfile, expectedGitHubLogin: "danish-work" };
 
     const withoutCheck = await manager.inspect(repo.dir);
-    assert.equal(withoutCheck.policyProfileDrift, false);
+    assert.equal(withoutCheck.identityDrift, false);
 
-    const withDrift = await manager.inspect(repo.dir, { currentProfiles: [updatedProfile] });
-    assert.equal(withDrift.policyProfileDrift, true);
+    const withDrift = await manager.inspect(repo.dir, { currentIdentities: [updatedIdentity] });
+    assert.equal(withDrift.identityDrift, true);
+    assert.deepEqual(withDrift.identityDriftDetails, ["expectedGitHubLogin"]);
     assert.equal(withDrift.state, "degraded");
     assert.match(withDrift.reasons.join(" "), /expectedGitHubLogin/);
 
-    // Explicit repair (never automatic) re-syncs the policy to the live profile.
-    await manager.repair(repo.dir, EVALUATOR_SOURCE, {
-      facts: baseFacts(repo),
-      profiles: [updatedProfile],
-      protectedBranches: ["main", "master"],
-    });
-    const afterRepair = await manager.inspect(repo.dir, { currentProfiles: [updatedProfile] });
-    assert.equal(afterRepair.policyProfileDrift, false);
+    // The identity was REMOVED from settings entirely: still drift, never "fine".
+    const removed = await manager.inspect(repo.dir, { currentIdentities: [] });
+    assert.equal(removed.identityDrift, true);
+    assert.deepEqual(removed.identityDriftDetails, ["identity removed"]);
+
+    // Explicit repair (never automatic) re-syncs the lock to the live identity.
+    await manager.repair(repo.dir, EVALUATOR_SOURCE, { identity: updatedIdentity, lockId: "coexistence", assignedAt: 1 });
+    const afterRepair = await manager.inspect(repo.dir, { currentIdentities: [updatedIdentity] });
+    assert.equal(afterRepair.identityDrift, false);
     assert.equal(afterRepair.state, "active");
+    assert.deepEqual(afterRepair.policySnapshot?.enforcedActions, ["commit", "push"]);
   } finally {
     await cleanup(repo.dir);
   }
@@ -908,18 +719,7 @@ test("lifecycle: an interrupted enable (policy written, hooks/evaluator not yet)
     await fs.mkdir(path.join(commonDir, "repo-identity-guard"), { recursive: true });
     await fs.writeFile(
       path.join(commonDir, "repo-identity-guard", "shield-policy.json"),
-      JSON.stringify({
-        policyVersion: 2,
-        generatedAt: Date.now(),
-        matchedProfileId: "work",
-        profileLabel: "Work",
-        expectedGitEmail: "work@example.com",
-        trustedSshHostAliases: [],
-        strictPushSetup: true,
-        protectedBranches: [],
-        expectedBranchPatterns: [],
-        enabledActions: ["commit", "push"],
-      }),
+      serializeShieldPolicy(testPolicy(workProfile)),
     );
 
     const midway = await manager.inspect(repo.dir);

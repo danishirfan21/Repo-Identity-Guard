@@ -15,17 +15,18 @@ import {
   writeRawPolicy,
 } from "./fuzzHarness";
 import { ShieldPolicy, parseShieldPolicy, serializeShieldPolicy } from "../shield/policy";
+import { WORK_IDENTITY, testPolicy } from "./testUtil/lockFixtures";
 
 /**
  * PART 8 — adversarial fuzzing of the standalone evaluator's policy parser.
  *
  * The evaluator parses its policy with a recursive-descent JSON parser
  * written in POSIX awk (no jq, no Node, no Python — see the long comment in
- * `shield-evaluate.sh`). That parser is the one piece of Shield that faces
- * arbitrary bytes off disk, and its two historical failure modes were both
- * FAIL-OPEN: a compactly-formatted policy and a truncated policy each made
- * `enabledActions` come back empty, which the script read as "this policy
- * does not govern this action" and exited 0.
+ * `shield-evaluate.sh`). That parser is the one piece of the identity lock
+ * that faces arbitrary bytes off disk, and its two historical failure
+ * modes were both FAIL-OPEN: a compactly-formatted policy and a truncated
+ * policy each made the actions array come back empty, which the script
+ * read as "this policy does not govern this action" and exited 0.
  *
  * ## The invariant under test
  *
@@ -47,22 +48,7 @@ const SEED = fuzzSeed(0x9011c4);
 // for the repository state these tests set up, so any block observed for it
 // is attributable to parsing rather than to policy content.
 function baselinePolicy(): ShieldPolicy {
-  return {
-    policyVersion: 2,
-    generatedAt: 1_700_000_000_000,
-    matchedProfileId: "work",
-    profileLabel: "Work",
-    expectedGitName: "Danish Irfan",
-    expectedGitEmail: "work@example.com",
-    approvedRepositoryKey: "github.com/AcmeSoftware/acme-frontend",
-    approvedPushDestination: { host: "github.com", owner: "AcmeSoftware", repo: "acme-frontend" },
-    trustedSshHostAliases: ["github-work"],
-    expectedGitHubLogin: undefined,
-    strictPushSetup: false,
-    protectedBranches: ["main"],
-    expectedBranchPatterns: ["feature/*"],
-    enabledActions: ["commit", "push"],
-  };
+  return testPolicy(WORK_IDENTITY);
 }
 
 const BASELINE_JSON = serializeShieldPolicy(baselinePolicy());
@@ -96,23 +82,23 @@ function validCases(): ParserCase[] {
       expect: "allow",
     },
     {
-      label: "empty arrays everywhere they are allowed",
-      raw: JSON.stringify({ ...policy, trustedSshHostAliases: [], protectedBranches: [], expectedBranchPatterns: [] }),
+      label: "empty trustedSshHostAliases (allowed)",
+      raw: JSON.stringify({ ...policy, trustedSshHostAliases: [] }),
       expect: "allow",
     },
     {
-      label: "large arrays (500 protected branches, none of them the current one)",
-      raw: JSON.stringify({ ...policy, protectedBranches: Array.from({ length: 500 }, (_, i) => `br-${i}`) }),
+      label: "large arrays (500 trusted aliases)",
+      raw: JSON.stringify({ ...policy, trustedSshHostAliases: Array.from({ length: 500 }, (_, i) => `alias-${i}`) }),
       expect: "allow",
     },
     {
-      label: "escaped quotes and backslashes inside profileLabel",
-      raw: JSON.stringify({ ...policy, profileLabel: 'Work "quoted" \\ backslash' }),
+      label: "escaped quotes and backslashes inside identityLabel",
+      raw: JSON.stringify({ ...policy, identityLabel: 'Work "quoted" \\ backslash' }),
       expect: "allow",
     },
     {
       label: "forward-slash escapes (legal JSON, unusual)",
-      raw: JSON.stringify(policy).replace(/github\.com/g, "github.com").replace(/"github/g, '"github'),
+      raw: JSON.stringify(policy).replace(/"github-work"/g, '"github\\/work"'),
       expect: "allow",
     },
     {
@@ -121,36 +107,18 @@ function validCases(): ParserCase[] {
       expect: "allow",
     },
     {
-      label: "non-ASCII unicode escape in profileLabel (materialized as '?', never a control character)",
+      label: "non-ASCII unicode escape in identityLabel (materialized as '?', never a control character)",
       raw: JSON.stringify(policy).replace('"Work"', '"W\\u00f6rk"'),
       expect: "allow",
     },
     {
-      label: "nested approvedPushDestination written compactly on one line",
-      raw: JSON.stringify(policy).replace(
-        /"approvedPushDestination":\{[^}]*\}/,
-        '"approvedPushDestination":{"host":"github.com","owner":"AcmeSoftware","repo":"acme-frontend"}',
-      ),
+      label: "optional field omitted entirely (expectedGitName)",
+      raw: JSON.stringify({ ...policy, expectedGitName: undefined }),
       expect: "allow",
     },
     {
-      label: "approvedPushDestination pretty-printed while the rest is compact",
-      raw: JSON.stringify(policy).replace(
-        /"approvedPushDestination":\{[^}]*\}/,
-        '"approvedPushDestination": {\n  "host" : "github.com" ,\n  "owner" : "AcmeSoftware" ,\n  "repo" : "acme-frontend"\n }',
-      ),
-      expect: "allow",
-    },
-    {
-      label: "optional fields omitted entirely (approvedRepositoryKey, expectedGitName, approvedPushDestination)",
-      raw: JSON.stringify({
-        ...policy,
-        approvedRepositoryKey: undefined,
-        expectedGitName: undefined,
-        approvedPushDestination: undefined,
-      }),
-      // Valid, but push then fails closed on the missing destination —
-      // this case is run for COMMIT, where it must allow.
+      label: "an unknown extra object (legal JSON, ignored by both validators)",
+      raw: JSON.stringify({ ...policy, extra: { a: [1, { b: "c" }] } }),
       expect: "allow",
     },
   ];
@@ -166,30 +134,27 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
 
   const add = (label: string, raw: string) => cases.push({ label, raw, expect: "block" });
 
-  // --- duplicate keys, top-level and nested ---
-  add("duplicate policyVersion", compact.replace('{"policyVersion":2', '{"policyVersion":2,"policyVersion":2'));
-  add("duplicate policyVersion with DIFFERENT values", compact.replace('{"policyVersion":2', '{"policyVersion":999,"policyVersion":2'));
+  // --- duplicate keys ---
+  add("duplicate policyVersion", compact.replace('{"policyVersion":3', '{"policyVersion":3,"policyVersion":3'));
+  add("duplicate policyVersion with DIFFERENT values", compact.replace('{"policyVersion":3', '{"policyVersion":999,"policyVersion":3'));
   add("duplicate expectedGitEmail with a different value", compact.replace('"expectedGitEmail"', '"expectedGitEmail":"attacker@example.com","expectedGitEmail"'));
-  add("duplicate enabledActions", `${compact.slice(0, -1)},"enabledActions":[]}`);
-  add(
-    "duplicate owner INSIDE approvedPushDestination",
-    compact.replace('"owner":"AcmeSoftware"', '"owner":"Attacker","owner":"AcmeSoftware"'),
-  );
+  add("duplicate enforcedActions", `${compact.slice(0, -1)},"enforcedActions":["commit"]}`);
+  add("duplicate key inside a nested unknown object", compact.replace(/\}$/, ',"extra":{"k":1,"k":2}}'));
 
   // --- structural malformation ---
   add("trailing garbage after a complete document", `${compact}garbage`);
   add("trailing second JSON document", `${compact}${compact}`);
-  add("trailing comma in an object", compact.replace(/\}$/, ',}'));
-  add("trailing comma in an array", compact.replace('["commit","push"]', '["commit","push",]'));
+  add("trailing comma in an object", compact.replace(/\}$/, ",}"));
+  add("trailing comma in an array", compact.replace('["commit"]', '["commit",]'));
   add("unterminated string", compact.replace('"Work"', '"Work'));
   add("unterminated object", compact.slice(0, -1));
-  add("unterminated array", compact.replace('["commit","push"]', '["commit","push"'));
+  add("unterminated array", compact.replace('["commit"]', '["commit"'));
   add("bare value, not an object", '"just a string"');
   add("top-level array", `[${compact}]`);
   add("empty document", "");
   add("whitespace-only document", "   \n\t  ");
   add("JSON null", "null");
-  add("not JSON at all", "policyVersion=1; enabledActions=commit,push");
+  add("not JSON at all", "policyVersion=3; enforcedActions=commit");
 
   // --- string / escape malformation ---
   add("invalid escape sequence", compact.replace('"Work"', '"Wo\\qrk"'));
@@ -198,51 +163,52 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
   add("dangling backslash at end of string", compact.replace('"Work"', '"Work\\"'));
   add("raw newline inside a string", compact.replace('"Work"', '"Wo\nrk"'));
   add("raw tab inside a string", compact.replace('"Work"', '"Wo\trk"'));
-  add("raw control character (0x01) inside a string", compact.replace('"Work"', '"Work"'));
+  add("raw control character (0x01) inside a string", compact.replace('"Work"', '"Wo\u0001rk"'));
   add("single-quoted string", compact.replace('"Work"', "'Work'"));
-  add("unquoted key", compact.replace('"profileLabel"', "profileLabel"));
+  add("unquoted key", compact.replace('"identityLabel"', "identityLabel"));
 
   // --- literal / number malformation ---
-  add("capitalized True for strictPushSetup", compact.replace('"strictPushSetup":false', '"strictPushSetup":True'));
-  add("bare word for strictPushSetup", compact.replace('"strictPushSetup":false', '"strictPushSetup":yes'));
+  add("capitalized True literal", compact.replace('"expectedGitName":"Danish Irfan"', '"expectedGitName":True'));
+  add("bare word literal", compact.replace('"expectedGitName":"Danish Irfan"', '"expectedGitName":yes'));
   add("NULL literal in wrong case", compact.replace('"expectedGitName":"Danish Irfan"', '"expectedGitName":NULL'));
-  add("leading-zero number", compact.replace('"policyVersion":2', '"policyVersion":02'));
-  add("hex number", compact.replace('"policyVersion":2', '"policyVersion":0x2'));
+  add("leading-zero number", compact.replace('"policyVersion":3', '"policyVersion":03'));
+  add("hex number", compact.replace('"policyVersion":3', '"policyVersion":0x3'));
   add("trailing-dot number", compact.replace('"generatedAt":1700000000000', '"generatedAt":1700000000000.'));
-  add("plus-signed number", compact.replace('"policyVersion":2', '"policyVersion":+2'));
+  add("plus-signed number", compact.replace('"policyVersion":3', '"policyVersion":+3'));
   add("Infinity", compact.replace('"generatedAt":1700000000000', '"generatedAt":Infinity'));
   add("NaN", compact.replace('"generatedAt":1700000000000', '"generatedAt":NaN'));
 
   // --- schema-invalid but JSON-valid ---
-  add("wrong policyVersion", compact.replace('"policyVersion":2', '"policyVersion":1'));
-  add("policyVersion as a string", compact.replace('"policyVersion":2', '"policyVersion":"2"'));
-  add("strictPushSetup as a string", compact.replace('"strictPushSetup":false', '"strictPushSetup":"false"'));
-  add("strictPushSetup as a number", compact.replace('"strictPushSetup":false', '"strictPushSetup":0'));
-  add("strictPushSetup as null", compact.replace('"strictPushSetup":false', '"strictPushSetup":null'));
-  add("enabledActions as a string", compact.replace('["commit","push"]', '"commit,push"'));
-  add("enabledActions containing a non-action", compact.replace('["commit","push"]', '["commit","push","rebase"]'));
-  add("enabledActions containing a number", compact.replace('["commit","push"]', '["commit",1]'));
-  add("protectedBranches as an object", compact.replace('["main"]', '{"0":"main"}'));
+  add("legacy policyVersion 2", compact.replace('"policyVersion":3', '"policyVersion":2'));
+  add("future policyVersion", compact.replace('"policyVersion":3', '"policyVersion":4'));
+  add("policyVersion as a string", compact.replace('"policyVersion":3', '"policyVersion":"3"'));
+  add("enforcedActions as a string", compact.replace('["commit"]', '"commit"'));
+  add("enforcedActions containing a non-action", compact.replace('["commit"]', '["commit","rebase"]'));
+  add("enforcedActions containing a number", compact.replace('["commit"]', '["commit",1]'));
+  add("enforcedActions without commit", compact.replace('["commit"]', '["push"]'));
+  add("enforcedActions empty", compact.replace('["commit"]', "[]"));
+  add("enforcedActions claims push without a GitHub login", compact.replace('["commit"]', '["commit","push"]'));
+  add("expectedGitHubLogin without push enforcement", compact.replace('"identityLabel":"Work"', '"identityLabel":"Work","expectedGitHubLogin":"danish-work"'));
+  add("trustedSshHostAliases as an object", compact.replace('["github-work"]', '{"0":"github-work"}'));
   add("trustedSshHostAliases containing an object", compact.replace('["github-work"]', '[{"host":"github-work"}]'));
-  add("approvedPushDestination as an array", compact.replace(/"approvedPushDestination":\{[^}]*\}/, '"approvedPushDestination":[]'));
-  add("approvedPushDestination as a string", compact.replace(/"approvedPushDestination":\{[^}]*\}/, '"approvedPushDestination":"github.com/acme/x"'));
-  add("approvedPushDestination.owner as a number", compact.replace('"owner":"AcmeSoftware"', '"owner":42'));
   add("expectedGitEmail as a number", compact.replace('"expectedGitEmail":"work@example.com"', '"expectedGitEmail":1'));
   add("expectedGitEmail empty", compact.replace('"expectedGitEmail":"work@example.com"', '"expectedGitEmail":""'));
-  add("profileLabel empty", compact.replace('"profileLabel":"Work"', '"profileLabel":""'));
+  add("identityLabel empty", compact.replace('"identityLabel":"Work"', '"identityLabel":""'));
+  add("lockId empty", compact.replace('"lockId":"test-lock"', '"lockId":""'));
+  add("assignedAt as a string", compact.replace('"assignedAt":1700000000000', '"assignedAt":"1700000000000"'));
+  add("expectedGitName as null", compact.replace('"expectedGitName":"Danish Irfan"', '"expectedGitName":null'));
 
   // --- missing required fields ---
   for (const field of [
     "policyVersion",
+    "lockId",
+    "assignedAt",
     "generatedAt",
-    "matchedProfileId",
-    "profileLabel",
+    "identityId",
+    "identityLabel",
     "expectedGitEmail",
     "trustedSshHostAliases",
-    "strictPushSetup",
-    "protectedBranches",
-    "expectedBranchPatterns",
-    "enabledActions",
+    "enforcedActions",
   ]) {
     const without = { ...(policy as unknown as Record<string, unknown>) };
     delete without[field];
@@ -256,34 +222,18 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
   add("secret-shaped field present but null", JSON.stringify({ ...policy, token: null }));
 
   // --- misleading nesting ---
-  // NOTE: extra keys nested inside `approvedPushDestination` are legal
-  // under BOTH validators (neither rejects unknown keys), so this is not an
-  // "invalid" case — it is checked separately, in its own test below, for
-  // the property that actually matters: a nested key must never be read as
-  // if it were the top-level one. It stays in the corpus without an
-  // `expect`, so only the safety invariant applies to it.
+  // Extra keys under an unknown object are legal under BOTH validators, so
+  // this stays in the corpus without an `expect` (only the safety
+  // invariant applies). The property that matters — a nested key is never
+  // read as the top-level one — has its own test below.
   cases.push({
     label: "nested object whose keys shadow top-level field names",
-    raw: JSON.stringify({
-      ...policy,
-      approvedPushDestination: {
-        host: "github.com",
-        owner: "AcmeSoftware",
-        repo: "acme-frontend",
-        enabledActions: ["commit", "push"],
-        strictPushSetup: true,
-        expectedGitEmail: "attacker@example.com",
-      },
-    }),
+    raw: JSON.stringify({ ...policy, extra: { enforcedActions: [], expectedGitEmail: "attacker@example.com", policyVersion: 3 } }),
   });
   add(
     "deeply nested junk plus a secret-shaped top-level field",
     JSON.stringify({ ...policy, junk: { a: { b: { c: { d: { e: [1, 2, { f: "g" }] } } } } }, token: "x" }),
   );
-  cases.push({
-    label: "deeply nested junk under an unexpected key (legal JSON, unknown key)",
-    raw: JSON.stringify({ ...policy, junk: { a: { b: { c: { d: { e: [1, 2, { f: "g" }] } } } } } }),
-  });
 
   // --- truncation sweep ---
   // Every byte position is checked for the pretty-printed form by default
@@ -390,8 +340,8 @@ test("PART 8 — every rejected policy is reported as policy-corrupt specificall
   const cases: string[] = [
     `${compact}trailing`,
     compact.slice(0, 40),
-    compact.replace('"strictPushSetup":false', '"strictPushSetup":"no"'),
-    compact.replace('"policyVersion":2', '"policyVersion":2,"policyVersion":2'),
+    compact.replace('["commit"]', '["push"]'),
+    compact.replace('"policyVersion":3', '"policyVersion":3,"policyVersion":3'),
     JSON.stringify({ ...baselinePolicy(), token: "x" }),
     "not json",
   ];
@@ -416,65 +366,50 @@ test("PART 8 — a nested key that shadows a top-level field name is never read 
   const repo = repos[0];
   try {
     await prepareRepoState(repo);
-    // Top level says NOT strict and expects work@example.com; the nested
-    // object says strict and expects someone else. Path lookups are exact,
-    // so the nested values must have no effect whatsoever.
+    // Top level: commit-only lock expecting work@example.com. The nested
+    // object claims a different email, push enforcement with a GitHub
+    // login, and no actions at all. Path lookups are exact, so none of it
+    // may have any effect.
     await writeRawPolicy(
       repo,
       JSON.stringify({
         ...baselinePolicy(),
-        approvedPushDestination: {
-          host: "github.com",
-          // canonicalHost: literal HTTPS host below needs no "ssh -G"
-          // resolution (this file has no fake-ssh transport set up — its
-          // whole point is nested-key isolation, not SSH canonicalization,
-          // which has its own dedicated coverage elsewhere).
-          canonicalHost: "github.com",
-          owner: "AcmeSoftware",
-          repo: "acme-frontend",
-          strictPushSetup: true,
+        extra: {
           expectedGitEmail: "attacker@example.com",
           expectedGitHubLogin: "attacker",
           trustedSshHostAliases: [],
-          protectedBranches: ["feature/login"],
-          enabledActions: [],
+          enforcedActions: [],
         },
       }),
     );
-    // The identity actually configured is work@example.com and the branch is
-    // feature/login. If ANY nested value leaked into a top-level read the
-    // commit would be blocked (wrong expected email, or a protected branch),
-    // or enforcement would be skipped entirely (empty enabledActions).
     const commit = await runEvaluator(repo, ["commit"]);
     assert.equal(commit.allowed, true, commit.stderr);
-
-    // And on the push side, the nested `strictPushSetup: true` must not turn
-    // a non-strict policy strict: an unverifiable HTTPS route is allowed
-    // here precisely because the TOP-LEVEL policy is not strict.
+    // And the nested login must not turn a commit-only lock into a push lock.
     const push = await runEvaluator(repo, ["push", "origin", "https://github.com/AcmeSoftware/acme-frontend.git"]);
     assert.equal(push.allowed, true, push.stderr);
+    // While a wrong identity is still blocked by the TOP-LEVEL expectation.
+    await setConfiguredIdentity(repo, "Danish Irfan", "attacker@example.com");
+    const wrong = await runEvaluator(repo, ["commit"]);
+    assert.deepEqual(wrong.reasonIds, ["commit-identity-mismatch"]);
   } finally {
     await destroyRepoPool(repos);
   }
 });
 
-test("PART 8 — an enabledActions array naming an action this build cannot enforce is corruption, not a subset", async () => {
+test("PART 8 — an enforcedActions array naming an action this build cannot enforce, or dropping commit, is corruption, not a subset", async () => {
   const repos = await createRepoPool(1);
   const repo = repos[0];
   try {
     await prepareRepoState(repo);
-    for (const actions of [["commit", "push", "rebase"], ["fetch"], ["Commit"], ["commit", ""], ["push", "push "]]) {
-      await writeRawPolicy(repo, JSON.stringify({ ...baselinePolicy(), enabledActions: actions }));
+    for (const actions of [["commit", "push", "rebase"], ["fetch"], ["Commit"], ["commit", ""], ["push", "push "], [], ["push"]]) {
+      const raw = JSON.stringify({ ...baselinePolicy(), enforcedActions: actions });
+      await writeRawPolicy(repo, raw);
       const result = await runEvaluator(repo, ["commit"]);
-      assert.equal(result.allowed, false, `enabledActions ${JSON.stringify(actions)} was allowed`);
+      assert.equal(result.allowed, false, `enforcedActions ${JSON.stringify(actions)} was allowed`);
       assert.deepEqual(result.reasonIds, ["policy-corrupt"]);
       // The TypeScript validator agrees, which is the whole point.
-      assert.equal(parseShieldPolicy(JSON.stringify({ ...baselinePolicy(), enabledActions: actions })).ok, false);
+      assert.equal(parseShieldPolicy(raw).ok, false, JSON.stringify(actions));
     }
-    // An empty list stays legal in both: it simply governs nothing.
-    await writeRawPolicy(repo, JSON.stringify({ ...baselinePolicy(), enabledActions: [] }));
-    assert.equal((await runEvaluator(repo, ["commit"])).allowed, true);
-    assert.equal(parseShieldPolicy(JSON.stringify({ ...baselinePolicy(), enabledActions: [] })).ok, true);
   } finally {
     await destroyRepoPool(repos);
   }

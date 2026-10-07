@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
 
 /**
- * Shared machinery for Shield's differential/fuzz test harnesses
+ * Shared machinery for the identity lock's differential/fuzz test harnesses
  * (Parts 7, 8 and 9). Not itself a test file — `scripts/run-tests.js` only
  * picks up `*.test.js`, so this compiles alongside them and is imported.
  *
@@ -27,12 +27,9 @@ import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
  *     worker drives its own, serially, so cases never clobber each other's
  *     policy file.
  *  3. **Process-free state control.** Per case, the repository's HEAD, its
- *     in-progress-operation markers, its configured identity, and its
- *     policy are all set by writing files — no `git checkout`, no
- *     `git config` subprocess — so a case costs exactly ONE spawn (the
- *     evaluator itself). `.git/HEAD` written as `ref: refs/heads/<name>` is
- *     precisely what `git symbolic-ref` does, and written as a raw object
- *     id is precisely a detached HEAD.
+ *     configured identity, and its policy are all set by writing files —
+ *     no `git checkout`, no `git config` subprocess — so a case costs
+ *     exactly ONE spawn (the evaluator itself).
  */
 
 // ==================== deterministic RNG ====================
@@ -223,30 +220,6 @@ export async function setHeadBranch(repo: FuzzRepo, branch: string): Promise<voi
   await fs.writeFile(path.join(repo.gitCommonDir, "HEAD"), `ref: refs/heads/${branch}\n`);
 }
 
-/** Detaches HEAD onto this repository's real commit — byte-identical to what `git checkout --detach` writes. */
-export async function setHeadDetached(repo: FuzzRepo): Promise<void> {
-  await fs.writeFile(path.join(repo.gitCommonDir, "HEAD"), `${repo.headSha}\n`);
-}
-
-export type InProgressMarker = "merge" | "rebase-merge" | "rebase-apply" | "cherry-pick" | "revert" | undefined;
-
-/** Sets exactly one in-progress-operation marker (or none), clearing all the others first. */
-export async function setInProgressMarker(repo: FuzzRepo, marker: InProgressMarker): Promise<void> {
-  const dir = repo.gitCommonDir;
-  await Promise.all([
-    fs.rm(path.join(dir, "MERGE_HEAD"), { force: true }),
-    fs.rm(path.join(dir, "CHERRY_PICK_HEAD"), { force: true }),
-    fs.rm(path.join(dir, "REVERT_HEAD"), { force: true }),
-    fs.rm(path.join(dir, "rebase-merge"), { recursive: true, force: true }),
-    fs.rm(path.join(dir, "rebase-apply"), { recursive: true, force: true }),
-  ]);
-  if (marker === undefined) return;
-  if (marker === "merge") await fs.writeFile(path.join(dir, "MERGE_HEAD"), `${repo.headSha}\n`);
-  else if (marker === "cherry-pick") await fs.writeFile(path.join(dir, "CHERRY_PICK_HEAD"), `${repo.headSha}\n`);
-  else if (marker === "revert") await fs.writeFile(path.join(dir, "REVERT_HEAD"), `${repo.headSha}\n`);
-  else await fs.mkdir(path.join(dir, marker), { recursive: true });
-}
-
 // ==================== running the real shipped evaluator ====================
 
 export const EVALUATOR_SCRIPT_PATH = path.join(__dirname, "..", "..", "resources", "shield", "shield-evaluate.sh");
@@ -254,12 +227,12 @@ export const EVALUATOR_SCRIPT_PATH = path.join(__dirname, "..", "..", "resources
 export interface EvaluatorResult {
   code: number;
   stderr: string;
-  /** Every `Shield: [<id>] …` reason id the evaluator emitted, in order. */
+  /** The `REASON_ID: <id>` the evaluator's block message carries (at most one — a lock block has exactly one reason). */
   reasonIds: string[];
   allowed: boolean;
 }
 
-const REASON_LINE = /^Shield: \[([a-z-]+)\]/gm;
+const REASON_LINE = /^REASON_ID: ([a-z-]+)$/gm;
 
 export function runEvaluator(
   repo: FuzzRepo,

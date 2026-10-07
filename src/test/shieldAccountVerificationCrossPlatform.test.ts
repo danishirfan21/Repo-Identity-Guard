@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ShieldPolicy, serializeShieldPolicy } from "../shield/policy";
 import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
+import { WORK_IDENTITY, identityWith, testPolicy } from "./testUtil/lockFixtures";
 
 /**
  * PART 3 (Windows-skip reduction) — GitHub SSH account verification,
@@ -19,7 +20,7 @@ import { shieldPolicyFilePath, shieldStorageDir } from "../shield/storage";
  * skips all sixteen of those tests on Windows for a real reason: **Git for
  * Windows does not resolve its ssh transport through the caller's PATH**,
  * so the fake is never reached and a genuine DNS/auth failure surfaces
- * before Shield's pre-push hook ever runs.
+ * before the lock's pre-push hook ever runs.
  *
  * That reason applies to GIT's transport. It does not apply to Shield's
  * verification probe, which is a different program on a different code
@@ -46,36 +47,10 @@ const SCRIPT_PATH = path.join(__dirname, "..", "..", "resources", "shield", "shi
 const TRUSTED_ALIAS = "github-work";
 const REMOTE_URL = `git@${TRUSTED_ALIAS}:AcmeSoftware/acme-frontend.git`;
 
-// canonicalHost/canonicalPort default to the fake ssh's own defaults
-// ("github.com"/"22") -- i.e. "Shield was enabled under the same
-// environment this test is about to push under," which is the realistic
-// baseline this file's account-verification matrix wants (destination
-// confirmed, so a test's outcome is attributable to the account check
-// alone). A test that deliberately overrides FAKE_SSH_HOSTNAME/PORT to
-// simulate a genuinely different route passes the SAME values here via
-// `evaluatePush`, below, so canonicalHost still matches what a real
-// enable() would have persisted under that same environment -- only a
-// route that changes BETWEEN enable-time and push-time should ever
-// surface push-destination-mismatch, and no test in this matrix does that
-// (that scenario is release-blocker-round-2 territory, covered in
-// shieldEvaluator.test.ts and shieldGitHubAccountBinding.test.ts instead).
-function policyWithLogin(login: string | undefined, canonicalHost = "github.com", canonicalPort = "22"): ShieldPolicy {
-  return {
-    policyVersion: 2,
-    generatedAt: 1,
-    matchedProfileId: "work",
-    profileLabel: "Work",
-    expectedGitName: "Danish Irfan",
-    expectedGitEmail: "work@example.com",
-    approvedRepositoryKey: "github.com/AcmeSoftware/acme-frontend",
-    approvedPushDestination: { host: TRUSTED_ALIAS, owner: "AcmeSoftware", repo: "acme-frontend", canonicalHost, canonicalPort },
-    trustedSshHostAliases: [TRUSTED_ALIAS],
-    expectedGitHubLogin: login,
-    strictPushSetup: true,
-    protectedBranches: [],
-    expectedBranchPatterns: [],
-    enabledActions: ["commit", "push"],
-  };
+// The lock policy for an identity that expects `login` (or, for
+// `undefined`, a commit-only identity with no GitHub login at all).
+function policyWithLogin(login: string | undefined): ShieldPolicy {
+  return testPolicy(login ? identityWith({ expectedGitHubLogin: login, trustedSshHostAliases: [TRUSTED_ALIAS] }) : WORK_IDENTITY);
 }
 
 /**
@@ -210,21 +185,6 @@ function runInEvaluatorShell(fixture: Fixture, shellCommand: string, args: strin
 
 function evaluatePush(fixture: Fixture, extraEnv: NodeJS.ProcessEnv = {}, url = REMOTE_URL): Promise<Result> {
   const launch = async (): Promise<{ stdout: string; stderr: string }> => {
-    // Rewrite the policy's canonical destination to match THIS call's own
-    // FAKE_SSH_HOSTNAME/PORT before running — i.e. "Shield was enabled
-    // under the same environment this push is about to run under" (see
-    // policyWithLogin's doc comment). Skipped for FAKE_SSH_G_FAIL, whose
-    // whole point is an UNRESOLVABLE route — there is no hostname to
-    // canonicalize to, and the fixture's default canonicalHost ("github.com")
-    // correctly stays unreachable by the current (failing) resolution.
-    if (extraEnv.FAKE_SSH_G_FAIL !== "1") {
-      await fs.writeFile(
-        shieldPolicyFilePath(fixture.commonDir),
-        serializeShieldPolicy(
-          policyWithLogin(fixture.login, extraEnv.FAKE_SSH_HOSTNAME || "github.com", extraEnv.FAKE_SSH_PORT || "22"),
-        ),
-      );
-    }
     const scriptPath = await toGitForWindowsPath(SCRIPT_PATH, fixture.baseEnv);
     // Source the evaluator in the shell whose POSIX PATH the preflight just
     // verified. Executing the file via its shebang starts a second MSYS
@@ -233,12 +193,12 @@ function evaluatePush(fixture: Fixture, extraEnv: NodeJS.ProcessEnv = {}, url = 
   };
   return new Promise((resolve, reject) => {
     launch().then(({ stderr }) => {
-      resolve({ code: 0, stderr, reasonIds: [...stderr.matchAll(/^Shield: \[([a-z-]+)\]/gm)].map((m) => m[1]) });
+      resolve({ code: 0, stderr, reasonIds: [...stderr.matchAll(/^REASON_ID: ([a-z-]+)$/gm)].map((m) => m[1]) });
     }).catch((error: unknown) => {
       const typedError = error as { code?: unknown; stderr?: unknown };
       if (typeof typedError.code !== "number") return reject(error);
       const stderr = typeof typedError.stderr === "string" ? typedError.stderr : "";
-      resolve({ code: typedError.code, stderr, reasonIds: [...stderr.matchAll(/^Shield: \[([a-z-]+)\]/gm)].map((m) => m[1]) });
+      resolve({ code: typedError.code, stderr, reasonIds: [...stderr.matchAll(/^REASON_ID: ([a-z-]+)$/gm)].map((m) => m[1]) });
     });
   });
 }
@@ -280,7 +240,8 @@ test("PART 3/xplat — a DIFFERENT GitHub account authenticates -> push-account-
     const result = await evaluatePush(fixture, { FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED("someone-else") });
     assert.notEqual(result.code, 0);
     assert.deepEqual(result.reasonIds, ["push-account-mismatch"]);
-    assert.match(result.stderr, /someone-else/);
+    assert.match(result.stderr, /^FOUND_GITHUB_LOGIN: someone-else$/m);
+    assert.match(result.stderr, /^EXPECTED_GITHUB_LOGIN: danish-work$/m);
   } finally {
     await cleanup(fixture);
   }
@@ -340,13 +301,7 @@ const UNVERIFIABLE: Array<[string, NodeJS.ProcessEnv, RegExp, string[]?]> = [
   [
     "`ssh -G` reports no hostname at all — never assumed to be fine",
     { FAKE_SSH_G_FAIL: "1", FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED("danish-work") },
-    /could not resolve this SSH route/,
-    // Release-blocker fix: an unresolvable "ssh -G" also makes the
-    // DESTINATION's canonical host unprovable (the same alias, the same
-    // "ssh -G" call), so push-destination-mismatch now accompanies
-    // push-account-unverified — proven independently in
-    // shieldEvaluator.test.ts's "canonically resolved" tests.
-    ["push-destination-mismatch", "push-account-unverified"],
+    /reported no effective hostname/,
   ],
 ];
 
@@ -412,13 +367,13 @@ test("PART 3/xplat — the probe travels the same host:port route the push would
   }
 });
 
-test("PART 3/xplat — a profile with no expectedGitHubLogin never probes at all (route trust alone)", async () => {
+test("PART 3/xplat — an identity with no expectedGitHubLogin (commit-only lock) never probes at all and never blocks a push", async () => {
   const fixture = await setUp(null);
   const probeLog = path.join(fixture.repoDir, "probe.log");
   try {
     const result = await evaluatePush(fixture, { FAKE_SSH_PROBE_LOG: probeLog, FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED("someone-else") });
     assert.equal(result.code, 0, result.stderr);
-    assert.equal(await fs.readFile(probeLog, "utf8").catch(() => null), null, "an account probe ran for a profile that never asked for one");
+    assert.equal(await fs.readFile(probeLog, "utf8").catch(() => null), null, "an account probe ran for an identity that never asked for one");
   } finally {
     await cleanup(fixture);
   }
@@ -436,12 +391,7 @@ test("PART 3/xplat — an SSH transport override short-circuits verification ent
         FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED("danish-work"),
       });
       assert.notEqual(result.code, 0, JSON.stringify(override));
-      // Release-blocker fix: the override also makes the aliased route's
-      // canonical destination host unprovable (see
-      // shieldSshTransportEquivalence.test.ts's dedicated release-blocker
-      // test), so push-destination-mismatch now accompanies
-      // push-route-override.
-      assert.deepEqual(result.reasonIds, ["push-destination-mismatch", "push-route-override"], JSON.stringify(override));
+      assert.deepEqual(result.reasonIds, ["push-route-override"], JSON.stringify(override));
       assert.equal(
         await fs.readFile(probeLog, "utf8").catch(() => null),
         null,
