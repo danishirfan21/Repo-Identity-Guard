@@ -598,6 +598,103 @@ test("LEGACY: a legacy install can be unlocked explicitly too", async () => {
   assert.equal(result.status?.enforcement.state, "unassigned");
 });
 
+// ---- the REAL 0.2.0 artifacts ----
+//
+// src/test/fixtures/legacy-shield-v5/ holds the exact pre-commit / pre-push
+// hooks and shield-evaluate.sh that release 0.2.0 (commit 981e252)
+// installed — generated from that commit's own sources, byte-for-byte. A
+// legacy repository built from them really enforces the OLD Shield policy
+// (protected branches, destination approval, ...), which is what makes the
+// before/after assertions below meaningful.
+
+const LEGACY_FIXTURES = path.join(__dirname, "..", "..", "src", "test", "fixtures", "legacy-shield-v5");
+
+async function installRealLegacyShield(repo: Repo, options: { chainedOriginal?: string; matchedProfileId?: string } = {}): Promise<void> {
+  const storage = path.join(await commonDir(repo), "repo-identity-guard");
+  await fs.mkdir(storage, { recursive: true });
+  await fs.copyFile(path.join(LEGACY_FIXTURES, "shield-evaluate.sh"), path.join(storage, "shield-evaluate.sh"));
+  await fs.chmod(path.join(storage, "shield-evaluate.sh"), 0o755);
+  await fs.writeFile(
+    path.join(storage, "shield-policy.json"),
+    JSON.stringify(
+      {
+        policyVersion: 2,
+        generatedAt: 1,
+        matchedProfileId: options.matchedProfileId ?? "work",
+        profileLabel: "Work",
+        expectedGitName: WORK.gitName,
+        expectedGitEmail: WORK.gitEmail,
+        approvedRepositoryKey: LEGACY_KEY,
+        approvedPushDestination: { host: "github.com", owner: "acmesoftware", repo: "acme-frontend", canonicalHost: "github.com", canonicalPort: "22" },
+        trustedSshHostAliases: [],
+        strictPushSetup: false,
+        protectedBranches: ["main"],
+        expectedBranchPatterns: [],
+        enabledActions: ["commit", "push"],
+      },
+      null,
+      2,
+    ),
+  );
+  const hooks = await hooksDir(repo);
+  for (const [name, fixture] of [
+    ["pre-commit", "pre-commit"],
+    ["pre-merge-commit", "pre-commit"],
+    ["pre-push", "pre-push"],
+  ]) {
+    await fs.copyFile(path.join(LEGACY_FIXTURES, fixture), path.join(hooks, name));
+    await fs.chmod(path.join(hooks, name), 0o755);
+  }
+  if (options.chainedOriginal !== undefined) {
+    await fs.writeFile(path.join(hooks, `pre-commit${SHIELD_CHAIN_ORIGINAL_SUFFIX}`), options.chainedOriginal, { mode: 0o755 });
+  }
+}
+
+test("REAL 0.2.0 LEGACY, binding provable: the old protected-branch rule stops applying; the repository is locked to the bound identity instead", async () => {
+  const repo = await makeRepo();
+  await git(repo, ["remote", "add", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"]);
+  await installRealLegacyShield(repo);
+  const svc = service();
+  const repoRef = await ref(svc, repo);
+
+  // Before: the real 0.2.0 hooks enforce the old policy — even the RIGHT
+  // identity cannot commit on the protected branch "main".
+  const before = await commitAs(repo, WORK.gitEmail);
+  assert.notEqual(before.code, 0);
+  assert.match(before.stderr, /protected-branch/);
+
+  const legacyProfiles = [LEGACY_WORK_PROFILE];
+  const identities = identitiesFromLegacyProfiles(legacyProfiles).identities;
+  const outcome = await svc.migrateLegacy(repoRef, { legacyProfiles, identities });
+  assert.equal(outcome.kind, "migrated", JSON.stringify(outcome));
+
+  const allowed = await commitAs(repo, WORK.gitEmail);
+  assert.equal(allowed.code, 0, `branch policy must be gone: ${allowed.stderr}`);
+  const blocked = await commitAs(repo, PERSONAL.gitEmail);
+  assert.notEqual(blocked.code, 0);
+  assert.equal(parseBlockPrelude(blocked.stderr).REASON, "wrong_identity");
+});
+
+test("REAL 0.2.0 LEGACY, owner pattern only: removed completely, the user's chained hook restored, Git unrestricted", async () => {
+  const repo = await makeRepo();
+  await git(repo, ["remote", "add", "origin", "git@github.com:AcmeSoftware/acme-frontend.git"]);
+  const original = "#!/bin/sh\n# pre-existing hook the user had before enabling Shield\nexit 0\n";
+  await installRealLegacyShield(repo, { chainedOriginal: original });
+  const svc = service();
+  const repoRef = await ref(svc, repo);
+  const legacyProfiles = [{ id: "work", label: "Work", gitName: WORK.gitName, gitEmail: WORK.gitEmail, expectedRemoteOwners: ["AcmeSoftware"] }];
+
+  const outcome = await svc.migrateLegacy(repoRef, { legacyProfiles, identities: identitiesFromLegacyProfiles(legacyProfiles).identities });
+  assert.equal(outcome.kind, "removed", JSON.stringify(outcome));
+  assert.equal((await svc.getStatus(repoRef, [WORK])).enforcement.state, "unassigned");
+  assert.equal(await fs.readFile(path.join(await hooksDir(repo), "pre-commit"), "utf8"), original);
+  assert.deepEqual(await nonSampleHookFiles(repo), ["pre-commit"]);
+  assert.equal(await exists(path.join(await commonDir(repo), "repo-identity-guard")), false);
+  // Protected branch, wrong identity: nothing restricts Git any more.
+  const committed = await commitAs(repo, PERSONAL.gitEmail);
+  assert.equal(committed.code, 0, committed.stderr);
+});
+
 // ==================== passive status performs no network I/O ====================
 
 test("PERFORMANCE: getStatus never invokes ssh, even for a push-enforcing lock", async () => {

@@ -1,0 +1,161 @@
+#!/bin/sh
+# Repo Identity Guard Shield pre-push hook (owned by Repo Identity Guard)
+# repo-identity-guard-shield-artifact v5 (pre-push)
+#
+# Managed by Repo Identity Guard's Shield Mode. Do not hand-edit this file
+# -- "Repo Identity Guard: Repair Shield" regenerates it, and "Repo
+# Identity Guard: Disable Shield" removes it (only because that command
+# recognizes this exact marker comment; a hand-edited copy that keeps the
+# marker would still be recognized as Shield's own and be replaced/removed
+# by those commands -- if you need to customize hook behavior, chain your
+# own separate hook instead of editing this one).
+set -eu
+
+REMOTE_NAME="${1:-}"
+REMOTE_LOCATION="${2:-}"
+
+GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || GIT_COMMON_DIR=""
+if [ -z "$GIT_COMMON_DIR" ]; then
+  {
+    echo ""
+    echo "Repo Identity Guard Shield"
+    echo ""
+    echo "PUSH BLOCKED (Shield internal error: broken installation)"
+    echo ""
+    echo "This Shield hook is installed, but the repository's git-common-dir could not be resolved (\"git rev-parse --path-format=absolute --git-common-dir\" failed). Shield cannot find its policy or evaluator, so it cannot make a decision -- failing closed."
+    echo ""
+    echo "Note: \"--path-format\" requires Git 2.31 or newer, which is Shield's minimum supported Git version."
+    echo ""
+    echo "Next step: run \"Repo Identity Guard: Repair Shield\", or \"Repo Identity Guard: Disable Shield\" to remove Shield from this repository."
+  } >&2
+  exit 1
+fi
+
+EVAL_SCRIPT="$GIT_COMMON_DIR/repo-identity-guard/shield-evaluate.sh"
+
+# FAIL CLOSED, never open: a hook that is installed but whose evaluator is
+# missing/unreadable is a BROKEN Shield installation, not a disabled one.
+if [ ! -f "$EVAL_SCRIPT" ] || [ ! -r "$EVAL_SCRIPT" ]; then
+  {
+    echo ""
+    echo "Repo Identity Guard Shield"
+    echo ""
+    echo "PUSH BLOCKED (Shield internal error: broken installation)"
+    echo ""
+    echo "This Shield hook is installed, but Shield's evaluator is missing or unreadable at:"
+    echo "  $EVAL_SCRIPT"
+    echo ""
+    echo "Shield cannot decide whether this push is safe, so it is failing closed rather than letting it through unchecked."
+    echo ""
+    echo "Next step: run \"Repo Identity Guard: Repair Shield\" to reinstall it, or \"Repo Identity Guard: Disable Shield\" to remove Shield from this repository (which also removes this hook)."
+  } >&2
+  exit 1
+fi
+
+ORIGINAL_HOOK="$(dirname "$0")/pre-push.repo-identity-guard-original"
+
+# Git's <local-ref> <local-sha1> <remote-ref> <remote-sha1> lines arrive on
+# stdin exactly once. A chained original hook may need the very same
+# lines the evaluator reads, so they're captured to a private temp file up
+# front and handed to each consumer as its own independent read -- never
+# split, never guessed at, never left for only one of the two to see.
+#
+# No predictable fallback path: if mktemp cannot create a private file,
+# this fails closed as a Shield internal error rather than creating (and
+# truncating!) a guessable path in a world-writable directory.
+STDIN_CAPTURE=$(mktemp "${TMPDIR:-/tmp}/repo-identity-guard-prepush-stdin.XXXXXX" 2>/dev/null) || STDIN_CAPTURE=""
+if [ -z "$STDIN_CAPTURE" ] || [ ! -f "$STDIN_CAPTURE" ]; then
+  {
+    echo ""
+    echo "Repo Identity Guard Shield"
+    echo ""
+    echo "PUSH BLOCKED (Shield internal error)"
+    echo ""
+    echo "Shield could not create a private temporary file (via mktemp) to hold this push's ref lines, so it cannot evaluate the push. Failing closed."
+    echo ""
+    echo "Shield deliberately does NOT fall back to a predictable temporary file name here -- doing so would let any other local user pre-create or symlink that path."
+    echo ""
+    echo "Next step: check that \"${TMPDIR:-/tmp}\" exists, is writable, and has free space/inodes, then retry."
+  } >&2
+  exit 1
+fi
+chmod 600 "$STDIN_CAPTURE" 2>/dev/null || true
+trap 'rm -f "$STDIN_CAPTURE"' EXIT
+cat > "$STDIN_CAPTURE"
+
+set +e
+REASON=$(sh "$EVAL_SCRIPT" push "$REMOTE_NAME" "$REMOTE_LOCATION" < "$STDIN_CAPTURE" 2>&1 >/dev/null)
+CODE=$?
+set -e
+
+if [ "$CODE" -ne 0 ]; then
+  # See the pre-commit hook's identical comment: a structured policy
+  # reason always contains a "Shield: [id]" line; its absence means the
+  # evaluator itself crashed, which is a Shield bug, not a policy verdict
+  # -- both still fail closed (block the push), only the framing differs.
+  case "$REASON" in
+    *'Shield: ['*)
+      {
+        echo ""
+        echo "Repo Identity Guard Shield"
+        echo ""
+        echo "PUSH BLOCKED"
+        echo ""
+        echo "Remote: $REMOTE_NAME"
+        echo "Destination: $REMOTE_LOCATION"
+        echo ""
+        printf '%s\n' "$REASON" | grep -v '^Shield: BLOCKED'
+        echo ""
+        echo "Fix the push destination/route or disable Shield for this repository."
+      } >&2
+      ;;
+    *)
+      {
+        echo ""
+        echo "Repo Identity Guard Shield"
+        echo ""
+        echo "PUSH BLOCKED (Shield internal error)"
+        echo ""
+        echo "Remote: $REMOTE_NAME"
+        echo "Destination: $REMOTE_LOCATION"
+        echo ""
+        echo "Shield's evaluator failed unexpectedly instead of reaching a policy decision. Failing closed: the push is blocked, but this is most likely a Shield bug or a corrupted Shield installation, not a problem with your push."
+        echo ""
+        echo "Raw evaluator output:"
+        printf '%s\n' "$REASON"
+        echo ""
+        echo "Next step: re-run \"sh $EVAL_SCRIPT push $REMOTE_NAME $REMOTE_LOCATION\" directly to see the full error, then repair or disable Shield for this repository. If this persists, please report it."
+      } >&2
+      ;;
+  esac
+  exit "$CODE"
+fi
+
+# Shield allows this push -- hand off to a pre-existing hook that was
+# moved aside when Shield was enabled/repaired with chaining, if any,
+# feeding it the exact same stdin Git gave this hook. Its exit code
+# becomes this hook's exit code -- a chained tool's own failure (e.g. a
+# force-push guard) is never silently swallowed. Not `exec`: the trap
+# above must still fire to clean up the captured stdin file.
+if [ -e "$ORIGINAL_HOOK" ] || [ -L "$ORIGINAL_HOOK" ]; then
+  if [ ! -f "$ORIGINAL_HOOK" ] || [ ! -x "$ORIGINAL_HOOK" ]; then
+    {
+      echo ""
+      echo "Repo Identity Guard Shield"
+      echo ""
+      echo "PUSH BLOCKED (Shield internal error: broken hook chain)"
+      echo ""
+      echo "Shield's own check passed, but the chained original hook it was supposed to hand off to is not an executable regular file:"
+      echo "  $ORIGINAL_HOOK"
+      echo ""
+      echo "Shield will not guess whether that hook was meant to run, so it is failing closed instead of silently skipping it."
+      echo ""
+      echo "Next step: restore that file's executable permission, or run \"Repo Identity Guard: Disable Shield\" (which restores the original hook to its own path) and re-enable Shield afterwards."
+    } >&2
+    exit 1
+  fi
+  "$ORIGINAL_HOOK" "$@" < "$STDIN_CAPTURE"
+  exit $?
+fi
+
+exit 0

@@ -10,3 +10,7 @@
 # effect of the same corruption. `eol=lf` forces LF on checkout
 # regardless of the checking-out platform's `core.autocrlf` setting.
 *.sh text eol=lf
+
+# The real 0.2.0 Shield hooks used as legacy-migration fixtures are
+# extension-less POSIX sh scripts; same reason.
+src/test/fixtures/legacy-shield-v5/* text eol=lf

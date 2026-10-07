@@ -1,0 +1,126 @@
+#!/bin/sh
+# Repo Identity Guard Shield pre-commit hook (owned by Repo Identity Guard)
+# repo-identity-guard-shield-artifact v5 (pre-commit)
+#
+# Managed by Repo Identity Guard's Shield Mode. Do not hand-edit this file
+# -- "Repo Identity Guard: Repair Shield" regenerates it, and "Repo
+# Identity Guard: Disable Shield" removes it (only because that command
+# recognizes this exact marker comment; a hand-edited copy that keeps the
+# marker would still be recognized as Shield's own and be replaced/removed
+# by those commands -- if you need to customize hook behavior, chain your
+# own separate hook instead of editing this one).
+set -eu
+
+GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || GIT_COMMON_DIR=""
+if [ -z "$GIT_COMMON_DIR" ]; then
+  {
+    echo ""
+    echo "Repo Identity Guard Shield"
+    echo ""
+    echo "COMMIT BLOCKED (Shield internal error: broken installation)"
+    echo ""
+    echo "This Shield hook is installed, but the repository's git-common-dir could not be resolved (\"git rev-parse --path-format=absolute --git-common-dir\" failed). Shield cannot find its policy or evaluator, so it cannot make a decision -- failing closed."
+    echo ""
+    echo "Note: \"--path-format\" requires Git 2.31 or newer, which is Shield's minimum supported Git version."
+    echo ""
+    echo "Next step: run \"Repo Identity Guard: Repair Shield\", or \"Repo Identity Guard: Disable Shield\" to remove Shield from this repository."
+  } >&2
+  exit 1
+fi
+
+EVAL_SCRIPT="$GIT_COMMON_DIR/repo-identity-guard/shield-evaluate.sh"
+
+# FAIL CLOSED, never open: a hook that is installed but whose evaluator is
+# missing/unreadable is a BROKEN Shield installation, not a disabled one.
+if [ ! -f "$EVAL_SCRIPT" ] || [ ! -r "$EVAL_SCRIPT" ]; then
+  {
+    echo ""
+    echo "Repo Identity Guard Shield"
+    echo ""
+    echo "COMMIT BLOCKED (Shield internal error: broken installation)"
+    echo ""
+    echo "This Shield hook is installed, but Shield's evaluator is missing or unreadable at:"
+    echo "  $EVAL_SCRIPT"
+    echo ""
+    echo "Shield cannot decide whether this commit is safe, so it is failing closed rather than letting it through unchecked."
+    echo ""
+    echo "Next step: run \"Repo Identity Guard: Repair Shield\" to reinstall it, or \"Repo Identity Guard: Disable Shield\" to remove Shield from this repository (which also removes this hook)."
+  } >&2
+  exit 1
+fi
+
+ORIGINAL_HOOK="$0.repo-identity-guard-original"
+
+set +e
+REASON=$(sh "$EVAL_SCRIPT" commit 2>&1 >/dev/null)
+CODE=$?
+set -e
+
+if [ "$CODE" -ne 0 ]; then
+  # A structured policy reason always contains at least one "Shield: [id]"
+  # line (add_reason/fail_immediately's own format). Its ABSENCE means the
+  # evaluator crashed or exited before reaching a decision (e.g. an
+  # unbound variable under `set -eu`, a missing `git` on PATH, a corrupted
+  # copy of the script itself) -- that is a Shield bug, not a policy
+  # verdict, and must never be presented to the user as one. Both branches
+  # still fail closed (the commit is blocked either way); only the
+  # framing differs, so "why was I blocked" is never answered wrong.
+  case "$REASON" in
+    *'Shield: ['*)
+      {
+        echo ""
+        echo "Repo Identity Guard Shield"
+        echo ""
+        echo "COMMIT BLOCKED"
+        echo ""
+        printf '%s\n' "$REASON" | grep -v '^Shield: BLOCKED'
+        echo ""
+        echo "Fix the repository identity or disable Shield for this repository."
+      } >&2
+      ;;
+    *)
+      {
+        echo ""
+        echo "Repo Identity Guard Shield"
+        echo ""
+        echo "COMMIT BLOCKED (Shield internal error)"
+        echo ""
+        echo "Shield's evaluator failed unexpectedly instead of reaching a policy decision. Failing closed: the commit is blocked, but this is most likely a Shield bug or a corrupted Shield installation, not a problem with your commit."
+        echo ""
+        echo "Raw evaluator output:"
+        printf '%s\n' "$REASON"
+        echo ""
+        echo "Next step: re-run \"sh $EVAL_SCRIPT commit\" directly to see the full error, then repair or disable Shield for this repository. If this persists, please report it."
+      } >&2
+      ;;
+  esac
+  exit "$CODE"
+fi
+
+# Shield allows this commit -- hand off to a pre-existing hook that was
+# moved aside when Shield was enabled/repaired with chaining (see
+# ShieldManager's chainForeignHooks option), if any. Its exit code becomes
+# this hook's exit code: a chained tool's own failure (e.g. a linter) is
+# never silently swallowed. No original hook here means nothing to chain
+# -- exit 0.
+if [ -e "$ORIGINAL_HOOK" ] || [ -L "$ORIGINAL_HOOK" ]; then
+  if [ ! -f "$ORIGINAL_HOOK" ] || [ ! -x "$ORIGINAL_HOOK" ]; then
+    {
+      echo ""
+      echo "Repo Identity Guard Shield"
+      echo ""
+      echo "COMMIT BLOCKED (Shield internal error: broken hook chain)"
+      echo ""
+      echo "Shield's own check passed, but the chained original hook it was supposed to hand off to is not an executable regular file:"
+      echo "  $ORIGINAL_HOOK"
+      echo ""
+      echo "Shield will not guess whether that hook was meant to run, so it is failing closed instead of silently skipping it."
+      echo ""
+      echo "Next step: restore that file's executable permission, or run \"Repo Identity Guard: Disable Shield\" (which restores the original hook to its own path) and re-enable Shield afterwards."
+    } >&2
+    exit 1
+  fi
+  exec "$ORIGINAL_HOOK" "$@"
+fi
+
+exit 0
