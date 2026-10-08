@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { IdentityListResult, identitiesFromLegacyProfiles, validateIdentityList } from "../identity/identityConfig";
+import { IdentityCrudResult, IdentityDeleteResult, IdentityDraft, IdentityInUseRepo, createIdentity, deleteIdentity, updateIdentity } from "../identity/identityCrud";
 import { Identity } from "../identity/types";
 
 const SECTION = "repoIdentityGuard";
@@ -47,6 +48,34 @@ export function getIdentities(): Identity[] {
 
 export async function saveIdentities(identities: Identity[]): Promise<void> {
   await config().update("identities", identities, vscode.ConfigurationTarget.Global);
+}
+
+/**
+ * Product-level identity CRUD, backed by `src/identity/identityCrud.ts`
+ * (structural validation, duplicate id/label policy, delete safety).
+ * Always reads the LIVE list immediately before writing, so a create/
+ * update/delete never clobbers a concurrent edit with a stale snapshot —
+ * each of these is its own read-modify-write against
+ * `repoIdentityGuard.identities`, never a blind whole-array replace from a
+ * caller-held copy.
+ */
+export async function createIdentitySetting(draft: IdentityDraft): Promise<IdentityCrudResult> {
+  const result = createIdentity(getIdentities(), draft);
+  if (result.ok) await saveIdentities(result.identities);
+  return result;
+}
+
+export async function updateIdentitySetting(draft: IdentityDraft): Promise<IdentityCrudResult> {
+  const result = updateIdentity(getIdentities(), draft);
+  if (result.ok) await saveIdentities(result.identities);
+  return result;
+}
+
+/** `openAssignments` is supplied by the caller (extension.ts) from the repositories currently known/open in this session — see `deleteIdentity`'s doc comment for why this module cannot discover that on its own. */
+export async function deleteIdentitySetting(id: string, openAssignments: readonly IdentityInUseRepo[]): Promise<IdentityDeleteResult> {
+  const result = deleteIdentity(getIdentities(), id, openAssignments);
+  if (result.ok) await saveIdentities(result.identities);
+  return result;
 }
 
 /** The retired profile list, raw (user scope only). Only legacy migration reads it. */
