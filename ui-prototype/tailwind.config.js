@@ -72,14 +72,16 @@ export default {
         'space-xs': '0.25rem',
         margin: '0.75rem',
       },
+      // Stitch families, plus generic fallbacks so text never drops to a
+      // serif/Courier default while the web fonts load.
       fontFamily: {
-        'label-sm': ['Inter'],
-        'title-md': ['Inter'],
-        'code-sm': ['JetBrains Mono'],
-        'code-bold': ['JetBrains Mono'],
-        'body-sm': ['Inter'],
-        'headline-sm': ['Inter'],
-        'body-md': ['Inter'],
+        'label-sm': ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        'title-md': ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        'code-sm': ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
+        'code-bold': ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
+        'body-sm': ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        'headline-sm': ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        'body-md': ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
       },
       fontSize: {
         'label-sm': ['11px', { lineHeight: '14px', fontWeight: '500' }],
