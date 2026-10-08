@@ -43,6 +43,13 @@ export function NoteCard({ note, now, onCopy, onEdit, onDelete, onTogglePin }: N
     return () => window.clearTimeout(t);
   }, [copied]);
 
+  useEffect(() => {
+    if (!confirmingDelete) return;
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setConfirmingDelete(false);
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [confirmingDelete]);
+
   const truncatable = needsTruncation(note.text);
   const shown = truncatable && !expanded ? previewOf(note.text) : note.text;
   const time = note.updatedAt ? `Edited ${relativeTime(note.updatedAt, now).toLowerCase()}` : relativeTime(note.createdAt, now);

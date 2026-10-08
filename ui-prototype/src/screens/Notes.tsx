@@ -209,6 +209,13 @@ export function NoteEditorScreen({ noteId }: { noteId?: string }) {
     el.setSelectionRange(end, end);
   }, []);
 
+  useEffect(() => {
+    if (!confirmDiscard) return;
+    const onKey = (e: globalThis.KeyboardEvent) => e.key === 'Escape' && setConfirmDiscard(false);
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [confirmDiscard]);
+
   const dirty = text !== initialText;
   const canSave = text.trim().length > 0;
 

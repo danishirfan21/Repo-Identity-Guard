@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Header, OverflowMenu } from '../components/Header';
 import { Icon } from '../components/Icon';
 import { IdentityCard } from '../components/IdentityCard';
@@ -20,6 +20,16 @@ import { useApp } from '../state/AppState';
 import type { Identity } from '../state/types';
 import { useMockAsync } from '../state/utils';
 import { effectiveRepoState, lockStatus } from './lockStatus';
+
+/** Closes a temporary piece of UI (confirm panel, inline picker) on Escape, even once the element that opened it is gone. */
+function useEscape(active: boolean, onEscape: () => void) {
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onEscape();
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [active, onEscape]);
+}
 
 const fieldLabel: Record<'githubUsername' | 'sshProfile', string> = {
   githubUsername: 'GitHub username',
@@ -84,6 +94,7 @@ function StatusCardHeader({ icon, tone, title, badge, children }: { icon: string
 function UnlockRow() {
   const { repo, actions, showToast } = useApp();
   const [confirming, setConfirming] = useState(false);
+  useEscape(confirming, () => setConfirming(false));
 
   if (!confirming) {
     return <NavRow icon="lock_open" label="Unlock repository" quiet chevron={false} onClick={() => setConfirming(true)} />;
@@ -122,6 +133,7 @@ function UnlockRow() {
 function LockedView({ identity }: { identity: Identity }) {
   const { repo, identities, nav } = useApp();
   const [picking, setPicking] = useState(false);
+  useEscape(picking, () => setPicking(false));
   const others = identities.filter((i) => i.id !== identity.id);
   const status = lockStatus('locked', identity);
 
