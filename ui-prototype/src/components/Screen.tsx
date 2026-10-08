@@ -5,13 +5,16 @@ interface ScreenProps {
   children: ReactNode;
   /** Optional quiet footer pinned below the scrolling body. */
   footer?: ReactNode;
+  /** Optional fixed strip between the header and the scrolling body (e.g. a persistent search field). */
+  subheader?: ReactNode;
 }
 
 /** A full sidebar screen: fixed header, vertically scrolling body, optional footer. */
-export function Screen({ header, children, footer }: ScreenProps) {
+export function Screen({ header, children, footer, subheader }: ScreenProps) {
   return (
     <div className="flex flex-col h-full min-h-0">
       {header}
+      {subheader && <div className="shrink-0 px-margin pt-space-md">{subheader}</div>}
       <main className="rig-scroll flex-1 min-h-0 overflow-y-auto px-margin py-space-md">
         <div className="flex flex-col gap-space-md pb-14">{children}</div>
       </main>

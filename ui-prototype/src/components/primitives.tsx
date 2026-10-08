@@ -58,7 +58,7 @@ export function InlineAction({ icon, label, onClick }: { icon: string; label: st
     <button
       type="button"
       onClick={onClick}
-      className="inline-flex items-center gap-1 h-6 px-1.5 rounded-lg font-label-sm text-label-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface"
+      className="inline-flex items-center gap-1 h-7 px-1.5 rounded-lg font-label-sm text-label-sm text-on-surface-variant hover:bg-surface-container-high hover:text-on-surface focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-primary"
     >
       <Icon name={icon} size={14} />
       {label}
@@ -72,7 +72,7 @@ export function LinkButton({ children, onClick, icon }: { children: ReactNode; o
     <button
       type="button"
       onClick={onClick}
-      className="inline-flex items-center gap-1 font-body-sm text-body-sm text-primary hover:underline underline-offset-2"
+      className="inline-flex items-center gap-1 font-body-sm text-body-sm text-primary hover:underline underline-offset-2 rounded focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-primary"
     >
       {icon && <Icon name={icon} size={14} />}
       {children}
