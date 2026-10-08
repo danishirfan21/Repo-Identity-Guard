@@ -5,28 +5,54 @@ import { IdentityCard } from '../components/IdentityCard';
 import { AddRow, Button, Card, IconTile, LinkButton, StatusBadge } from '../components/primitives';
 import { Screen } from '../components/Screen';
 import { useApp } from '../state/AppState';
+import { isIdentityComplete, missingFields } from '../state/mockData';
 import { useMockAsync } from '../state/utils';
 
 export function AssignIdentityScreen() {
   const { repo, repoState, identities, assignedIdentity, nav } = useApp();
+
+  if (identities.length === 0) {
+    return (
+      <Screen header={<Header title="Assign identity" subtitle={repo.name} onBack={nav.pop} />}>
+        <div className="mt-2 flex flex-col items-center text-center gap-2 rounded-xl border border-dashed border-outline-variant px-space-lg py-space-xl">
+          <span className="h-10 w-10 inline-flex items-center justify-center rounded-full bg-surface-container-high text-on-surface-variant">
+            <Icon name="person_add" size={22} />
+          </span>
+          <h2 className="font-title-md text-title-md text-on-surface">No identities yet.</h2>
+          <p className="font-body-sm text-body-sm text-on-surface-variant max-w-[240px]">
+            Create an identity first, then assign it to this repository.
+          </p>
+          <Button size="sm" variant="primary" icon="add" className="mt-1" onClick={() => nav.push({ name: 'addIdentity' })}>
+            Add identity
+          </Button>
+        </div>
+      </Screen>
+    );
+  }
 
   return (
     <Screen header={<Header title="Assign identity" subtitle={repo.name} onBack={nav.pop} />}>
       <p className="font-body-md text-body-md text-on-surface-variant px-0.5">Choose an identity for this repository.</p>
 
       <div className="flex flex-col gap-2">
-        {identities.map((identity) => (
-          <IdentityCard
-            key={identity.id}
-            identity={identity}
-            onClick={() => nav.push({ name: 'confirmAssign', identityId: identity.id })}
-            trailing={
-              repoState !== 'unassigned' && assignedIdentity?.id === identity.id ? (
-                <StatusBadge tone="success">Current</StatusBadge>
-              ) : undefined
-            }
-          />
-        ))}
+        {identities.map((identity) => {
+          const current = repoState !== 'unassigned' && assignedIdentity?.id === identity.id;
+          return (
+            <IdentityCard
+              key={identity.id}
+              identity={identity}
+              compact={identities.length > 4}
+              onClick={() => nav.push({ name: 'confirmAssign', identityId: identity.id })}
+              trailing={
+                current ? (
+                  <StatusBadge tone="success">Current</StatusBadge>
+                ) : !isIdentityComplete(identity) ? (
+                  <StatusBadge tone="warning">Setup incomplete</StatusBadge>
+                ) : undefined
+              }
+            />
+          );
+        })}
         <AddRow label="Add identity" onClick={() => nav.push({ name: 'addIdentity' })} />
       </div>
 
@@ -74,11 +100,11 @@ export function ConfirmAssignScreen({ identityId }: { identityId: string }) {
           <IdentityCard identity={identity} showGitName />
         </div>
 
-        {!identity.githubUsername && (
+        {!isIdentityComplete(identity) && (
           <div className="mt-2 flex items-start gap-1.5 rounded-lg bg-tertiary/10 border border-tertiary/25 px-2.5 py-2">
             <Icon name="info" size={14} className="text-tertiary mt-[1px]" />
             <p className="font-body-sm text-body-sm text-on-surface">
-              This identity has no GitHub username yet, so pushes will be blocked until you add one.
+              This identity is missing {missingFields(identity).length === 2 ? 'a GitHub username and an SSH profile' : !identity.githubUsername ? 'a GitHub username' : 'an SSH profile'}, so push verification won't work until you add it.
             </p>
           </div>
         )}

@@ -15,9 +15,22 @@ export interface Note {
   createdAt: number;
   /** Set when a note has been edited after creation. */
   updatedAt?: number;
+  pinned?: boolean;
 }
 
-export type NotesPreset = 'empty' | 'two' | 'many';
+export type NotesPreset = 'empty' | 'two' | 'ten' | 'thirty' | 'long';
+
+/** Dev-only: which required field (if any) the current demo identity is missing. */
+export type IdentitySetup = 'complete' | 'missing_github' | 'missing_ssh';
+
+/** Dev-only: how many identities exist, for exercising 0/1/2/8/mixed-completeness lists. */
+export type IdentitiesPreset = '0' | '1' | '2' | '8' | 'incomplete';
+
+/** Dev-only: whether the next mock Repair attempt succeeds or fails. */
+export type RepairResult = 'success' | 'failure';
+
+/** Dev-only: whether the next mock note save succeeds or fails. */
+export type NoteSaveResult = 'success' | 'failure';
 
 /** One entry in the sidebar's drill-down navigation stack. */
 export type Route =
@@ -27,7 +40,7 @@ export type Route =
   | { name: 'confirmAssign'; identityId: string }
   | { name: 'manageIdentities' }
   | { name: 'addIdentity' }
-  | { name: 'editIdentity'; identityId: string }
+  | { name: 'editIdentity'; identityId: string; highlightMissing?: boolean }
   | { name: 'notes' }
   | { name: 'addNote' }
   | { name: 'editNote'; noteId: string };

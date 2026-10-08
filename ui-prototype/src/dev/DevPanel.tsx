@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { useApp } from '../state/AppState';
-import type { NotesPreset, RepoState, Route } from '../state/types';
+import type { IdentitiesPreset, IdentitySetup, NotesPreset, NoteSaveResult, RepairResult, RepoState, Route } from '../state/types';
 
 /*
  * Developer-only controls. Deliberately styled as a plain light-mode debug
@@ -16,10 +16,36 @@ const repoStates: { value: RepoState; label: string }[] = [
   { value: 'no_repo', label: 'No repo' },
 ];
 
+const identitySetups: { value: IdentitySetup; label: string }[] = [
+  { value: 'complete', label: 'Complete' },
+  { value: 'missing_github', label: 'Missing GitHub username' },
+  { value: 'missing_ssh', label: 'Missing SSH profile' },
+];
+
+const identitiesPresets: { value: IdentitiesPreset; label: string }[] = [
+  { value: '0', label: '0' },
+  { value: '1', label: '1' },
+  { value: '2', label: '2' },
+  { value: '8', label: '8' },
+  { value: 'incomplete', label: 'Incomplete' },
+];
+
 const notePresets: { value: NotesPreset; label: string }[] = [
   { value: 'empty', label: 'Empty' },
   { value: 'two', label: '2 notes' },
-  { value: 'many', label: 'Many notes' },
+  { value: 'ten', label: '10 notes' },
+  { value: 'thirty', label: '30 notes' },
+  { value: 'long', label: 'Long note' },
+];
+
+const noteSaveResults: { value: NoteSaveResult; label: string }[] = [
+  { value: 'success', label: 'Success' },
+  { value: 'failure', label: 'Failure' },
+];
+
+const repairResults: { value: RepairResult; label: string }[] = [
+  { value: 'success', label: 'Success' },
+  { value: 'failure', label: 'Failure' },
 ];
 
 const widthPresets = [240, 320, 420];
@@ -65,12 +91,12 @@ function Group({ title, children }: { title: string; children: ReactNode }) {
 const routeLabel = (r: Route) => ('identityId' in r ? `${r.name}(${r.identityId})` : 'noteId' in r ? `${r.name}(…)` : r.name);
 
 export function DevPanel({ width, onWidthChange }: { width: number; onWidthChange: (w: number) => void }) {
-  const { repoState, notesPreset, notes, assignedIdentity, nav, dev } = useApp();
+  const { repoState, notesPreset, notes, identities, assignedIdentity, nav, dev } = useApp();
 
   return (
     <aside
-      className="w-full max-w-[300px] shrink-0 rounded-md border-2 border-dashed border-amber-400 bg-slate-50 text-slate-800 p-4 flex flex-col gap-4 shadow-lg"
-      style={{ fontFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif' }}
+      className="w-full max-w-[300px] shrink-0 rounded-md border-2 border-dashed border-amber-400 bg-slate-50 text-slate-800 p-4 flex flex-col gap-4 shadow-lg overflow-y-auto"
+      style={{ fontFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif', maxHeight: 'min(760px, calc(100vh - 80px))' }}
     >
       <div>
         <div className="inline-block rounded bg-amber-400 text-amber-950 text-[11px] font-bold tracking-widest px-1.5 py-0.5">
@@ -85,9 +111,34 @@ export function DevPanel({ width, onWidthChange }: { width: number; onWidthChang
         <Segmented options={repoStates} value={repoState} onChange={dev.setRepoState} />
       </Group>
 
+      <Group title="Identity setup (assigned identity)">
+        <Segmented options={identitySetups} value={dev.identitySetup} onChange={dev.setIdentitySetup} />
+        <p className="text-[11px] text-slate-500">
+          Forces the repo to show "Needs attention" instead of "Locked" when the assigned identity is missing a
+          required push field.
+        </p>
+      </Group>
+
+      <Group title="Identities">
+        <Segmented
+          options={identitiesPresets}
+          value={dev.identitiesPreset === 'custom' ? null : dev.identitiesPreset}
+          onChange={dev.setIdentitiesPreset}
+        />
+        {dev.identitiesPreset === 'custom' && <p className="text-[11px] text-slate-500">Edited · {identities.length} identities</p>}
+      </Group>
+
       <Group title="Notes">
         <Segmented options={notePresets} value={notesPreset === 'custom' ? null : notesPreset} onChange={dev.setNotesPreset} />
         {notesPreset === 'custom' && <p className="text-[11px] text-slate-500">Edited · {notes.length} notes</p>}
+      </Group>
+
+      <Group title="Note save (next Add/Edit Note)">
+        <Segmented options={noteSaveResults} value={dev.noteSaveResult} onChange={dev.setNoteSaveResult} />
+      </Group>
+
+      <Group title="Repair result (next Repair attempt)">
+        <Segmented options={repairResults} value={dev.repairResult} onChange={dev.setRepairResult} />
       </Group>
 
       <Group title={`Sidebar width · ${width}px`}>

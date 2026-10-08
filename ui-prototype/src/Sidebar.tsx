@@ -23,7 +23,7 @@ function renderRoute(route: Route) {
     case 'addIdentity':
       return <IdentityFormScreen />;
     case 'editIdentity':
-      return <IdentityFormScreen identityId={route.identityId} />;
+      return <IdentityFormScreen identityId={route.identityId} highlightMissing={route.highlightMissing} />;
     case 'notes':
       return <RepoNotesScreen />;
     case 'addNote':

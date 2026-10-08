@@ -2,13 +2,15 @@ import { Header } from '../components/Header';
 import { ListGroup, NavRow, toneDot } from '../components/primitives';
 import { Screen } from '../components/Screen';
 import { useApp } from '../state/AppState';
+import { isIdentityComplete } from '../state/mockData';
 import { plural } from '../state/utils';
-import { lockStatus } from './lockStatus';
+import { effectiveRepoState, lockStatus } from './lockStatus';
 
 /** Root screen: exactly two jobs, Identity Lock and Repo Notes. */
 export function MainMenu() {
   const { repo, repoState, assignedIdentity, notes, nav } = useApp();
-  const status = lockStatus(repoState, assignedIdentity);
+  const state = effectiveRepoState(repoState, assignedIdentity ? isIdentityComplete(assignedIdentity) : true);
+  const status = lockStatus(state, assignedIdentity);
 
   return (
     <Screen header={<Header title="Repo Identity Guard" subtitle={repo.name} />}>

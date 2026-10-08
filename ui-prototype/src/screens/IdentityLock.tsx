@@ -15,15 +15,23 @@ import {
   type Tone,
 } from '../components/primitives';
 import { Screen } from '../components/Screen';
+import { isIdentityComplete, missingFields } from '../state/mockData';
 import { useApp } from '../state/AppState';
 import type { Identity } from '../state/types';
 import { useMockAsync } from '../state/utils';
-import { lockStatus } from './lockStatus';
+import { effectiveRepoState, lockStatus } from './lockStatus';
+
+const fieldLabel: Record<'githubUsername' | 'sshProfile', string> = {
+  githubUsername: 'GitHub username',
+  sshProfile: 'SSH profile',
+};
 
 /** Identity Lock: renders one of four variants for the current repo state. */
 export function IdentityLockScreen() {
   const { repo, repoState, assignedIdentity, nav, showToast } = useApp();
   const identity = assignedIdentity;
+  const identityComplete = identity ? isIdentityComplete(identity) : true;
+  const state = effectiveRepoState(repoState, identityComplete);
 
   const header = (
     <Header
@@ -31,7 +39,7 @@ export function IdentityLockScreen() {
       subtitle={repo.name}
       onBack={nav.pop}
       actions={
-        repoState === 'locked' && identity ? (
+        state === 'locked' && identity ? (
           <OverflowMenu
             items={[
               {
@@ -47,9 +55,10 @@ export function IdentityLockScreen() {
   );
 
   let body: ReactNode;
-  if (repoState === 'unassigned' || !identity) body = <UnassignedView />;
-  else if (repoState === 'needs_attention') body = <NeedsAttentionView identity={identity} />;
-  else if (repoState === 'repair') body = <RepairView identity={identity} />;
+  if (state === 'unassigned' || !identity) body = <UnassignedView />;
+  else if (state === 'needs_attention' && !identityComplete) body = <IncompleteSetupView identity={identity} />;
+  else if (state === 'needs_attention') body = <NeedsAttentionView identity={identity} />;
+  else if (state === 'repair') body = <RepairView identity={identity} />;
   else body = <LockedView identity={identity} />;
 
   return <Screen header={header}>{body}</Screen>;
@@ -80,25 +89,26 @@ function UnlockRow() {
     return <NavRow icon="lock_open" label="Unlock repository" quiet chevron={false} onClick={() => setConfirming(true)} />;
   }
   return (
-    <div className="px-space-md py-2.5 bg-surface-container-low">
-      <p className="font-title-md text-title-md text-on-surface">Unlock {repo.name}?</p>
-      <p className="mt-0.5 font-body-sm text-body-sm text-on-surface-variant">
-        Commits and pushes will no longer be checked. You can assign an identity again at any time.
+    <div className="px-space-md py-2.5 bg-surface-container-low flex flex-col gap-0.5">
+      <p className="font-title-md text-title-md text-on-surface">Unlock this repository?</p>
+      <p className="font-body-sm text-body-sm text-on-surface-variant">
+        Repo Identity Guard will stop restricting commits and pushes in {repo.name}.
       </p>
-      <div className="mt-2.5 flex justify-end gap-2">
-        <Button size="sm" variant="ghost" onClick={() => setConfirming(false)}>
+      <p className="font-body-sm text-body-sm text-on-surface-variant">Your Repo Notes will be kept.</p>
+      <div className="mt-2 flex flex-wrap justify-end gap-2">
+        <Button size="sm" variant="secondary" onClick={() => setConfirming(false)}>
           Cancel
         </Button>
         <Button
           size="sm"
-          variant="danger"
+          variant="primary"
           icon="lock_open"
           onClick={() => {
             actions.unlock();
             showToast(`${repo.name} unlocked`, { icon: 'lock_open', tone: 'info' });
           }}
         >
-          Unlock
+          Unlock repository
         </Button>
       </div>
     </div>
@@ -243,15 +253,70 @@ function NeedsAttentionView({ identity }: { identity: Identity }) {
             <KeyValueList
               stacked
               rows={[
-                { k: 'Locked to', v: identity.label },
                 { k: 'Git is using', v: detectedEmail, mono: true },
-                { k: 'Comes from', v: 'Global Git config' },
-                { k: 'This repository', v: 'No user.email set' },
+                { k: 'Source', v: 'Global Git configuration' },
+                { k: 'Repository-local email', v: 'Not configured' },
               ]}
             />
             <p className="font-body-sm text-body-sm text-on-surface-variant">
               “Use {identity.label} identity” sets user.name and user.email for this repository only. Your global Git
-              config isn't changed.
+              configuration is not changed.
+            </p>
+          </Collapsible>
+        </div>
+      </Card>
+
+      <ListGroup>
+        <UnlockRow />
+      </ListGroup>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Needs attention (assigned identity is missing a required push field)
+// ---------------------------------------------------------------------------
+
+function IncompleteSetupView({ identity }: { identity: Identity }) {
+  const { nav } = useApp();
+  const status = lockStatus('needs_attention', identity);
+  const missing = missingFields(identity);
+
+  return (
+    <>
+      <Card>
+        <StatusCardHeader icon="warning" tone={status.tone} title={identity.label} badge={status.word} />
+
+        <p className="mt-space-md font-body-md text-body-md text-on-surface">Push verification isn't configured yet.</p>
+        <p className="mt-1 font-body-sm text-body-sm text-on-surface-variant">
+          Add the GitHub username and SSH profile used by {identity.label} before pushing.
+        </p>
+
+        <Button
+          block
+          variant="primary"
+          icon="build"
+          className="mt-space-md"
+          onClick={() => nav.push({ name: 'editIdentity', identityId: identity.id, highlightMissing: true })}
+        >
+          Finish setup
+        </Button>
+
+        <div className="mt-2.5">
+          <Collapsible>
+            <KeyValueList
+              stacked
+              rows={[
+                { k: 'Identity', v: identity.label },
+                {
+                  k: 'Missing',
+                  v: missing.length ? missing.map((f) => fieldLabel[f]).join(' and ') : 'Nothing — this should say Locked.',
+                },
+              ]}
+            />
+            <p className="font-body-sm text-body-sm text-on-surface-variant">
+              Commits can still use {identity.label}, but Repo Identity Guard can't verify pushes until this identity has a
+              GitHub username and an SSH profile.
             </p>
           </Collapsible>
         </div>
@@ -269,20 +334,27 @@ function NeedsAttentionView({ identity }: { identity: Identity }) {
 // ---------------------------------------------------------------------------
 
 function RepairView({ identity }: { identity: Identity }) {
-  const { repo, actions, showToast } = useApp();
+  const { repo, actions, showToast, dev } = useApp();
   const [repairing, runRepair] = useMockAsync();
   const [, runFinish] = useMockAsync();
   const [done, setDone] = useState(false);
+  const [failed, setFailed] = useState(false);
   const status = lockStatus('repair', identity);
 
-  const repair = () =>
+  const repair = () => {
+    setFailed(false);
     runRepair(1200, () => {
+      if (dev.repairResult === 'failure') {
+        setFailed(true);
+        return;
+      }
       setDone(true);
       runFinish(1100, () => {
         actions.repaired();
         showToast(`Identity lock restored · Locked to ${identity.label}`);
       });
     });
+  };
 
   if (done) {
     return (
@@ -294,6 +366,31 @@ function RepairView({ identity }: { identity: Identity }) {
     );
   }
 
+  if (failed) {
+    return (
+      <Card>
+        <StatusCardHeader icon="error" tone="error" title="Repair failed" badge="Needs repair">
+          Repo Identity Guard still can't enforce this repository's identity.
+        </StatusCardHeader>
+        <Button block variant="primary" icon="refresh" className="mt-space-md" loading={repairing} onClick={repair}>
+          {repairing ? 'Repairing…' : 'Try again'}
+        </Button>
+        <div className="mt-2.5">
+          <Collapsible>
+            <KeyValueList
+              stacked
+              rows={[
+                { k: 'Locked to', v: `${identity.label} (${identity.gitEmail})` },
+                { k: 'Likely cause', v: 'Another tool changed where Git looks for hooks, or the hook files were deleted.' },
+                { k: 'What to try', v: 'Try again, or close and reopen this repository before trying again.' },
+              ]}
+            />
+          </Collapsible>
+        </div>
+      </Card>
+    );
+  }
+
   return (
     <Card>
       <StatusCardHeader icon="build_circle" tone={status.tone} title="Identity lock needs repair">
@@ -301,7 +398,9 @@ function RepairView({ identity }: { identity: Identity }) {
       </StatusCardHeader>
 
       <p className="mt-space-md font-body-sm text-body-sm text-on-surface-variant">
-        Repair restores the lock to {identity.label}. Your commits, branches and notes aren't touched.
+        Repair restores local identity enforcement.
+        <br />
+        Your commits and Repo Notes won't be changed.
       </p>
       <Button block variant="primary" icon="build" className="mt-space-md" loading={repairing} onClick={repair}>
         {repairing ? 'Repairing…' : 'Repair'}

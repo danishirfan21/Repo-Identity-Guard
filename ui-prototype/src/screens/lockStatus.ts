@@ -9,6 +9,18 @@ export interface LockStatus {
   summary: string;
 }
 
+/**
+ * The repo state as the dev panel sets it, plus whether the assigned identity
+ * is missing a required push-verification field. An incomplete identity
+ * always surfaces as "Needs attention" — it is never shown as Locked.
+ */
+export function effectiveRepoState(repoState: RepoState, identityComplete: boolean): RepoState {
+  if (repoState === 'locked' || repoState === 'needs_attention') {
+    return identityComplete ? repoState : 'needs_attention';
+  }
+  return repoState;
+}
+
 export function lockStatus(state: RepoState, identity: Identity | null): LockStatus {
   const withLabel = (word: string) => (identity ? `${word} · ${identity.label}` : word);
   switch (state) {
