@@ -87,7 +87,7 @@ function DeleteIdentityDialog({
   onClose: () => void;
   onDeleted: () => void;
 }) {
-  const { actions, showToast } = useApp();
+  const { actions, showToast, nav } = useApp();
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
@@ -108,8 +108,16 @@ function DeleteIdentityDialog({
                 Change or unlock this repository before deleting {identity.label}.
               </p>
               <div className="mt-space-md flex justify-end">
-                <Button variant="secondary" onClick={onClose} autoFocus>
-                  Back
+                <Button
+                  variant="primary"
+                  icon="verified_user"
+                  autoFocus
+                  onClick={() => {
+                    onClose();
+                    nav.popTo({ name: 'identityLock' });
+                  }}
+                >
+                  Go to Identity Lock
                 </Button>
               </div>
             </>
@@ -228,6 +236,7 @@ export function IdentityFormScreen({ identityId, highlightMissing = false }: { i
         <Field
           label="Name"
           icon="badge"
+          required
           placeholder="Work"
           value={draft.label}
           onChange={set('label')}

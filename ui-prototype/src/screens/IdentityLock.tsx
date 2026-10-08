@@ -112,7 +112,7 @@ function UnlockRow() {
         </Button>
         <Button
           size="sm"
-          variant="primary"
+          variant="attention"
           icon="lock_open"
           onClick={() => {
             actions.unlock();
@@ -301,7 +301,7 @@ function IncompleteSetupView({ identity }: { identity: Identity }) {
 
         <p className="mt-space-md font-body-md text-body-md text-on-surface">Push verification isn't configured yet.</p>
         <p className="mt-1 font-body-sm text-body-sm text-on-surface-variant">
-          Add the GitHub username and SSH profile used by {identity.label} before pushing.
+          Add the {missing.map((f) => fieldLabel[f]).join(' and ')} used by {identity.label} before pushing.
         </p>
 
         <Button

@@ -5,7 +5,7 @@ import { Icon } from './Icon';
 // Buttons
 // ---------------------------------------------------------------------------
 
-type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
+type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'attention';
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
@@ -20,6 +20,8 @@ const variantClass: Record<ButtonVariant, string> = {
   secondary: 'bg-surface-container-high text-on-surface border border-outline-variant hover:bg-surface-container-highest',
   ghost: 'text-primary hover:bg-surface-container-high',
   danger: 'bg-error-container text-on-error-container hover:brightness-110',
+  /** A step with real consequences (e.g. unlocking a repo) that isn't a destructive delete — restrained, not alarming. */
+  attention: 'bg-tertiary/15 text-tertiary border border-tertiary/30 hover:bg-tertiary/25',
 };
 
 export function Button({
