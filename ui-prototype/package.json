@@ -1,0 +1,27 @@
+{
+  "name": "repo-identity-guard-ui-prototype",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Disposable interactive UI prototype for the Repo Identity Guard sidebar. Mock state only; not wired to the extension.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "4.7.0",
+    "autoprefixer": "10.6.1",
+    "postcss": "8.5.29",
+    "tailwindcss": "3.4.19",
+    "typescript": "5.6.3",
+    "vite": "7.3.7"
+  }
+}
