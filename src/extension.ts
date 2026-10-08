@@ -353,7 +353,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const identities = getIdentities().filter((identity) => identity.id !== excludeId);
     if (identities.length === 0) {
       const choice = await vscode.window.showInformationMessage(
-        "No identities are configured yet. Add one (label, Git name/email, and optionally the GitHub login pushes must use) in settings first.",
+        "No identities are configured yet. Add one (label, Git name/email, the GitHub login pushes must authenticate as, and a trusted SSH host alias) in settings first.",
         "Edit Identities",
       );
       if (choice) await editIdentities();

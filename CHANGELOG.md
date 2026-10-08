@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased — an assigned repository always governs push
+
+### Fixed
+
+- **Pushes from an assigned repository could go through unchecked.** An
+  identity without `expectedGitHubLogin` produced a "commits only" lock
+  (policy v3 `enforcedActions: ["commit"]`): the pre-push hook let every
+  push through, from any GitHub account, while the repository was
+  reported as actively locked. An assigned repository now always governs
+  BOTH commit and push. If the identity has no GitHub login, commits are
+  still locked, but **every push is blocked** with the new reason
+  `push_identity_not_configured` (`REASON_ID:
+  push-identity-not-configured`) and the repository reports **Needs
+  attention**, never Locked/active. The block message says to configure
+  the identity's GitHub account; nothing is ever guessed.
+
+### Changed
+
+- Lock policy **v4**: no `enforcedActions`; commit and push are always
+  both governed. A missing `expectedGitHubLogin` means "push requirement
+  incomplete — block", not "push outside the lock". A v4 policy that
+  carries `enforcedActions` is `policy-corrupt`. Hook/evaluator artifacts
+  **v7**.
+- `RepoIdentityState.enforcement.push` is now `enforced |
+  needs_configuration | unverifiable | none` (`not_configured` is gone).
+  `active` requires every hook installed AND `push: "enforced"`.
+- Identities without a GitHub login remain valid and editable
+  (structurally valid vs. enforcement-ready: `EnforcementReadyIdentity`,
+  `isEnforcementReadyIdentity`, `identityReadinessProblems`). Assigning
+  one is allowed and warns that every push will be blocked.
+- **Check Identity Lock** reports a missing GitHub login as a block
+  (`needs_configuration`), not as "nothing to check".
+- The "no trusted SSH alias" push block now explains the alias
+  requirement.
+- Every lock installs all three hooks; a foreign hook in any slot (now
+  including `pre-push`) needs explicit chaining. **Repair Identity Lock**
+  offers to chain one instead of failing.
+
+### Migration
+
+- **v3 locks from earlier 0.3.0 builds are upgraded in place** (on scan
+  in a trusted workspace, or by Repair): same assignment (`identityId`,
+  `lockId`, `assignedAt`, taken from the recorded v3 snapshot), commit
+  enforcement unchanged, pushes fail-closed. A v3 commit-only lock is
+  never unlocked and never treated as a legacy Shield installation; it
+  reports Needs attention until a GitHub login is configured. If a foreign
+  `pre-push` hook occupies the slot, the automatic upgrade changes nothing
+  and Repair asks to chain it. The v7 evaluator never enforces a v3
+  policy (fails closed).
+
 ## 0.3.0 — Unreleased: identity lock and notes only
 
 Repo Identity Guard is reduced to two jobs: **explicit per-repository

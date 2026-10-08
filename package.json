@@ -127,7 +127,7 @@
               },
               "expectedGitHubLogin": {
                 "type": "string",
-                "description": "The github.com username every push from a locked repository must authenticate as (what `ssh -T git@<alias>` reports). Not your email, not the repository owner. Omit to lock commits only. Requires at least one trusted SSH host alias, otherwise every push is blocked."
+                "description": "The github.com username every push from a locked repository must authenticate as (what `ssh -T git@<alias>` reports). Not your email, not the repository owner. Required for a complete identity: while it is missing, commits are still locked but EVERY push from a repository locked to this identity is blocked. Also requires at least one trusted SSH host alias, otherwise every push is blocked."
               },
               "trustedSshHostAliases": {
                 "type": "array",

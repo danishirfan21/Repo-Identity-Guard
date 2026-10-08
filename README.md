@@ -5,9 +5,11 @@ open in VS Code:
 
 1. **Identity lock.** You explicitly assign an identity (for example
    *Work* or *Personal*) to a repository. From then on, commits in that
-   repository whose author or committer is not that identity are blocked —
-   and, if the identity names a GitHub login, pushes that do not
-   authenticate to GitHub as that account are blocked too. It is enforced
+   repository whose author or committer is not that identity are blocked,
+   and pushes that do not authenticate to GitHub as that identity's
+   account are blocked too. An assigned repository always checks both: if
+   the identity has no GitHub account configured yet, every push is
+   blocked until it does. It is enforced
    by local Git hooks, so it applies in every terminal, Git GUI and AI
    coding agent, even with VS Code closed.
 2. **Private notes.** A small plain-text notebook per repository, stored
@@ -55,7 +57,9 @@ identity on its own does nothing.
     {
       "id": "personal",
       "label": "Personal",
-      "gitEmail": "jane@example.com"
+      "gitEmail": "jane@example.com",
+      "expectedGitHubLogin": "jane-doe",
+      "trustedSshHostAliases": ["github-personal"]
     }
   ]
 }
@@ -67,8 +71,13 @@ identity on its own does nothing.
 | `label` | Display name. |
 | `gitEmail` | Required. Commits whose author or committer email differs are blocked. |
 | `gitName` | Optional. When set, the author/committer name must match too. |
-| `expectedGitHubLogin` | Optional. When set, every push from a locked repository must authenticate to GitHub as this user. Omit it to lock commits only. |
-| `trustedSshHostAliases` | The `~/.ssh/config` `Host` aliases (e.g. `github-work`) pushes for this identity must go through. Required for push checks: a login with no alias means every push is blocked. |
+| `expectedGitHubLogin` | Required for a complete identity: the GitHub user every push from a locked repository must authenticate as. If it is missing, the identity can still be saved and assigned (commits are locked), but **every push from a repository locked to it is blocked** until you add it. It is never guessed from your email, remote, alias or Git config. |
+| `trustedSshHostAliases` | Required for a complete identity: the `~/.ssh/config` `Host` aliases (e.g. `github-work`) pushes for this identity must go through. A login with no alias means every push is blocked. |
+
+An identity with both `expectedGitHubLogin` and at least one trusted alias
+is **complete**. Only a repository locked to a complete identity is shown
+as **Locked**; one locked to an incomplete identity is shown as **Needs
+attention** and blocks every push, never "commits only".
 
 Invalid entries (bad email/login, control characters, aliases beginning
 with `-`, duplicate ids) are rejected individually and shown in the
@@ -115,8 +124,11 @@ Assign, change, repair and unlock change Git hooks, so they require
   `GIT_AUTHOR_*` / `GIT_COMMITTER_*` / `EMAIL` environment variables,
   `git -c user.email=…` and `--author`. When Git config is right but an
   override changes the result, the message says so.
-- **Pushes** (`pre-push`, only when the identity has `expectedGitHubLogin`):
-  the push must go over SSH through one of the identity's trusted aliases,
+- **Pushes** (`pre-push`, always): if the identity has no
+  `expectedGitHubLogin`, every push is blocked
+  (`push_identity_not_configured`) — there is no account to verify it
+  against. Otherwise the push must go over SSH through one of the
+  identity's trusted aliases,
   with no `GIT_SSH` / `GIT_SSH_COMMAND` / `core.sshCommand` / non-OpenSSH
   `ssh.variant` override. The alias is resolved with `ssh -G` (it must
   really point at a GitHub SSH endpoint with `IdentitiesOnly yes`) and the
@@ -157,18 +169,47 @@ Push blocks carry `EXPECTED_GITHUB_LOGIN`, `FOUND_GITHUB_LOGIN` (the login
 GitHub reported, or `unverified`), `DETAIL` (e.g. `https`,
 `untrusted_alias`, `account_mismatch`, `timeout`), `REMOTE` and
 `ROUTE_HOST`. `REASON` is one of `wrong_identity`, `identity_override`,
-`push_route_unverified`, `push_route_override`, `wrong_push_account`,
+`push_identity_not_configured`, `push_route_unverified`,
+`push_route_override`, `wrong_push_account`,
 `push_account_unverified`, `policy_missing`, `policy_corrupt`,
 `inspection_failed`, or `internal_error`. Messages never contain
 credentials, tokens or key material.
 
+A push from a repository locked to an identity with no GitHub account
+configured looks like this:
+
+```text
+REPO_IDENTITY_GUARD_BLOCK
+ACTION: push
+REASON: push_identity_not_configured
+REASON_ID: push-identity-not-configured
+IDENTITY: Work
+EXPECTED_GITHUB_LOGIN: (not configured)
+DETAIL: github_login_not_configured
+REMOTE: origin
+
+Repo Identity Guard blocked this push.
+
+This repository is locked to "Work", but that identity does not yet have
+a GitHub account configured for push verification, so this push cannot be
+attributed to the assigned identity.
+
+What to do: configure the GitHub account for "Work" in Repo Identity Guard
+...
+
+Do not bypass this check (for example with --no-verify): ...
+```
+
 ### Health, drift and repair
 
 The sidebar and status bar show each repository's state: **Not locked**,
-**Locked**, **Needs attention** (a hook was deleted or modified, the
-identity was edited or removed in settings since the lock was installed,
-a legacy installation is awaiting migration, cleanup could not finish...)
-or **Unavailable** (the repository's Git state could not be read). Editing an
+**Locked** (commits AND pushes are both enforced), **Needs attention** (the
+identity has no GitHub account or no trusted SSH alias configured — every
+push is blocked meanwhile —, a hook was deleted or modified, the identity
+was edited or removed in settings since the lock was installed, a legacy
+installation is awaiting migration, a lock from an earlier version is
+awaiting upgrade, cleanup could not finish...) or **Unavailable** (the
+repository's Git state could not be read). Editing an
 identity in settings never silently changes a lock: the lock keeps
 enforcing what you assigned until you run **Repair Identity Lock**, which
 re-installs it from the identity's current definition (and refuses, rather
@@ -232,6 +273,25 @@ Assigning, changing, repairing and unlocking an identity — and migrating a
 legacy installation — install or remove Git hooks, so they only run in a
 trusted workspace.
 
+## Upgrading locks from earlier 0.3.0 builds
+
+Earlier 0.3.0 builds (lock policy v3) turned an identity without
+`expectedGitHubLogin` into a lock that checked commits but let every push
+through unchecked. That mode no longer exists. The first time a repository
+locked by such a build is opened in a trusted workspace, its lock is
+upgraded in place (policy v4): it **stays assigned** to
+the same identity (same lock id and assignment time) and keeps checking
+commits exactly as before; if that identity has no GitHub account
+configured, **every push is now blocked** and the repository shows
+**Needs attention** until you add `expectedGitHubLogin` (and a trusted SSH
+alias) to the identity and run **Repair Identity Lock**. Nothing is
+unlocked, and no GitHub login is ever filled in for you. If a pre-push hook
+of your own now sits where the lock's hook must go, the upgrade changes
+nothing and **Repair Identity Lock** asks whether to keep (chain) it.
+Until a repository is upgraded, the hooks the earlier build installed in it
+keep behaving as that build did (they call the evaluator copy installed
+next to them).
+
 ## Upgrading from 0.2.x
 
 Version 0.3.0 removes most of the earlier product (see
@@ -255,7 +315,9 @@ Version 0.3.0 removes most of the earlier product (see
   unassigned. Until then, the old Shield hooks keep enforcing the old
   Shield policy in that repository (they call the old evaluator installed
   next to them); run **Unlock Current Repository** to remove them
-  explicitly at any time.
+  explicitly at any time. A profile migrated without an
+  `expectedGitHubLogin` locks commits and blocks every push until you add
+  one.
 - Obsolete settings (`repoIdentityGuard.profiles`,
   `protectedBranches`, `requireLocalIdentity`, `includeMemoryInAiContext`)
   are ignored; you can delete them from `settings.json`.
