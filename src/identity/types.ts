@@ -7,6 +7,15 @@ import type { MemoryNote } from "../types";
  * `.vscode/settings.json`). Never holds a secret: no token, key, password
  * or credential-helper data, only values that are already visible in Git
  * history or `~/.ssh/config`.
+ *
+ * This type is a STRUCTURALLY VALID identity: it can be stored, listed,
+ * edited and assigned while still incomplete. Whether it can enforce BOTH
+ * halves of a lock is a separate question — see
+ * {@link EnforcementReadyIdentity} and `pushEnforcementFor()` in
+ * `./identityConfig`. An incomplete identity is never rejected, deleted or
+ * "completed" by guessing: a missing field stays missing until the user
+ * fills it in, and every push from a repository locked to it is blocked
+ * meanwhile.
  */
 export interface Identity {
   /** Stable unique id. Lock policies record it so a later settings edit can be detected as drift. */
@@ -19,12 +28,18 @@ export interface Identity {
   gitEmail: string;
   /**
    * The github.com username an SSH push must authenticate as (what
-   * `ssh -T git@<alias>` reports). When set, every push from a repository
-   * locked to this identity is verified live at push time; when omitted,
-   * only commits are enforced.
+   * `ssh -T git@<alias>` reports). REQUIRED for an enforcement-ready
+   * identity: every push from a repository locked to this identity is
+   * verified live at push time, and while it is missing every such push
+   * is BLOCKED (`push-identity-not-configured`) — never let through
+   * unchecked.
    *
-   * This is NOT the commit email, NOT the repository owner, and NOT the
-   * SSH host alias.
+   * Optional in this type only so an incomplete identity (e.g. one carried
+   * over from an earlier release, where it was optional) stays storable
+   * and editable. It is never inferred: not from the commit email, the
+   * repository owner, the remote URL, the SSH host alias, or Git config.
+   * It is NOT the commit email, NOT the repository owner, and NOT the SSH
+   * host alias.
    */
   expectedGitHubLogin?: string;
   /**
@@ -40,11 +55,22 @@ export interface Identity {
 }
 
 /**
+ * An identity complete enough to enforce a lock in full: commits are
+ * checked against `gitEmail`/`gitName`, and pushes are verified live as
+ * `expectedGitHubLogin` over one of `trustedSshHostAliases`. Only a lock
+ * built from an enforcement-ready identity can ever report `active`.
+ */
+export type EnforcementReadyIdentity = Identity & {
+  expectedGitHubLogin: string;
+  trustedSshHostAliases: [string, ...string[]];
+};
+
+/**
  * An explicit mapping from one local repository to one identity.
  *
  * The durable record of an assignment is the lock policy installed in the
  * repository's own common Git directory
- * (`<git-common-dir>/repo-identity-guard/shield-policy.json`, policy v3) —
+ * (`<git-common-dir>/repo-identity-guard/shield-policy.json`, policy v4) —
  * see `src/identity/assignment.ts` for why the assignment lives there and
  * not in extension storage. This interface is the read-side projection of
  * that record.
@@ -64,29 +90,42 @@ export interface RepoIdentityAssignment {
  *
  * - `unassigned`: no identity is assigned and no lock artifacts exist —
  *   Repo Identity Guard does not interfere with Git at all here.
- * - `active`: assigned, and every hook/policy/evaluator artifact needed to
- *   enforce it is installed and intact.
+ * - `active`: assigned, every hook/policy/evaluator artifact needed to
+ *   enforce it is installed and intact, AND the identity is complete
+ *   enough to enforce both commits and pushes (`push` is `enforced`).
  * - `needs_attention`: something is assigned or installed but is not in a
  *   fully trustworthy state (hooks missing or modified, identity edited
  *   since the lock was installed, a legacy installation awaiting
- *   migration, cleanup that could not finish, a push identity that cannot
- *   be verified, ...). `reason` explains it.
+ *   migration, a lock from an earlier version awaiting upgrade, cleanup
+ *   that could not finish, no GitHub login configured for push
+ *   verification, no trusted SSH alias, ...). `reason` explains it.
  * - `unavailable`: not a Git repository, or Git itself cannot support
  *   enforcement (version too old, repository unreadable).
  */
 export type EnforcementState = "unassigned" | "active" | "needs_attention" | "unavailable";
 
 /**
- * What the push side of a lock enforces:
+ * The push requirement of an assigned repository. Push is ALWAYS governed
+ * once a repository is assigned — there is deliberately no value meaning
+ * "push is outside this lock" or "push is unconfigured, therefore
+ * allowed":
+ *
  * - `enforced`: the identity has an expected GitHub login AND at least one
- *   trusted SSH alias, so every push is verified live.
- * - `not_configured`: the identity declares no GitHub login, so the lock
- *   makes no claim about push accounts (commits are still enforced).
- * - `unverifiable`: the identity declares a GitHub login but no trusted
- *   SSH alias, so no push can ever be verified — every push is blocked
- *   until the identity is completed.
+ *   trusted SSH alias, so every push is verified live (the expected account
+ *   is allowed; a different account or an unverifiable route is blocked).
+ * - `needs_configuration`: the identity has no GitHub login configured, so
+ *   no push can be attributed to an account — EVERY push is blocked
+ *   (`push-identity-not-configured`) until a login is configured.
+ * - `unverifiable`: the identity has a GitHub login but no trusted SSH
+ *   alias, so no push route can be verified — EVERY push is blocked
+ *   (`push-route-unverified`) until an alias is added.
+ *
+ * Every value other than `enforced` keeps an assigned repository in
+ * `needs_attention`, never `active`.
  */
-export type PushEnforcement = "enforced" | "not_configured" | "unverifiable";
+export type PushEnforcement = "enforced" | "needs_configuration" | "unverifiable";
+
+export const PUSH_ENFORCEMENT_VALUES: readonly PushEnforcement[] = ["enforced", "needs_configuration", "unverifiable"];
 
 export interface RepoIdentityEnforcement {
   state: EnforcementState;
@@ -94,6 +133,11 @@ export interface RepoIdentityEnforcement {
   reason?: string;
   /** Whether commits are being checked against the assigned identity right now. */
   commitEnforced: boolean;
+  /**
+   * The assigned repository's push requirement (see {@link PushEnforcement});
+   * `"none"` only when nothing is assigned or the assignment record cannot
+   * be read. `state` is `active` only when this is `enforced`.
+   */
   push: PushEnforcement | "none";
   /** True when "Repair Identity Lock" can be expected to restore `active`. */
   repairAvailable: boolean;

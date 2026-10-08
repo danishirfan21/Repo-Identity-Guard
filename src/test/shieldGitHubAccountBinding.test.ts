@@ -397,16 +397,18 @@ test("route not strongly bound (IdentitiesOnly not set) -> unverified without ev
 
 // ==================== no expectedGitHubLogin ====================
 
-test("an identity without expectedGitHubLogin (commit-only lock) never runs account verification and never blocks a push", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
+test("an identity without expectedGitHubLogin BLOCKS a real SSH push through its own trusted alias (push_identity_not_configured) — nothing reaches the remote", { skip: SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS }, async () => {
   const noLoginProfile: Identity = { ...workProfile, expectedGitHubLogin: undefined };
   const scenario = await setUpScenario(noLoginProfile);
   try {
-    // No FAKE_SSH_AUTH_OUTPUT set at all -- if the evaluator incorrectly
-    // attempted verification anyway, the fake ssh's default empty output
-    // would be parsed as malformed and this push would be blocked.
-    const result = await pushWithFakeSsh(scenario, {});
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(await remoteRefSha(scenario.bare), await git(scenario.repo, ["rev-parse", "HEAD"]));
+    // The route WOULD authenticate as the person's real account — with no
+    // expected login configured there is still nothing to verify it
+    // against, so the push is blocked, never let through unchecked.
+    const result = await pushWithFakeSsh(scenario, { FAKE_SSH_AUTH_OUTPUT: "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access." });
+    assert.notEqual(result.code, 0, "an assigned repository let a push through unchecked");
+    assert.match(result.stderr, /^REASON: push_identity_not_configured$/m);
+    assert.match(result.stderr, /does not yet have\na GitHub account configured for push verification/);
+    assert.equal(await remoteRefSha(scenario.bare), null, "nothing may reach the remote");
   } finally {
     await cleanup(scenario.repo.dir, scenario.remoteParent, scenario.fakeSshBin);
   }

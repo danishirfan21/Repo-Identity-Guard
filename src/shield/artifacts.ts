@@ -43,8 +43,17 @@ export const SHIELD_ARTIFACT_MARKER = "repo-identity-guard-shield-artifact";
  * identity and push account identity, every block message starts with the
  * machine-readable `REPO_IDENTITY_GUARD_BLOCK` prelude, and the pre-push
  * shim no longer echoes the raw remote URL (which can embed credentials).
+ *
+ * v7: push is always governed (policy v4). An identity with no GitHub
+ * login blocks every push (`push-identity-not-configured`) instead of
+ * leaving push unchecked; v3 policies are refused until upgraded. Every v6
+ * installation is upgraded in place by `IdentityLockService` (assignment
+ * kept), because a v6 evaluator would keep letting such pushes through.
  */
-export const SHIELD_ARTIFACT_VERSION = 6;
+export const SHIELD_ARTIFACT_VERSION = 7;
+
+/** The artifact version that shipped with policy v3 — an identity lock to upgrade in place, never a legacy Shield installation to migrate or remove. */
+export const PREVIOUS_LOCK_ARTIFACT_VERSION = 6;
 
 /**
  * The sidecar file name suffix a hook's exact original foreign bytes are

@@ -185,10 +185,10 @@ async function assertInvariants(repo: Repo, manager: ShieldManager, inspection: 
     assert.equal(inspection.evaluatorVersion, SHIELD_ARTIFACT_VERSION, `active with an outdated evaluator\n${where}`);
     assert.deepEqual(inspection.orphanedHookPaths, [], `active with recorded orphans\n${where}`);
     assert.equal(inspection.identityDrift, false, `active with identity drift\n${where}`);
-    const enforced = inspection.policySnapshot?.enforcedActions ?? ["commit", "push"];
-    // Every hook governing an ENFORCED action is the lock's own. (A
-    // commit-only lock may leave a foreign pre-push hook alone.)
-    for (const hook of inspection.hooks.filter((h) => enforced.includes(h.action))) {
+    // Every hook is the lock's own: a lock governs commit AND push for
+    // every identity (one with no GitHub login blocks pushes through its
+    // pre-push hook), so no slot may be left to a foreign hook.
+    for (const hook of inspection.hooks) {
       assert.equal(hook.ownership, "shield", `active with a ${hook.ownership} ${hook.fileName}\n${where}`);
       assert.equal(hook.contentModified, false, `active with a modified ${hook.fileName}\n${where}`);
       assert.equal(hook.version, SHIELD_ARTIFACT_VERSION, `active with an outdated ${hook.fileName}\n${where}`);

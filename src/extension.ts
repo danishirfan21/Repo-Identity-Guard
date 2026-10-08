@@ -31,8 +31,9 @@ import { SidebarModel } from "./ui/wireState";
  * This file only wires those into VS Code: repository discovery, Workspace
  * Trust gating, confirmations, commands, and the (placeholder) sidebar.
  * An unassigned repository is never touched — the only automatic Git
- * mutation is removing/migrating a LEGACY Shield installation, and only in
- * a trusted workspace.
+ * mutations are removing/migrating a LEGACY Shield installation and
+ * upgrading an identity lock from an earlier version in place (assignment
+ * kept, pushes made fail-closed), and only in a trusted workspace.
  */
 
 interface RepoEntry {
@@ -203,9 +204,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   /**
    * Passive refresh — cheap and read-only for every repository (no network,
-   * no `ssh`). The single exception, in a trusted workspace only: a legacy
+   * no `ssh`). The exceptions, in a trusted workspace only: a legacy
    * Shield installation is migrated or removed, because an unassigned
-   * repository must not keep hooks that block Git.
+   * repository must not keep hooks that block Git; and an identity lock
+   * from an earlier version is upgraded in place, because its installed
+   * evaluator could still let pushes through unchecked.
    */
   async function scan(): Promise<void> {
     const sequence = ++scanSequence;
@@ -229,6 +232,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           entry.status = await lockService.getStatus(ref, identities);
           if (entry.status.legacy && vscode.workspace.isTrusted) {
             entry.status = await migrateLegacyInstallation(ref, identities, entry.status);
+          } else if (entry.status.inspection.policyNeedsUpgrade && vscode.workspace.isTrusted) {
+            entry.status = await upgradePreviousLock(ref, identities, entry.status);
           }
         } catch (error) {
           entry.statusError = errorMessage(error);
@@ -268,6 +273,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       notifiedMigrations.add(ref.repoKey);
       if (outcome.kind === "failed") {
         void vscode.window.showWarningMessage(`Repo Identity Guard (${name}): ${outcome.message} ${outcome.details.join(" ")}`);
+      } else {
+        void vscode.window.showInformationMessage(`Repo Identity Guard (${name}): ${outcome.message}`);
+      }
+    }
+    return outcome.status ?? current;
+  }
+
+  /**
+   * Upgrades an identity lock written by an earlier version in place —
+   * assignment kept, commits still enforced, pushes now fail-closed when
+   * the identity has no GitHub login. Never chains a foreign hook on its
+   * own: that stays an explicit choice (offered by Repair).
+   */
+  async function upgradePreviousLock(ref: RepositoryRef, identities: Identity[], current: LockStatus): Promise<LockStatus> {
+    const outcome = await withRepoLock(ref.repoKey, () => lockService.upgradePreviousLock(ref, { identities }));
+    if (outcome.kind === "none") return current;
+    const name = path.basename(ref.repoRoot);
+    if (!notifiedMigrations.has(ref.repoKey)) {
+      notifiedMigrations.add(ref.repoKey);
+      if (outcome.kind === "failed") {
+        void vscode.window.showWarningMessage(`Repo Identity Guard (${name}): ${outcome.message} ${outcome.details.join(" ")}`);
+      } else if (outcome.status.enforcement.state !== "active") {
+        void vscode.window.showWarningMessage(`Repo Identity Guard (${name}): ${outcome.message}`);
       } else {
         void vscode.window.showInformationMessage(`Repo Identity Guard (${name}): ${outcome.message}`);
       }
@@ -335,7 +363,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       identities.map((identity) => ({
         label: identity.label,
         description: `${identity.gitName ? `${identity.gitName} ` : ""}<${identity.gitEmail}>`,
-        detail: identity.expectedGitHubLogin ? `Pushes must authenticate as GitHub user ${identity.expectedGitHubLogin}` : "Commits only (no GitHub login)",
+        detail: identity.expectedGitHubLogin
+          ? `Pushes must authenticate as GitHub user ${identity.expectedGitHubLogin}`
+          : "Incomplete: no GitHub login configured, so every push from a locked repository is blocked",
         identity,
       })),
       { title: "Repo Identity Guard: choose the identity to lock this repository to" },
@@ -365,7 +395,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       ? (identity.trustedSshHostAliases ?? []).length > 0
         ? ` Pushes must authenticate to GitHub as ${identity.expectedGitHubLogin} through one of: ${(identity.trustedSshHostAliases ?? []).join(", ")}.`
         : ` WARNING: ${identity.label} expects GitHub user ${identity.expectedGitHubLogin} but lists no trusted SSH host alias, so every push will be blocked until one is added.`
-      : " Pushes are not account-checked (this identity has no GitHub login).";
+      : ` WARNING: ${identity.label} has no GitHub account configured for push verification, so every push will be blocked until one is configured.`;
     const confirm = await vscode.window.showWarningMessage(
       `${current ? `Change ${entry.repoName} from "${current.identityLabel}" to` : `Lock ${entry.repoName} to`} "${identity.label}"?\n\nCommits whose author or committer is not ${identity.gitName ? `${identity.gitName} ` : ""}<${identity.gitEmail}> will be blocked.${pushLine}\n\nThis uses local Git hooks, so it applies in every terminal, Git GUI and AI agent, even with VS Code closed. Repository: ${entry.ref.repoRoot}`,
       { modal: true },
@@ -376,17 +406,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // A foreign hook already in a slot the lock needs is never touched
     // silently: chaining it is an explicit choice.
     let chainForeignHooks = false;
-    const governedForeign = (entry.status?.inspection.hooks ?? []).filter(
-      (hook) => hook.ownership === "foreign" && (hook.action === "commit" || !!identity.expectedGitHubLogin),
-    );
-    if (governedForeign.length > 0) {
-      const chain = await vscode.window.showWarningMessage(
-        `This repository already has its own ${governedForeign.map((hook) => hook.fileName).join(", ")} hook. Repo Identity Guard can keep it: the identity check runs first, then your hook runs exactly as before (and is restored byte-for-byte on unlock).`,
-        { modal: true },
-        "Keep My Hook (Chain It)",
-      );
-      if (!chain) return;
-      chainForeignHooks = true;
+    if (entry.status) {
+      const chain = await confirmChainingForeignHooks(entry.status);
+      if (chain === undefined) return;
+      chainForeignHooks = chain;
     }
 
     const result = await withRepoLock(entry.ref.repoKey, () =>
@@ -407,6 +430,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (identity.expectedGitHubLogin && (identity.trustedSshHostAliases ?? []).length > 0) {
       await checkLock({ quietWhenVerified: true, target: repos.find((repo) => repo.id === entry.id) ?? entry });
     }
+  }
+
+  /**
+   * A lock governs every hook slot (commit AND push). A foreign hook in any
+   * of them is never touched silently: chaining it is an explicit choice.
+   * Returns false when there is nothing to chain, true when the user chose
+   * to chain, and undefined when they declined (abort).
+   */
+  async function confirmChainingForeignHooks(status: LockStatus): Promise<boolean | undefined> {
+    const foreign = status.inspection.hooks.filter((hook) => hook.ownership === "foreign");
+    if (foreign.length === 0) return false;
+    const chain = await vscode.window.showWarningMessage(
+      `This repository already has its own ${foreign.map((hook) => hook.fileName).join(", ")} hook. Repo Identity Guard can keep it: the identity check runs first, then your hook runs exactly as before (and is restored byte-for-byte on unlock).`,
+      { modal: true },
+      "Keep My Hook (Chain It)",
+    );
+    return chain ? true : undefined;
   }
 
   async function unlockRepository(target: RepoEntry | undefined = commandTarget()): Promise<void> {
@@ -446,7 +486,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await scan();
       return;
     }
-    const result = await withRepoLock(entry.ref.repoKey, () => lockService.repair(entry.ref, identities));
+    // Repair re-installs every hook slot; a foreign hook now occupying one
+    // (e.g. a pre-push hook next to a lock from an earlier version that did
+    // not need that slot) is only ever chained with explicit consent.
+    const chainForeignHooks = entry.status ? await confirmChainingForeignHooks(entry.status) : false;
+    if (chainForeignHooks === undefined) return;
+    const result = await withRepoLock(entry.ref.repoKey, () => lockService.repair(entry.ref, identities, { chainForeignHooks }));
     showOperationResult(result);
     await scan();
   }
@@ -491,7 +536,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ? `${entry.repoName} is locked to "${view.identityLabel}".`
         : `${entry.repoName} (locked to "${view.identityLabel}") needs attention: ${status.enforcement.reason ?? ""}`;
     const message = `${lockLine} ${push.message}`;
-    if (status.enforcement.state === "active" && (push.status === "verified" || push.status === "not_configured")) {
+    if (status.enforcement.state === "active" && push.status === "verified") {
       if (!options.quietWhenVerified) await vscode.window.showInformationMessage(message);
     } else {
       await vscode.window.showWarningMessage(message);

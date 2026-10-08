@@ -48,7 +48,8 @@ const TRUSTED_ALIAS = "github-work";
 const REMOTE_URL = `git@${TRUSTED_ALIAS}:AcmeSoftware/acme-frontend.git`;
 
 // The lock policy for an identity that expects `login` (or, for
-// `undefined`, a commit-only identity with no GitHub login at all).
+// `undefined`, an identity with no GitHub login configured at all — whose
+// every push is blocked).
 function policyWithLogin(login: string | undefined): ShieldPolicy {
   return testPolicy(login ? identityWith({ expectedGitHubLogin: login, trustedSshHostAliases: [TRUSTED_ALIAS] }) : WORK_IDENTITY);
 }
@@ -367,13 +368,18 @@ test("PART 3/xplat — the probe travels the same host:port route the push would
   }
 });
 
-test("PART 3/xplat — an identity with no expectedGitHubLogin (commit-only lock) never probes at all and never blocks a push", async () => {
+test("PART 3/xplat — an identity with no expectedGitHubLogin BLOCKS every push (push-identity-not-configured) without ever probing", async () => {
   const fixture = await setUp(null);
   const probeLog = path.join(fixture.repoDir, "probe.log");
   try {
-    const result = await evaluatePush(fixture, { FAKE_SSH_PROBE_LOG: probeLog, FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED("someone-else") });
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(await fs.readFile(probeLog, "utf8").catch(() => null), null, "an account probe ran for an identity that never asked for one");
+    // Even a route that would authenticate as the right person is refused:
+    // with no expected login there is nothing to verify it against.
+    for (const output of [AUTHENTICATED("someone-else"), AUTHENTICATED("danish-work")]) {
+      const result = await evaluatePush(fixture, { FAKE_SSH_PROBE_LOG: probeLog, FAKE_SSH_AUTH_OUTPUT: output });
+      assert.notEqual(result.code, 0, result.stderr);
+      assert.deepEqual(result.reasonIds, ["push-identity-not-configured"]);
+    }
+    assert.equal(await fs.readFile(probeLog, "utf8").catch(() => null), null, "no account probe runs when there is no login to verify against");
   } finally {
     await cleanup(fixture);
   }

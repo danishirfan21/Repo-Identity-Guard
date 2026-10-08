@@ -123,7 +123,7 @@ function renderLock(repo) {
   if (repo.assignment) {
     const a = repo.assignment;
     children.push(el("div", { id: "assignedIdentity", text: a.identityLabel + ": " + (a.gitName ? a.gitName + " " : "") + "<" + a.gitEmail + ">" }));
-    children.push(el("div", { className: "rig-muted", text: a.expectedGitHubLogin ? "Pushes must authenticate as GitHub user " + a.expectedGitHubLogin : "Pushes are not account-checked (no GitHub login on this identity)" }));
+    children.push(el("div", { className: "rig-muted", text: a.expectedGitHubLogin ? "Pushes must authenticate as GitHub user " + a.expectedGitHubLogin : "Every push is blocked: no GitHub account is configured for push verification on this identity" }));
   } else if (enforcement.state === "unassigned") {
     children.push(el("div", { className: "rig-muted", text: "No identity is assigned. Repo Identity Guard does not restrict Git in this repository." }));
   }

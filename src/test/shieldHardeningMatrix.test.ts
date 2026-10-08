@@ -1086,23 +1086,30 @@ test("PERFORMANCE: commit median stays below the catastrophic-regression ceiling
   }
 });
 
-test("a commit-only lock (no GitHub login) never checks pushes: any route is allowed and ssh is never invoked", async () => {
+test("a lock whose identity has no GitHub login blocks EVERY push (push_identity_not_configured) and never invokes ssh", async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   try {
     const manager = new ShieldManager();
-    const { expectedGitHubLogin: _omit, ...commitOnly } = workProfile;
+    const { expectedGitHubLogin: _omit, ...noLogin } = workProfile;
     void _omit;
-    const enabled = await enableShield(manager, repo, { identity: commitOnly });
-    assert.deepEqual(enabled.inspection.policySnapshot?.enforcedActions, ["commit"]);
-    // A plain local path: not GitHub, not SSH -- would be refused by an
-    // account-verifying lock, and needs no ssh at all to push.
+    const enabled = await enableShield(manager, repo, { identity: noLogin });
+    assert.equal(enabled.inspection.policySnapshot?.expectedGitHubLogin, undefined);
+    assert.ok(
+      enabled.inspection.hooks.every((h) => h.ownership === "shield"),
+      "the pre-push hook is installed even though the identity has no GitHub login",
+    );
+    // A plain local path: no route at all could make this push verifiable,
+    // and ssh must never be needed to reach the decision.
     const bare = await makeBareRemote(remoteParent, "Anyone", "anything");
     await git(repo, ["remote", "add", "origin", bare]);
     const env = { ...repo.env, GIT_SSH_COMMAND: "false-ssh-must-never-run" };
     const result = await push(repo, ["origin", "feature/shield-tests"], env);
-    assert.equal(result.code, 0, result.stderr);
-    assert.ok(await remoteRefSha(bare, "refs/heads/feature/shield-tests"));
+    assert.notEqual(result.code, 0, "an assigned repository must never let a push through unchecked");
+    assert.match(result.stderr, /^REASON: push_identity_not_configured$/m);
+    assert.match(result.stderr, /^REASON_ID: push-identity-not-configured$/m);
+    assert.doesNotMatch(result.stderr, /false-ssh-must-never-run/);
+    assert.equal(await remoteRefSha(bare, "refs/heads/feature/shield-tests"), null, "nothing may reach the remote");
   } finally {
     await cleanup(repo.dir, remoteParent);
   }

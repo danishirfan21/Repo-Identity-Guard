@@ -46,6 +46,7 @@ export const SHIELD_LIFECYCLE_STATES: readonly ShieldLifecycleState[] = [
 export type ShieldReasonId =
   | "commit-identity-mismatch"
   | "commit-identity-override"
+  | "push-identity-not-configured"
   | "push-route-unverified"
   | "push-route-override"
   | "push-account-mismatch"
@@ -57,6 +58,7 @@ export type ShieldReasonId =
 export const SHIELD_REASON_IDS: readonly ShieldReasonId[] = [
   "commit-identity-mismatch",
   "commit-identity-override",
+  "push-identity-not-configured",
   "push-route-unverified",
   "push-route-override",
   "push-account-mismatch",

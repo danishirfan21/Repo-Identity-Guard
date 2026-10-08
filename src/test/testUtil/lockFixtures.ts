@@ -11,7 +11,13 @@ import { ShieldPolicy, buildShieldPolicy } from "../../shield/policy";
 
 export const EVALUATOR_SOURCE = path.join(__dirname, "..", "..", "..", "resources", "shield", "shield-evaluate.sh");
 
-/** The canonical "Work" identity used across the enforcement suites. Commit-only unless a test adds `expectedGitHubLogin`. */
+/**
+ * The canonical "Work" identity used across the enforcement suites. It has
+ * NO `expectedGitHubLogin`: structurally valid but not enforcement-ready —
+ * a lock for it enforces commits and blocks EVERY push
+ * (`push-identity-not-configured`). Use {@link WORK_IDENTITY_WITH_LOGIN}
+ * for the complete identity.
+ */
 export const WORK_IDENTITY: Identity = {
   id: "work",
   label: "Work",

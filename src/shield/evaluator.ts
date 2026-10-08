@@ -15,8 +15,9 @@ import { ShieldAction, ShieldDecision, ShieldReason, decisionFromReasons } from 
  *
  * The lock answers exactly one question per action:
  *  - commit: is the EFFECTIVE author AND committer identity the assigned one?
- *  - push (only when the identity declares an expected GitHub login): can
- *    this push's route be shown to authenticate as that login, and does it?
+ *  - push (always): does the identity have an expected GitHub login at all
+ *    (no → blocked, `push-identity-not-configured`), can this push's route
+ *    be shown to authenticate as that login, and does it?
  * Branch names, repository operation state (merge/rebase/conflicts) and
  * the push destination's owner/repo are deliberately never consulted.
  */
@@ -82,9 +83,6 @@ function identityReasons(policy: ShieldPolicy, facts: CommitEvalFacts): ShieldRe
 }
 
 export function evaluateCommit(policy: ShieldPolicy, facts: CommitEvalFacts, now: number = Date.now()): ShieldDecision {
-  if (!policy.enforcedActions.includes("commit")) {
-    return decisionFromReasons("commit", [], now);
-  }
   if (facts.inspectionError) {
     return decisionFromReasons("commit", [{ id: "inspection-failed", message: `Git state could not be read: ${facts.inspectionError}` }], now);
   }
@@ -243,10 +241,25 @@ function accountReasons(policy: ShieldPolicy, facts: PushEvalFacts): ShieldReaso
   }
 }
 
+/**
+ * The block an assigned repository's push gets while its identity has no
+ * GitHub login: nothing can attribute the push to the assigned identity,
+ * so it is refused — never waved through as "not checked". Exported so the
+ * on-demand check reports exactly the hook's wording.
+ */
+export function pushIdentityNotConfiguredReason(identityLabel: string): ShieldReason {
+  return {
+    id: "push-identity-not-configured",
+    message: `This repository is locked to "${identityLabel}", but that identity does not yet have a GitHub account configured for push verification, so every push is blocked. Configure the GitHub account for "${identityLabel}" in Repo Identity Guard, then retry.`,
+  };
+}
+
 export function evaluatePush(policy: ShieldPolicy, facts: PushEvalFacts, now: number = Date.now()): ShieldDecision {
-  // No expected GitHub login = the lock makes no claim about push accounts.
-  if (!policy.enforcedActions.includes("push") || !policy.expectedGitHubLogin) {
-    return decisionFromReasons("push", [], now);
+  // Push is always governed by an assigned repository's lock. No expected
+  // GitHub login means the push requirement is INCOMPLETE — block, before
+  // the route is even looked at (no route could make it verifiable).
+  if (!policy.expectedGitHubLogin) {
+    return decisionFromReasons("push", [pushIdentityNotConfiguredReason(policy.identityLabel)], now);
   }
   const parsed = parseRemoteUrl(facts.remoteUrl);
   const route = routeReasons(policy, parsed.protocol, parsed.host, parsed.sshUser, facts.sshCommandOverrides);

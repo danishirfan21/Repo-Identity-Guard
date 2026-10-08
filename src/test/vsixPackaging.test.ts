@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { IdentityLockService } from "../identity/identityLockService";
-import { WORK_IDENTITY } from "./testUtil/lockFixtures";
+import { WORK_IDENTITY_WITH_LOGIN as WORK_IDENTITY } from "./testUtil/lockFixtures";
 
 /**
  * PART 11 — package a real VSIX and inspect what is actually inside it.

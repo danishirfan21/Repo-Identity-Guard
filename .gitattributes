@@ -14,3 +14,7 @@
 # The real 0.2.0 Shield hooks used as legacy-migration fixtures are
 # extension-less POSIX sh scripts; same reason.
 src/test/fixtures/legacy-shield-v5/* text eol=lf
+
+# The real 0.3.0 identity-lock (artifact v6) hooks used as v3 -> v4
+# upgrade fixtures; same reason.
+src/test/fixtures/identity-lock-v6/* text eol=lf

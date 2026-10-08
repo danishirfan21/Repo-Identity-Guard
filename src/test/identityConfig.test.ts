@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   identitiesFromLegacyProfiles,
+  identityReadinessProblems,
+  isEnforcementReadyIdentity,
   pushEnforcementFor,
   sanitizeIdentityList,
   validateIdentity,
   validateIdentityList,
 } from "../identity/identityConfig";
+import { PUSH_ENFORCEMENT_VALUES } from "../identity/types";
 
 /**
  * Identity validation is a trust boundary: the `repoIdentityGuard.identities`
@@ -65,7 +68,7 @@ test("angle brackets in name/email are rejected (they would corrupt Git's ident 
   assert.equal(validateIdentity({ ...VALID, gitName: "Name <x@y>" }).ok, false);
 });
 
-test("an invalid GitHub login is an ERROR — never silently dropped into a weaker (commit-only) lock", () => {
+test("an invalid GitHub login is an ERROR — never silently dropped into an identity with no login", () => {
   for (const login of ["-leading", "trailing-", "double--hyphen", "has space", "a".repeat(40), "under_score", "dot.ted"]) {
     const result = validateIdentity({ ...VALID, expectedGitHubLogin: login });
     assert.equal(result.ok, false, login);
@@ -93,12 +96,39 @@ test("identity list: invalid entries and duplicate ids are rejected individually
   assert.deepEqual(sanitizeIdentityList("not a list"), []);
 });
 
-test("push enforcement: no login → not_configured; login without alias → unverifiable; login + alias → enforced", () => {
-  assert.equal(pushEnforcementFor({}), "not_configured");
-  assert.equal(pushEnforcementFor({ trustedSshHostAliases: ["github-work"] }), "not_configured");
+test("push requirement: no login → needs_configuration; login without alias → unverifiable; login + alias → enforced", () => {
+  assert.equal(pushEnforcementFor({}), "needs_configuration");
+  assert.equal(pushEnforcementFor({ trustedSshHostAliases: ["github-work"] }), "needs_configuration");
+  assert.equal(pushEnforcementFor({ expectedGitHubLogin: "" }), "needs_configuration");
   assert.equal(pushEnforcementFor({ expectedGitHubLogin: "danish" }), "unverifiable");
   assert.equal(pushEnforcementFor({ expectedGitHubLogin: "danish", trustedSshHostAliases: [] }), "unverifiable");
   assert.equal(pushEnforcementFor({ expectedGitHubLogin: "danish", trustedSshHostAliases: ["github-work"] }), "enforced");
+  // The state contract has no "push unconfigured, therefore allowed" value.
+  assert.deepEqual([...PUSH_ENFORCEMENT_VALUES].sort(), ["enforced", "needs_configuration", "unverifiable"]);
+});
+
+test("structurally valid vs enforcement-ready: an identity with no GitHub login is valid and storable, but not enforcement-ready", () => {
+  const noLogin = validateIdentity(VALID);
+  assert.equal(noLogin.ok, true, "a missing login is never a validation error — the identity stays editable");
+  assert.ok(noLogin.ok);
+  assert.equal(noLogin.identity.expectedGitHubLogin, undefined, "the login is never guessed (not from email, owner, alias or config)");
+  assert.equal(isEnforcementReadyIdentity(noLogin.identity), false);
+  assert.match(identityReadinessProblems(noLogin.identity).join(" "), /no GitHub account \(expectedGitHubLogin\) configured/);
+
+  const noAlias = validateIdentity({ ...VALID, expectedGitHubLogin: "danish-work" });
+  assert.ok(noAlias.ok);
+  assert.equal(isEnforcementReadyIdentity(noAlias.identity), false);
+  assert.deepEqual(identityReadinessProblems(noAlias.identity), ['"Work" lists no trusted SSH host alias (trustedSshHostAliases) to push through.']);
+
+  const complete = validateIdentity({ ...VALID, expectedGitHubLogin: "danish-work", trustedSshHostAliases: ["github-work"] });
+  assert.ok(complete.ok);
+  assert.equal(isEnforcementReadyIdentity(complete.identity), true);
+  assert.deepEqual(identityReadinessProblems(complete.identity), []);
+
+  // A legacy profile with no login converts into a valid (incomplete) identity — never rejected, never dropped.
+  const legacy = identitiesFromLegacyProfiles([{ id: "old", label: "Old", gitEmail: "old@example.com", exactRepos: ["github.com/a/b"] }]);
+  assert.deepEqual(legacy.identities, [{ id: "old", label: "Old", gitEmail: "old@example.com" }]);
+  assert.deepEqual(legacy.rejected, []);
 });
 
 test("legacy profiles → identities: only WHO fields survive; matching/policy fields are dropped; invalid profiles are reported", () => {

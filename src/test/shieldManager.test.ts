@@ -168,7 +168,8 @@ test("enable() installs a policy, an evaluator copy, and owned pre-commit AND pr
     assert.match(evaluatorContent, new RegExp(`repo-identity-guard-shield-artifact v${SHIELD_ARTIFACT_VERSION} \\(evaluator\\)`));
     const policyContent = await fs.readFile(path.join(commonDir, "repo-identity-guard", "shield-policy.json"), "utf8");
     assert.match(policyContent, /"identityLabel": "Work"/);
-    assert.match(policyContent, /"policyVersion": 3/);
+    assert.match(policyContent, /"policyVersion": 4/);
+    assert.doesNotMatch(policyContent, /enforcedActions/);
   } finally {
     await cleanup(repo);
   }

@@ -31,8 +31,10 @@ import { makeFakeSshBin, withFakeSshOnPath } from "./testUtil/fakeSsh";
  * policies and action facts, runs BOTH, and asserts they agree on
  * allow/block AND on the exact reason id.
  *
- * Push cases use identities WITH an expected GitHub login (a commit-only
- * lock never blocks a push, which would make the push sweep trivial). The
+ * Push cases mostly use identities WITH an expected GitHub login (one with
+ * no login blocks every push as `push-identity-not-configured` before the
+ * route is even parsed, which would make the push sweep trivial — a
+ * minority of cases still exercise that, so both sides must agree on it). The
  * live account probe is kept hermetic: a fake `ssh` on PATH resolves every
  * alias to a non-GitHub host, so whenever the shell reaches the probe it
  * stops at `route_not_github` without any network connection — and the

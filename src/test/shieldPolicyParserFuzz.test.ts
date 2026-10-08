@@ -135,20 +135,20 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
   const add = (label: string, raw: string) => cases.push({ label, raw, expect: "block" });
 
   // --- duplicate keys ---
-  add("duplicate policyVersion", compact.replace('{"policyVersion":3', '{"policyVersion":3,"policyVersion":3'));
-  add("duplicate policyVersion with DIFFERENT values", compact.replace('{"policyVersion":3', '{"policyVersion":999,"policyVersion":3'));
+  add("duplicate policyVersion", compact.replace('{"policyVersion":4', '{"policyVersion":4,"policyVersion":4'));
+  add("duplicate policyVersion with DIFFERENT values", compact.replace('{"policyVersion":4', '{"policyVersion":999,"policyVersion":4'));
   add("duplicate expectedGitEmail with a different value", compact.replace('"expectedGitEmail"', '"expectedGitEmail":"attacker@example.com","expectedGitEmail"'));
-  add("duplicate enforcedActions", `${compact.slice(0, -1)},"enforcedActions":["commit"]}`);
+  add("duplicate trustedSshHostAliases", `${compact.slice(0, -1)},"trustedSshHostAliases":["github-work"]}`);
   add("duplicate key inside a nested unknown object", compact.replace(/\}$/, ',"extra":{"k":1,"k":2}}'));
 
   // --- structural malformation ---
   add("trailing garbage after a complete document", `${compact}garbage`);
   add("trailing second JSON document", `${compact}${compact}`);
   add("trailing comma in an object", compact.replace(/\}$/, ",}"));
-  add("trailing comma in an array", compact.replace('["commit"]', '["commit",]'));
+  add("trailing comma in an array", compact.replace('["github-work"]', '["github-work",]'));
   add("unterminated string", compact.replace('"Work"', '"Work'));
   add("unterminated object", compact.slice(0, -1));
-  add("unterminated array", compact.replace('["commit"]', '["commit"'));
+  add("unterminated array", compact.replace('["github-work"]', '["github-work"'));
   add("bare value, not an object", '"just a string"');
   add("top-level array", `[${compact}]`);
   add("empty document", "");
@@ -171,24 +171,28 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
   add("capitalized True literal", compact.replace('"expectedGitName":"Danish Irfan"', '"expectedGitName":True'));
   add("bare word literal", compact.replace('"expectedGitName":"Danish Irfan"', '"expectedGitName":yes'));
   add("NULL literal in wrong case", compact.replace('"expectedGitName":"Danish Irfan"', '"expectedGitName":NULL'));
-  add("leading-zero number", compact.replace('"policyVersion":3', '"policyVersion":03'));
-  add("hex number", compact.replace('"policyVersion":3', '"policyVersion":0x3'));
+  add("leading-zero number", compact.replace('"policyVersion":4', '"policyVersion":04'));
+  add("hex number", compact.replace('"policyVersion":4', '"policyVersion":0x4'));
   add("trailing-dot number", compact.replace('"generatedAt":1700000000000', '"generatedAt":1700000000000.'));
-  add("plus-signed number", compact.replace('"policyVersion":3', '"policyVersion":+3'));
+  add("plus-signed number", compact.replace('"policyVersion":4', '"policyVersion":+4'));
   add("Infinity", compact.replace('"generatedAt":1700000000000', '"generatedAt":Infinity'));
   add("NaN", compact.replace('"generatedAt":1700000000000', '"generatedAt":NaN'));
 
   // --- schema-invalid but JSON-valid ---
-  add("legacy policyVersion 2", compact.replace('"policyVersion":3', '"policyVersion":2'));
-  add("future policyVersion", compact.replace('"policyVersion":3', '"policyVersion":4'));
-  add("policyVersion as a string", compact.replace('"policyVersion":3', '"policyVersion":"3"'));
-  add("enforcedActions as a string", compact.replace('["commit"]', '"commit"'));
-  add("enforcedActions containing a non-action", compact.replace('["commit"]', '["commit","rebase"]'));
-  add("enforcedActions containing a number", compact.replace('["commit"]', '["commit",1]'));
-  add("enforcedActions without commit", compact.replace('["commit"]', '["push"]'));
-  add("enforcedActions empty", compact.replace('["commit"]', "[]"));
-  add("enforcedActions claims push without a GitHub login", compact.replace('["commit"]', '["commit","push"]'));
-  add("expectedGitHubLogin without push enforcement", compact.replace('"identityLabel":"Work"', '"identityLabel":"Work","expectedGitHubLogin":"danish-work"'));
+  add("legacy policyVersion 2", compact.replace('"policyVersion":4', '"policyVersion":2'));
+  add("previous identity-lock policyVersion 3", compact.replace('"policyVersion":4', '"policyVersion":3'));
+  add(
+    "a complete, well-formed v3 commit-only policy (awaiting upgrade, never enforced as-is)",
+    `${compact.replace('"policyVersion":4', '"policyVersion":3').slice(0, -1)},"enforcedActions":["commit"]}`,
+  );
+  add("future policyVersion", compact.replace('"policyVersion":4', '"policyVersion":5'));
+  add("policyVersion as a string", compact.replace('"policyVersion":4', '"policyVersion":"4"'));
+  // v4 has no per-action list: one in ANY shape is corruption (so nobody
+  // can believe editing it takes push out of an assigned repository's lock).
+  for (const actions of ['["commit"]', '["commit","push"]', "[]", '"commit"', '["push"]', "null", '["commit","rebase"]']) {
+    add(`enforcedActions present: ${actions}`, `${compact.slice(0, -1)},"enforcedActions":${actions}}`);
+  }
+  add("expectedGitHubLogin as a number", compact.replace('"identityLabel":"Work"', '"identityLabel":"Work","expectedGitHubLogin":7'));
   add("trustedSshHostAliases as an object", compact.replace('["github-work"]', '{"0":"github-work"}'));
   add("trustedSshHostAliases containing an object", compact.replace('["github-work"]', '[{"host":"github-work"}]'));
   add("expectedGitEmail as a number", compact.replace('"expectedGitEmail":"work@example.com"', '"expectedGitEmail":1'));
@@ -208,7 +212,6 @@ function invalidCases(rng: ReturnType<typeof rngFrom>): ParserCase[] {
     "identityLabel",
     "expectedGitEmail",
     "trustedSshHostAliases",
-    "enforcedActions",
   ]) {
     const without = { ...(policy as unknown as Record<string, unknown>) };
     delete without[field];
@@ -340,8 +343,9 @@ test("PART 8 — every rejected policy is reported as policy-corrupt specificall
   const cases: string[] = [
     `${compact}trailing`,
     compact.slice(0, 40),
-    compact.replace('["commit"]', '["push"]'),
-    compact.replace('"policyVersion":3', '"policyVersion":3,"policyVersion":3'),
+    `${compact.slice(0, -1)},"enforcedActions":["commit"]}`,
+    compact.replace('"policyVersion":4', '"policyVersion":3'),
+    compact.replace('"policyVersion":4', '"policyVersion":4,"policyVersion":4'),
     JSON.stringify({ ...baselinePolicy(), token: "x" }),
     "not json",
   ];
@@ -366,10 +370,10 @@ test("PART 8 — a nested key that shadows a top-level field name is never read 
   const repo = repos[0];
   try {
     await prepareRepoState(repo);
-    // Top level: commit-only lock expecting work@example.com. The nested
-    // object claims a different email, push enforcement with a GitHub
-    // login, and no actions at all. Path lookups are exact, so none of it
-    // may have any effect.
+    // Top level: a lock expecting work@example.com with NO GitHub login
+    // (so every push is blocked). The nested object claims a different
+    // email, a GitHub login, and no actions at all. Path lookups are exact,
+    // so none of it may have any effect.
     await writeRawPolicy(
       repo,
       JSON.stringify({
@@ -384,9 +388,12 @@ test("PART 8 — a nested key that shadows a top-level field name is never read 
     );
     const commit = await runEvaluator(repo, ["commit"]);
     assert.equal(commit.allowed, true, commit.stderr);
-    // And the nested login must not turn a commit-only lock into a push lock.
+    // And the nested login must not be read as the top-level one: the push
+    // is still blocked for having NO configured login (not checked against
+    // "attacker" over some route).
     const push = await runEvaluator(repo, ["push", "origin", "https://github.com/AcmeSoftware/acme-frontend.git"]);
-    assert.equal(push.allowed, true, push.stderr);
+    assert.equal(push.allowed, false, push.stderr);
+    assert.deepEqual(push.reasonIds, ["push-identity-not-configured"]);
     // While a wrong identity is still blocked by the TOP-LEVEL expectation.
     await setConfiguredIdentity(repo, "Danish Irfan", "attacker@example.com");
     const wrong = await runEvaluator(repo, ["commit"]);
@@ -396,12 +403,12 @@ test("PART 8 — a nested key that shadows a top-level field name is never read 
   }
 });
 
-test("PART 8 — an enforcedActions array naming an action this build cannot enforce, or dropping commit, is corruption, not a subset", async () => {
+test("PART 8 — an enforcedActions field (v3's per-action list) in a v4 policy is corruption in EVERY shape — never a way to take push out of the lock", async () => {
   const repos = await createRepoPool(1);
   const repo = repos[0];
   try {
     await prepareRepoState(repo);
-    for (const actions of [["commit", "push", "rebase"], ["fetch"], ["Commit"], ["commit", ""], ["push", "push "], [], ["push"]]) {
+    for (const actions of [["commit"], ["commit", "push"], ["commit", "push", "rebase"], ["fetch"], ["Commit"], ["commit", ""], ["push", "push "], [], ["push"]]) {
       const raw = JSON.stringify({ ...baselinePolicy(), enforcedActions: actions });
       await writeRawPolicy(repo, raw);
       const result = await runEvaluator(repo, ["commit"]);

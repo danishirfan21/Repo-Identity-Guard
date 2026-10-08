@@ -84,10 +84,18 @@ function pushFacts(overrides: Partial<PushEvalFacts> = {}): PushEvalFacts {
   return { remoteName: "origin", remoteUrl: "git@github-work:AcmeSoftware/acme-frontend.git", sshCommandOverrides: [], ...overrides };
 }
 
-test("a commit-only lock (identity without expectedGitHubLogin) never blocks a push — whatever the route", () => {
-  for (const remoteUrl of ["https://github.com/x/y.git", "git@github.com:x/y.git", "git@unknown-alias:x/y.git", "not a url"]) {
-    assert.equal(evaluatePush(testPolicy(WORK_IDENTITY), pushFacts({ remoteUrl })).allowed, true, remoteUrl);
+test("a lock whose identity has no expectedGitHubLogin BLOCKS every push (push-identity-not-configured) — whatever the route, even a verified one", () => {
+  const verified = { githubAccountCheck: { kind: "authenticated-user" as const, login: "danish-work" } };
+  for (const remoteUrl of ["https://github.com/x/y.git", "git@github.com:x/y.git", "git@unknown-alias:x/y.git", "git@github-work:x/y.git", "not a url", ""]) {
+    for (const policy of [testPolicy(WORK_IDENTITY), testPolicy(WORK_IDENTITY, { expectedGitHubLogin: "" })]) {
+      const decision = evaluatePush(policy, pushFacts({ remoteUrl, ...verified }));
+      assert.equal(decision.allowed, false, remoteUrl);
+      assert.deepEqual(decision.reasons.map((r) => r.id), ["push-identity-not-configured"], remoteUrl);
+      assert.match(decision.reasons[0].message, /does not yet have a GitHub account configured for push verification/);
+    }
   }
+  // Commits are still evaluated normally for the same policy.
+  assert.equal(evaluateCommit(testPolicy(WORK_IDENTITY), commitFacts()).allowed, true);
 });
 
 test("there is no push-destination policy: pushing to ANY repository is allowed when the account is the assigned one", () => {
@@ -176,7 +184,8 @@ test("evaluateFromPolicyLoad denies with policy-missing when no policy file was 
 });
 
 test("evaluateFromPolicyLoad denies with policy-corrupt for an invalid or legacy policy", () => {
-  for (const raw of [{ policyVersion: 999 }, { policyVersion: 2, matchedProfileId: "work" }]) {
+  const v3CommitOnly = { ...testPolicy(WORK_IDENTITY), policyVersion: 3, enforcedActions: ["commit"] };
+  for (const raw of [{ policyVersion: 999 }, { policyVersion: 2, matchedProfileId: "work" }, v3CommitOnly]) {
     const invalid = validateShieldPolicy(raw);
     assert.equal(invalid.ok, false);
     const decision = evaluateFromPolicyLoad("push", { found: true, ...invalid }, pushFacts());

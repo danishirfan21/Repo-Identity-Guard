@@ -1,6 +1,6 @@
 #!/bin/sh
 # shield-evaluate.sh — Repo Identity Guard's standalone identity-lock evaluator.
-# repo-identity-guard-shield-artifact v6 (evaluator)
+# repo-identity-guard-shield-artifact v7 (evaluator)
 #
 # This is the runtime artifact the identity lock's Git hooks (pre-commit,
 # pre-merge-commit, pre-push) invoke. It has NO dependency on Node, VS
@@ -38,10 +38,13 @@
 #  - commit: the EFFECTIVE author and committer identity (`git var`, which
 #    sees GIT_AUTHOR_*/GIT_COMMITTER_* env vars, `git -c user.*=...`, and
 #    `--author`) must equal the assigned identity.
-#  - push, only when the assigned identity declares an expected GitHub
-#    login: the push must travel a trusted SSH alias with no transport
-#    override, and a live `ssh -G` + `ssh -T` probe over that exact route
-#    must authenticate as the expected login. Anything unprovable blocks.
+#  - push, ALWAYS (a lock governs commit and push unconditionally): the
+#    assigned identity must declare an expected GitHub login (if it does
+#    not, every push is blocked as push_identity_not_configured -- never
+#    allowed unchecked), the push must travel a trusted SSH alias with no
+#    transport override, and a live `ssh -G` + `ssh -T` probe over that
+#    exact route must authenticate as the expected login. Anything
+#    unprovable blocks.
 # Branch names, merge/rebase state, and which repository a push goes to
 # are deliberately never consulted.
 #
@@ -84,6 +87,7 @@ reason_code() {
   case "$1" in
     commit-identity-mismatch) echo wrong_identity ;;
     commit-identity-override) echo identity_override ;;
+    push-identity-not-configured) echo push_identity_not_configured ;;
     push-route-unverified) echo push_route_unverified ;;
     push-route-override) echo push_route_override ;;
     push-account-mismatch) echo wrong_push_account ;;
@@ -408,19 +412,25 @@ if [ "$(policy_type "")" != "object" ]; then
   fail_immediately policy-corrupt "The identity-lock policy must contain a JSON object. Failing closed."
 fi
 
-# v3 is the identity-lock policy. v1/v2 were the retired "Shield Mode"
+# v4 is the identity-lock policy. v1/v2 were the retired "Shield Mode"
 # policy (profile matching, branch protection, approved push
-# destinations): they are never enforced by this evaluator. Opening the
-# repository in VS Code migrates it -- into a v3 lock when an explicit
-# legacy binding is provable, otherwise by removing the legacy hooks.
+# destinations); v3 was the first identity-lock policy, whose
+# enforcedActions list could take push out of an assigned repository's
+# lock. None of them is enforced by this evaluator. Opening the repository
+# in VS Code migrates a v1/v2 installation (into a lock when an explicit
+# legacy binding is provable, otherwise by removing the legacy hooks) and
+# upgrades a v3 lock in place, keeping its assignment.
 POLICY_VERSION_VALUE=$(policy_scalar .policyVersion)
-if [ "$(policy_type .policyVersion)" != "number" ] || [ "$POLICY_VERSION_VALUE" != "3" ]; then
+if [ "$(policy_type .policyVersion)" != "number" ] || [ "$POLICY_VERSION_VALUE" != "4" ]; then
   case "$POLICY_VERSION_VALUE" in
     1|2)
       fail_immediately policy-corrupt "This repository still has a legacy Repo Identity Guard \"Shield\" policy (version $POLICY_VERSION_VALUE), which this version no longer enforces. Failing closed until it is migrated."
       ;;
+    3)
+      fail_immediately policy-corrupt "This repository's identity lock was written by an earlier version of Repo Identity Guard (policy version 3), which this evaluator no longer enforces. Failing closed until it is upgraded (the assignment is kept)."
+      ;;
     *)
-      fail_immediately policy-corrupt "The identity-lock policy has an unexpected or missing policyVersion (got: '$POLICY_VERSION_VALUE'; expected 3). Failing closed."
+      fail_immediately policy-corrupt "The identity-lock policy has an unexpected or missing policyVersion (got: '$POLICY_VERSION_VALUE'; expected 4). Failing closed."
       ;;
   esac
 fi
@@ -441,33 +451,20 @@ require_optional_string .expectedGitName
 require_optional_string .expectedGitHubLogin
 
 require_string_array .trustedSshHostAliases
-require_string_array .enforcedActions
 
-# Every element must be one of the two actions the evaluator knows about.
-# An unrecognized action is corruption, and corruption fails closed.
-policy_array .enforcedActions | while IFS= read -r declared_action; do
-  case "$declared_action" in
-    commit|push) ;;
-    *) exit 7 ;;
-  esac
-done || fail_immediately policy-corrupt "The identity-lock policy field enforcedActions must contain only \"commit\" and \"push\"."
-
-# A lock ALWAYS enforces commit identity, and enforces push identity
-# exactly when an expected GitHub login is declared -- so a hand-edited
-# policy can neither silently drop commit enforcement nor claim push
-# enforcement with no account to enforce.
-if ! policy_array .enforcedActions | grep -qxF commit; then
-  fail_immediately policy-corrupt "The identity-lock policy field enforcedActions must include \"commit\"."
+# A v4 lock governs commit AND push unconditionally -- there is no
+# per-action list that could take push out of an assigned repository's
+# lock. A policy that carries one anyway (hand-edited, or a v3 field
+# grafted onto a v4 file) is refused rather than ignored, mirroring
+# validateShieldPolicy(), so nobody can believe that editing it disables
+# push checks.
+if [ "$(policy_type .enforcedActions)" != "absent" ]; then
+  fail_immediately policy-corrupt "The identity-lock policy must not contain an enforcedActions field: commit and push are always both governed (policy version 4)."
 fi
+
+# Empty/absent = the push requirement is INCOMPLETE: every push is blocked
+# (push-identity-not-configured), never allowed unchecked.
 EXPECTED_GH_LOGIN=$(policy_scalar .expectedGitHubLogin)
-if policy_array .enforcedActions | grep -qxF push; then
-  ENFORCES_PUSH=1
-else
-  ENFORCES_PUSH=0
-fi
-if { [ "$ENFORCES_PUSH" = 1 ] && [ -z "$EXPECTED_GH_LOGIN" ]; } || { [ "$ENFORCES_PUSH" = 0 ] && [ -n "$EXPECTED_GH_LOGIN" ]; }; then
-  fail_immediately policy-corrupt "The identity-lock policy field enforcedActions must include \"push\" exactly when expectedGitHubLogin is set."
-fi
 
 # Secret-shaped-field guard -- mirrors validateShieldPolicy()'s own list.
 for forbidden_field in token accessToken password privateKey sshKey credentials secret; do
@@ -479,14 +476,6 @@ done
 EXPECTED_EMAIL=$(policy_scalar .expectedGitEmail)
 EXPECTED_NAME=$(policy_scalar .expectedGitName)
 IDENTITY_LABEL=$(policy_scalar .identityLabel)
-
-if ! policy_array .enforcedActions | grep -qxF "$ACTION"; then
-  # This lock does not govern this action (a push, for an identity with no
-  # expected GitHub login) -- never block it. Reaching here means
-  # enforcedActions was verified to be a well-formed, consistent array
-  # that genuinely does not list this action, NOT that it failed to parse.
-  exit 0
-fi
 
 # ==================== commit ====================
 
@@ -768,6 +757,25 @@ evaluate_push() {
   # decision never needs them.
   cat >/dev/null 2>&1 || true
 
+  # ---- push identity configured at all? ----
+  # Push is ALWAYS governed for an assigned repository. With no expected
+  # GitHub login there is no account any push could be verified as, so
+  # every push is blocked -- before the route is even parsed, because no
+  # route could make it verifiable. Mirrors evaluatePush() in
+  # src/shield/evaluator.ts. The login is never guessed (not from the
+  # commit email, the remote, the alias, or Git config).
+  if [ -z "$EXPECTED_GH_LOGIN" ]; then
+    block push-identity-not-configured "EXPECTED_GITHUB_LOGIN: (not configured)
+DETAIL: github_login_not_configured
+REMOTE: $(one_line "${REMOTE_NAME:-(none)}")" "This repository is locked to \"$IDENTITY_LABEL\", but that identity does not yet have
+a GitHub account configured for push verification, so this push cannot be
+attributed to the assigned identity.
+
+What to do: configure the GitHub account for \"$IDENTITY_LABEL\" in Repo Identity Guard
+(its expectedGitHubLogin, plus a trusted SSH host alias whose key belongs to that
+account), then retry the push. Commits are still checked as usual."
+  fi
+
   if [ -z "$REMOTE_URL" ]; then
     fail_immediately inspection-failed "No remote URL was provided to evaluate (expected: shield-evaluate.sh push <remote-name> <remote-url>)."
   fi
@@ -980,12 +988,21 @@ evaluate_push() {
   # other route is unprovable, and an unprovable push identity is blocked
   # for a lock that expects a GitHub login -- never assumed correct.
   TRUSTED_ALIASES_DISPLAY=$(policy_array .trustedSshHostAliases | awk 'NR > 1 { printf ", " } { printf "%s", $0 }')
-  [ -z "$TRUSTED_ALIASES_DISPLAY" ] && TRUSTED_ALIASES_DISPLAY="(none configured)"
+  if [ -z "$TRUSTED_ALIASES_DISPLAY" ]; then
+    # A login with no trusted alias at all: no route can ever be verified,
+    # so EVERY push is blocked until one is added -- say so plainly
+    # instead of suggesting the user pick from an empty list.
+    ROUTE_FIX="\"$IDENTITY_LABEL\" lists no trusted SSH host alias, so no push route can be verified as \"$EXPECTED_GH_LOGIN\" --
+every push from this repository is blocked until one is configured.
 
-  ROUTE_FIX="What to do: push over SSH through one of the identity's trusted SSH host aliases ($TRUSTED_ALIASES_DISPLAY),
-e.g. point the remote at git@<alias>:<owner>/<repo>.git, then retry the push.
-If no alias is configured yet, add a Host entry for the $EXPECTED_GH_LOGIN key to ~/.ssh/config and list it
-in the identity's trustedSshHostAliases setting."
+What to do: add a Host entry for the $EXPECTED_GH_LOGIN key to ~/.ssh/config (pointing at github.com,
+with \"IdentitiesOnly yes\"), list that alias in the trusted SSH host aliases (trustedSshHostAliases) of
+\"$IDENTITY_LABEL\" in Repo Identity Guard and run \"Repair Identity Lock\", then point the remote at
+git@<alias>:<owner>/<repo>.git and retry the push."
+  else
+    ROUTE_FIX="What to do: push over SSH through one of the identity's trusted SSH host aliases ($TRUSTED_ALIASES_DISPLAY),
+e.g. point the remote at git@<alias>:<owner>/<repo>.git, then retry the push."
+  fi
 
   route_block() {
     # $1 = reason id, $2 = detail code, $3 = specific reason sentence

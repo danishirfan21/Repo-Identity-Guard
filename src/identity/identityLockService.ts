@@ -1,6 +1,6 @@
 import * as crypto from "node:crypto";
 import { getCurrentBranch, getGitConfigValue, getOriginRemote, getPushRemoteName, getPushUrl } from "../services/gitService";
-import { SHIELD_ARTIFACT_VERSION } from "../shield/artifacts";
+import { PREVIOUS_LOCK_ARTIFACT_VERSION } from "../shield/artifacts";
 import { ShieldInspection, ShieldManager } from "../shield/manager";
 import { SshRunner } from "../shield/sshEndpoint";
 import { RepositoryRef, assignmentFromInspection, resolveRepository } from "./assignment";
@@ -21,6 +21,13 @@ import { Identity, RepoIdentityAssignment, RepoIdentityEnforcement, RepoIdentity
  * Semantics:
  *  - Assigning an identity IS enabling enforcement. There is no separate
  *    "also protect this repository?" decision.
+ *  - The invariant is binary: an UNASSIGNED repository is never
+ *    restricted; an ASSIGNED repository always governs BOTH commit and
+ *    push. An identity that is not enforcement-ready (no GitHub login, or
+ *    no trusted SSH alias) can still be assigned — its commits are locked
+ *    at once — but every push is blocked until it is completed, and the
+ *    repository reports `needs_attention`, never `active`. There is no
+ *    "assigned, but pushes are not checked" mode.
  *  - Assign/change is all-or-nothing (`requireComplete`): it either ends
  *    with a fully active lock for the requested identity, or with the
  *    repository exactly as it was before (refused before writing, or
@@ -62,6 +69,11 @@ export interface LockOperationResult {
   status?: LockStatus;
 }
 
+export type PreviousLockUpgradeOutcome =
+  | { kind: "none" }
+  | { kind: "upgraded"; identityLabel: string; message: string; status: LockStatus }
+  | { kind: "failed"; message: string; details: string[]; status?: LockStatus };
+
 export type LegacyMigrationOutcome =
   | { kind: "none" }
   | { kind: "migrated"; identityLabel: string; message: string; status: LockStatus }
@@ -86,16 +98,49 @@ const UNAVAILABLE_ENFORCEMENT = (reason: string): RepoIdentityEnforcement => ({
   unlockAvailable: false,
 });
 
-/** True when the on-disk artifacts are a pre-identity-lock (legacy Shield) installation rather than a damaged v3 lock. */
+/**
+ * True when the on-disk artifacts are a pre-identity-lock (legacy Shield)
+ * installation rather than an identity lock (current, previous-version
+ * awaiting upgrade, or damaged).
+ */
 export function isLegacyInstallation(inspection: ShieldInspection): boolean {
-  if (inspection.policyValid) return false;
+  if (inspection.policyValid || inspection.policyNeedsUpgrade) return false;
   if (inspection.legacyPolicy) return true;
-  const oldHook = inspection.hooks.some((h) => h.ownership === "shield" && (h.version ?? 0) < SHIELD_ARTIFACT_VERSION);
-  const oldEvaluator = inspection.evaluatorOwned && (inspection.evaluatorVersion ?? 0) < SHIELD_ARTIFACT_VERSION;
-  // Artifacts from a pre-v6 (Shield Mode) build with no valid v3 policy are
-  // a legacy installation even when the legacy policy itself is missing or
+  const oldHook = inspection.hooks.some((h) => h.ownership === "shield" && (h.version ?? 0) < PREVIOUS_LOCK_ARTIFACT_VERSION);
+  const oldEvaluator = inspection.evaluatorOwned && (inspection.evaluatorVersion ?? 0) < PREVIOUS_LOCK_ARTIFACT_VERSION;
+  // Artifacts from a pre-v6 (Shield Mode) build with no lock policy are a
+  // legacy installation even when the legacy policy itself is missing or
   // unreadable — migration then simply removes them (nothing provable).
+  // v6 artifacts belong to an identity lock (policy v3): never "legacy",
+  // so a damaged one is never removed automatically.
   return oldHook || oldEvaluator;
+}
+
+/** The identity a lock policy snapshot records — exactly what the lock enforces, never the (possibly edited) live definition. */
+export function identityFromSnapshot(snapshot: NonNullable<ShieldInspection["policySnapshot"]>): Identity {
+  const identity: Identity = { id: snapshot.identityId, label: snapshot.identityLabel, gitEmail: snapshot.expectedGitEmail };
+  if (snapshot.expectedGitName) identity.gitName = snapshot.expectedGitName;
+  if (snapshot.expectedGitHubLogin) identity.expectedGitHubLogin = snapshot.expectedGitHubLogin;
+  if (snapshot.trustedSshHostAliases.length > 0) identity.trustedSshHostAliases = [...snapshot.trustedSshHostAliases];
+  return identity;
+}
+
+/**
+ * The one sentence explaining why an assigned repository's pushes are all
+ * blocked by an incomplete push requirement, or `undefined` when push is
+ * `enforced`. Shared by status, assign and upgrade so the wording cannot
+ * drift — and so it can never read as "pushes are allowed".
+ */
+export function pushRequirementProblem(snapshot: Pick<Identity, "label" | "gitEmail" | "expectedGitHubLogin" | "trustedSshHostAliases">): string | undefined {
+  const push = pushEnforcementFor(snapshot);
+  if (push === "needs_configuration") {
+    const aliasNote = (snapshot.trustedSshHostAliases ?? []).length === 0 ? " It also needs a trusted SSH host alias to push through." : "";
+    return `Commits are checked against ${snapshot.gitEmail}, but "${snapshot.label}" has no GitHub account configured for push verification, so every push from this repository is blocked. Configure the GitHub account (expectedGitHubLogin) for "${snapshot.label}" in Repo Identity Guard, then run Repair Identity Lock.${aliasNote}`;
+  }
+  if (push === "unverifiable") {
+    return `"${snapshot.label}" expects the GitHub account "${snapshot.expectedGitHubLogin}" but lists no trusted SSH host alias, so no push from this repository can be verified — every push is blocked until an alias is added to the identity (then run Repair Identity Lock).`;
+  }
+  return undefined;
 }
 
 /**
@@ -106,7 +151,7 @@ export function deriveEnforcement(inspection: ShieldInspection, identities: Iden
   if (!inspection.gitContext) {
     return UNAVAILABLE_ENFORCEMENT(inspection.reasons[0] ?? "This repository's Git state could not be read.");
   }
-  const snapshot = inspection.policyValid ? inspection.policySnapshot : undefined;
+  const snapshot = inspection.policyValid || inspection.policyNeedsUpgrade ? inspection.policySnapshot : undefined;
   const ownedPreCommit = inspection.hooks.some((h) => h.fileName === "pre-commit" && h.ownership === "shield");
   const commitEnforced = ownedPreCommit && inspection.evaluatorOwned && !!snapshot;
 
@@ -148,9 +193,25 @@ export function deriveEnforcement(inspection: ShieldInspection, identities: Iden
     };
   }
 
-  const push = pushEnforcementFor({ expectedGitHubLogin: snapshot.expectedGitHubLogin, trustedSshHostAliases: snapshot.trustedSshHostAliases });
+  const recorded = identityFromSnapshot(snapshot);
+  const push = pushEnforcementFor(recorded);
   const identityStillDefined = identities.some((identity) => identity.id === snapshot.identityId);
 
+  if (inspection.policyNeedsUpgrade) {
+    // A lock from an earlier version: its assignment stands, but it must be
+    // upgraded before its push requirement is enforced the current way.
+    // The upgrade works from the recorded snapshot, so it never depends on
+    // the identity still existing in settings.
+    const pushNote = pushRequirementProblem(recorded);
+    return {
+      state: "needs_attention",
+      reason: `${inspection.reasons[0] ?? "This repository's identity lock was installed by an earlier version and must be upgraded."}${pushNote ? ` After the upgrade: ${pushNote}` : ""}`,
+      commitEnforced,
+      push,
+      repairAvailable: !inspection.gitVersionKnownUnsupported,
+      unlockAvailable: true,
+    };
+  }
   if (inspection.state !== "active") {
     return {
       state: "needs_attention",
@@ -161,10 +222,14 @@ export function deriveEnforcement(inspection: ShieldInspection, identities: Iden
       unlockAvailable: true,
     };
   }
-  if (push === "unverifiable") {
+  // Fully installed — but a lock is only ACTIVE when it enforces BOTH
+  // commit and push. An incomplete push requirement blocks every push and
+  // keeps the repository in needs_attention, never "active".
+  const pushProblem = pushRequirementProblem(recorded);
+  if (push !== "enforced") {
     return {
       state: "needs_attention",
-      reason: `"${snapshot.identityLabel}" expects the GitHub account "${snapshot.expectedGitHubLogin}" but lists no trusted SSH host alias, so no push from this repository can be verified — every push is blocked until an alias is added to the identity (then run Repair Identity Lock).`,
+      reason: pushProblem,
       commitEnforced,
       push,
       repairAvailable: false,
@@ -239,7 +304,10 @@ export class IdentityLockService {
     if (before.enforcement.state === "unavailable") {
       return { ok: false, message: "This repository cannot be locked right now.", details: [before.enforcement.reason ?? ""], status: before };
     }
-    const sameAssignment = before.inspection.policySnapshot && before.inspection.policyValid && before.inspection.policySnapshot.identityId === identity.id;
+    const sameAssignment =
+      before.inspection.policySnapshot &&
+      (before.inspection.policyValid || before.inspection.policyNeedsUpgrade) &&
+      before.inspection.policySnapshot.identityId === identity.id;
     const lockId = sameAssignment ? (before.inspection.policySnapshot as { lockId: string }).lockId : this.newLockId();
     const assignedAt = sameAssignment ? (before.inspection.policySnapshot as { assignedAt: number }).assignedAt : this.now();
 
@@ -270,15 +338,12 @@ export class IdentityLockService {
       };
     }
 
+    // Assigning an incomplete identity is allowed (commits are locked at
+    // once), but its push requirement is incomplete: every push is BLOCKED
+    // until it is completed, and the repository reports needs_attention.
     const details = [...(result.warnings ?? [])];
-    const push = pushEnforcementFor(identity);
-    if (push === "not_configured") {
-      details.push(`Commits are locked to ${identity.gitEmail}. "${identity.label}" declares no GitHub login, so pushes are not account-checked.`);
-    } else if (push === "unverifiable") {
-      details.push(
-        `"${identity.label}" expects the GitHub account "${identity.expectedGitHubLogin}" but lists no trusted SSH host alias, so every push from this repository will be blocked until one is added.`,
-      );
-    }
+    const pushProblem = pushRequirementProblem(identity);
+    if (pushProblem) details.push(pushProblem);
     return {
       ok: true,
       message: before.assignment && !sameAssignment
@@ -301,7 +366,7 @@ export class IdentityLockService {
     if (status.legacy) {
       return { ok: false, message: "This repository has a legacy Shield installation; it is migrated (not repaired).", details: [], status };
     }
-    const snapshot = status.inspection.policyValid ? status.inspection.policySnapshot : undefined;
+    const snapshot = status.inspection.policyValid || status.inspection.policyNeedsUpgrade ? status.inspection.policySnapshot : undefined;
     if (!snapshot) {
       if (status.enforcement.state === "unassigned") {
         return { ok: false, message: "This repository has no identity assigned, so there is nothing to repair.", details: [], status };
@@ -314,6 +379,12 @@ export class IdentityLockService {
       };
     }
     const identity = identities.find((candidate) => candidate.id === snapshot.identityId);
+    if (!identity && status.inspection.policyNeedsUpgrade) {
+      // An earlier-version lock whose identity is gone from settings is
+      // still upgraded — from the recorded snapshot, so exactly what it
+      // enforced keeps being enforced (with push now fail-closed).
+      return this.assign(repo, identityFromSnapshot(snapshot), { chainForeignHooks: options.chainForeignHooks, identities });
+    }
     if (!identity) {
       return {
         ok: false,
@@ -372,7 +443,50 @@ export class IdentityLockService {
   }
 
   /**
-   * Migrates a legacy Shield installation, if one is present: into a v3
+   * Upgrades an identity lock written by an earlier version (policy v3,
+   * artifacts v6) in place, if one is present — a no-op (`kind: "none"`)
+   * for every other repository, so it is safe and idempotent to call on
+   * every scan of a trusted workspace.
+   *
+   * The assignment is KEPT: the lock is re-installed from its own recorded
+   * snapshot (same identity values, `lockId` and `assignedAt` — never the
+   * live settings, which may have been edited; drift is then reported as
+   * usual). Commit enforcement is unchanged. Push becomes fail-closed: a
+   * lock whose identity had no GitHub login (a v3 "commit-only" lock) now
+   * blocks every push until a login is configured, and reports
+   * needs_attention. Nothing is unlocked, and no login is ever guessed.
+   *
+   * All-or-nothing like `assign`: if the upgrade cannot complete (e.g. a
+   * foreign hook now occupies a slot the lock needs, and chaining was not
+   * requested), the previous installation is left exactly as it was and
+   * keeps reporting needs_attention.
+   */
+  public async upgradePreviousLock(repo: RepositoryRef, input: { identities: Identity[]; chainForeignHooks?: boolean }): Promise<PreviousLockUpgradeOutcome> {
+    const status = await this.getStatus(repo, input.identities);
+    const snapshot = status.inspection.policySnapshot;
+    if (!status.inspection.policyNeedsUpgrade || !snapshot) return { kind: "none" };
+
+    const recorded = identityFromSnapshot(snapshot);
+    const upgraded = await this.assign(repo, recorded, { identities: input.identities, chainForeignHooks: input.chainForeignHooks });
+    if (!upgraded.ok || !upgraded.status) {
+      return {
+        kind: "failed",
+        message: `This repository's identity lock for "${recorded.label}" (from an earlier version of Repo Identity Guard) could not be upgraded, so it was left exactly as it was and needs attention: ${upgraded.message}`,
+        details: upgraded.details,
+        status: upgraded.status,
+      };
+    }
+    const pushProblem = pushRequirementProblem(recorded);
+    return {
+      kind: "upgraded",
+      identityLabel: recorded.label,
+      message: `This repository's identity lock for "${recorded.label}" was upgraded; it is still assigned and commits are still checked.${pushProblem ? ` ${pushProblem}` : ""}`,
+      status: upgraded.status,
+    };
+  }
+
+  /**
+   * Migrates a legacy Shield installation, if one is present: into an
    * identity lock when an explicit binding is provable, otherwise by
    * removing it (see `legacyMigration.ts`). A no-op (`kind: "none"`) for
    * every other repository, so it is safe — and idempotent — to call on

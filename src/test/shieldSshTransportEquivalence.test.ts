@@ -255,15 +255,18 @@ test("PART 3 — all four override families at once are reported together, in th
   }
 });
 
-test("PART 3 — a commit-only lock (no expected GitHub login) makes no claim about pushes, so a transport override does not block", async () => {
-  const repo = await fs.mkdtemp(path.join(os.tmpdir(), "shield-ssh-variant-commit-only-"));
+test("PART 3 — a lock with no expected GitHub login blocks the push as push-identity-not-configured, with or without a transport override", async () => {
+  const repo = await fs.mkdtemp(path.join(os.tmpdir(), "shield-ssh-variant-no-login-"));
   try {
     await execFileAsync("git", ["init", "-q"], { cwd: repo });
     const { stdout } = await execFileAsync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: repo });
     await fs.mkdir(shieldStorageDir(stdout.trim()), { recursive: true });
     await fs.writeFile(shieldPolicyFilePath(stdout.trim()), serializeShieldPolicy(testPolicy(WORK_IDENTITY)));
-    const result = await runPush(repo, { ...(await baseEnv()), GIT_SSH_VARIANT: "plink", GIT_SSH_COMMAND: "ssh -v" });
-    assert.equal(result.code, 0, result.stderr);
+    for (const override of [{}, { GIT_SSH_VARIANT: "plink", GIT_SSH_COMMAND: "ssh -v" }]) {
+      const result = await runPush(repo, { ...(await baseEnv()), ...override });
+      assert.notEqual(result.code, 0, JSON.stringify(override));
+      assert.match(result.stderr, /^REASON_ID: push-identity-not-configured$/m, JSON.stringify(override));
+    }
   } finally {
     await cleanup(repo);
   }

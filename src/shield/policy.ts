@@ -9,16 +9,32 @@ import { SHIELD_ACTIONS, ShieldAction } from "./types";
  *   and a user-facing `strictPushSetup` switch. They are never enforced by
  *   this build — the shell evaluator rejects them as `policy-corrupt`
  *   (fail closed), and `IdentityLockService.migrateLegacy` either converts
- *   a provable explicit binding into a v3 lock or removes the legacy
- *   installation (see `src/identity/legacyMigration.ts`).
- * - v3 is the identity lock: one explicitly assigned identity, nothing
- *   else. It is also the durable assignment record itself (see
- *   `src/identity/assignment.ts`).
+ *   a provable explicit binding into an identity lock or removes the
+ *   legacy installation (see `src/identity/legacyMigration.ts`).
+ * - v3 was the first identity-lock policy. It carried an `enforcedActions`
+ *   list that dropped `"push"` whenever the identity had no GitHub login,
+ *   which let every push through unchecked from an ASSIGNED repository.
+ *   This build never enforces a v3 policy (the evaluator fails closed on
+ *   it); `IdentityLockService.upgradePreviousLock` rewrites it as v4,
+ *   preserving the assignment (identity snapshot, `lockId`, `assignedAt`) —
+ *   see {@link upgradePreviousLockPolicy}.
+ * - v4 is the identity lock: one explicitly assigned identity, and BOTH
+ *   commit and push are always governed. There is no per-action switch: a
+ *   missing `expectedGitHubLogin` no longer takes push out of the policy,
+ *   it makes the push requirement incomplete, and every push is blocked
+ *   (`push-identity-not-configured`). It is also the durable assignment
+ *   record itself (see `src/identity/assignment.ts`).
  */
-export const SHIELD_POLICY_VERSION = 3 as const;
+export const SHIELD_POLICY_VERSION = 4 as const;
 
 /** Policy versions written by earlier releases — recognized only so they can be migrated, never enforced. */
 export const LEGACY_SHIELD_POLICY_VERSIONS: readonly number[] = [1, 2];
+
+/** Earlier identity-lock policy versions — a real assignment, recognized only so it can be upgraded in place (assignment preserved), never enforced. */
+export const PREVIOUS_LOCK_POLICY_VERSIONS: readonly number[] = [3];
+
+/** Every action a lock governs — always both, for every assigned repository. */
+export const GOVERNED_ACTIONS: readonly ShieldAction[] = SHIELD_ACTIONS;
 
 /**
  * Non-secret description of the identity one repository is locked to.
@@ -49,19 +65,20 @@ export interface ShieldPolicy {
   expectedGitName?: string;
   expectedGitEmail: string;
 
-  /** github.com login every push must authenticate as. Absent = pushes are not account-checked. */
-  expectedGitHubLogin?: string;
-  /** SSH aliases accepted as push routes for `expectedGitHubLogin` (see `Identity.trustedSshHostAliases`). */
-  trustedSshHostAliases: string[];
-
   /**
-   * Exactly the actions enforced: always `commit`; `push` if and only if
-   * `expectedGitHubLogin` is set. Validated for that consistency in both
-   * TypeScript and the shell evaluator, so a hand-edited policy cannot
-   * silently drop commit enforcement or claim push enforcement with no
-   * account to enforce.
+   * github.com login every push must authenticate as. ABSENT (or empty)
+   * means the push requirement is incomplete: every push is BLOCKED with
+   * `push-identity-not-configured` — never allowed unchecked. Push is
+   * governed by every policy regardless (see {@link GOVERNED_ACTIONS});
+   * there is no field that can take it out of the lock.
    */
-  enforcedActions: ShieldAction[];
+  expectedGitHubLogin?: string;
+  /**
+   * SSH aliases accepted as push routes for `expectedGitHubLogin` (see
+   * `Identity.trustedSshHostAliases`). Empty means no route can be
+   * verified: every push is blocked with `push-route-unverified`.
+   */
+  trustedSshHostAliases: string[];
 }
 
 export interface ShieldPolicyInput {
@@ -69,11 +86,6 @@ export interface ShieldPolicyInput {
   lockId: string;
   assignedAt: number;
   now?: number;
-}
-
-/** The actions a lock for this identity enforces — see `ShieldPolicy.enforcedActions`. */
-export function enforcedActionsFor(identity: Pick<Identity, "expectedGitHubLogin">): ShieldAction[] {
-  return identity.expectedGitHubLogin ? ["commit", "push"] : ["commit"];
 }
 
 /** Builds a policy purely from already-validated, non-secret inputs — no I/O. */
@@ -88,7 +100,6 @@ export function buildShieldPolicy(input: ShieldPolicyInput): ShieldPolicy {
     identityLabel: identity.label,
     expectedGitEmail: identity.gitEmail,
     trustedSshHostAliases: [...(identity.trustedSshHostAliases ?? [])],
-    enforcedActions: enforcedActionsFor(identity),
   };
   if (identity.gitName) policy.expectedGitName = identity.gitName;
   if (identity.expectedGitHubLogin) policy.expectedGitHubLogin = identity.expectedGitHubLogin;
@@ -121,12 +132,11 @@ function isNonEmptyString(value: unknown): value is string {
  * in agreement.
  */
 export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResult {
-  const errors: ShieldPolicyValidationError[] = [];
-
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return { ok: false, errors: [{ path: "$", message: "Policy must be a JSON object." }] };
   }
   const v = value as Record<string, unknown>;
+  const errors: ShieldPolicyValidationError[] = [];
 
   if (v.policyVersion !== SHIELD_POLICY_VERSION) {
     errors.push({
@@ -134,9 +144,34 @@ export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResu
       message:
         typeof v.policyVersion === "number" && LEGACY_SHIELD_POLICY_VERSIONS.includes(v.policyVersion)
           ? `This is a legacy Shield policy (version ${v.policyVersion}); it must be migrated, not enforced.`
-          : `Expected policyVersion ${SHIELD_POLICY_VERSION}, got ${JSON.stringify(v.policyVersion)}.`,
+          : typeof v.policyVersion === "number" && PREVIOUS_LOCK_POLICY_VERSIONS.includes(v.policyVersion)
+            ? `This is an identity-lock policy from an earlier version (version ${v.policyVersion}); it must be upgraded, not enforced.`
+            : `Expected policyVersion ${SHIELD_POLICY_VERSION}, got ${JSON.stringify(v.policyVersion)}.`,
     });
   }
+  // v4 governs commit AND push unconditionally. A per-action list is not
+  // part of the schema, and its presence is refused rather than ignored so
+  // nobody can believe that editing it takes push out of the lock.
+  if ("enforcedActions" in v) {
+    errors.push({
+      path: "enforcedActions",
+      message: "enforcedActions is not part of the identity-lock policy (version 4): commit and push are always both governed.",
+    });
+  }
+  errors.push(...lockFieldErrors(v));
+
+  if (errors.length > 0) {
+    return { ok: false, errors };
+  }
+  return { ok: true, policy: policyFromValidatedFields(v) };
+}
+
+/**
+ * Field checks shared by every identity-lock policy version (v3 and v4):
+ * everything except `policyVersion` and v3's `enforcedActions`.
+ */
+function lockFieldErrors(v: Record<string, unknown>): ShieldPolicyValidationError[] {
+  const errors: ShieldPolicyValidationError[] = [];
   if (!isNonEmptyString(v.lockId)) {
     errors.push({ path: "lockId", message: "lockId must be a non-empty string." });
   }
@@ -159,38 +194,20 @@ export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResu
     errors.push({ path: "trustedSshHostAliases", message: "trustedSshHostAliases must be an array of strings." });
   }
 
-  if (!Array.isArray(v.enforcedActions) || v.enforcedActions.some((a) => !SHIELD_ACTIONS.includes(a as ShieldAction))) {
-    errors.push({
-      path: "enforcedActions",
-      message: `enforcedActions must be an array containing only ${SHIELD_ACTIONS.join(", ")}.`,
-    });
-  } else {
-    const actions = v.enforcedActions as ShieldAction[];
-    if (!actions.includes("commit")) {
-      errors.push({ path: "enforcedActions", message: 'enforcedActions must include "commit" — a lock always enforces commit identity.' });
-    }
-    const hasLogin = isNonEmptyString(v.expectedGitHubLogin);
-    if (actions.includes("push") !== hasLogin) {
-      errors.push({
-        path: "enforcedActions",
-        message: 'enforcedActions must include "push" exactly when expectedGitHubLogin is set.',
-      });
-    }
-  }
-
   // Secret-shaped-field guard: a policy accidentally built from the wrong
   // source object must fail validation instead of silently persisting.
-  const forbiddenKeys = ["token", "accessToken", "password", "privateKey", "sshKey", "credentials", "secret"];
-  for (const key of forbiddenKeys) {
+  for (const key of FORBIDDEN_POLICY_KEYS) {
     if (key in v) {
       errors.push({ path: key, message: `Policy must not contain a "${key}" field — the lock policy is non-secret by design.` });
     }
   }
+  return errors;
+}
 
-  if (errors.length > 0) {
-    return { ok: false, errors };
-  }
+const FORBIDDEN_POLICY_KEYS = ["token", "accessToken", "password", "privateKey", "sshKey", "credentials", "secret"];
 
+/** The v4 policy carried by fields that already passed {@link lockFieldErrors}. */
+function policyFromValidatedFields(v: Record<string, unknown>): ShieldPolicy {
   const policy: ShieldPolicy = {
     policyVersion: SHIELD_POLICY_VERSION,
     lockId: v.lockId as string,
@@ -199,12 +216,44 @@ export function validateShieldPolicy(value: unknown): ShieldPolicyValidationResu
     identityId: v.identityId as string,
     identityLabel: v.identityLabel as string,
     expectedGitEmail: v.expectedGitEmail as string,
-    trustedSshHostAliases: v.trustedSshHostAliases as string[],
-    enforcedActions: v.enforcedActions as ShieldAction[],
+    trustedSshHostAliases: [...(v.trustedSshHostAliases as string[])],
   };
   if (typeof v.expectedGitName === "string") policy.expectedGitName = v.expectedGitName;
   if (typeof v.expectedGitHubLogin === "string") policy.expectedGitHubLogin = v.expectedGitHubLogin;
-  return { ok: true, policy };
+  return policy;
+}
+
+/**
+ * Reads a PREVIOUS-version (v3) identity-lock policy — a real, explicit
+ * assignment written by an earlier release — and returns the v4 policy
+ * that carries the same assignment forward: identical identity snapshot,
+ * `lockId` and `assignedAt`. Returns `undefined` when the text is not a
+ * well-formed v3 lock policy (anything else is corruption, not an
+ * assignment, and is never "upgraded" into one).
+ *
+ * The upgrade deliberately DROPS v3's `enforcedActions`: a v3 policy whose
+ * list omitted `"push"` (an identity with no GitHub login) becomes a v4
+ * policy with no `expectedGitHubLogin` — i.e. commits stay enforced
+ * exactly as before, and every push is now BLOCKED as
+ * `push-identity-not-configured` until the user configures a login. A v3
+ * lock is never silently unlocked, and never silently given a login.
+ */
+export function upgradePreviousLockPolicy(json: string): ShieldPolicy | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const v = parsed as Record<string, unknown>;
+  if (typeof v.policyVersion !== "number" || !PREVIOUS_LOCK_POLICY_VERSIONS.includes(v.policyVersion)) return undefined;
+  if (lockFieldErrors(v).length > 0) return undefined;
+  // v3's own consistency rule for its action list: well-formed, and always
+  // containing "commit". Anything else was already corrupt under v3.
+  if (!Array.isArray(v.enforcedActions) || v.enforcedActions.some((a) => !SHIELD_ACTIONS.includes(a as ShieldAction))) return undefined;
+  if (!(v.enforcedActions as ShieldAction[]).includes("commit")) return undefined;
+  return policyFromValidatedFields(v);
 }
 
 export function serializeShieldPolicy(policy: ShieldPolicy): string {

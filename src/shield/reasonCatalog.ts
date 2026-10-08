@@ -26,6 +26,11 @@ export const SHIELD_REASON_CATALOG: Record<ShieldReasonId, ShieldReasonDescripto
     description:
       "Git config already matches the assigned identity, but an environment variable or command-line option (GIT_AUTHOR_*/GIT_COMMITTER_*, git -c user.email=..., --author) overrides it for this commit.",
   },
+  "push-identity-not-configured": {
+    code: "push_identity_not_configured",
+    description:
+      "This repository is locked to an identity that has no GitHub account (expectedGitHubLogin) configured for push verification, so no push can be attributed to the assigned identity. Every push is blocked until the GitHub account is configured.",
+  },
   "push-route-unverified": {
     code: "push_route_unverified",
     description:

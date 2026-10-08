@@ -195,16 +195,26 @@ test("the lock policy is found identically from a linked worktree, end-to-end th
 
 // ==================== push ====================
 
-test("a commit-only lock (no expected GitHub login) never blocks a push, over any route", async () => {
+test("a lock whose identity has no expected GitHub login BLOCKS every push (push-identity-not-configured), over any route — matching the TS evaluator", async () => {
   const repo = await makeTempRepo();
+  const fakeSshBin = await makeFakeSshBin();
   try {
     await writePolicy(repo, testPolicy(WORK_IDENTITY));
-    for (const url of ["https://github.com/AcmeSoftware/acme-frontend.git", "git@github.com:x/y.git", "git@unknown:x/y.git"]) {
-      const result = await runScript(repo, ["push", "origin", url]);
-      assert.equal(result.code, 0, `${url}: ${result.stderr}`);
+    for (const url of ["https://github.com/AcmeSoftware/acme-frontend.git", "git@github.com:x/y.git", "git@unknown:x/y.git", "git@github-work:AcmeSoftware/acme-frontend.git"]) {
+      // Even a trusted alias that would authenticate as the right person.
+      const result = await runEvaluatorScript(repo, process.env, fakeSshBin, SCRIPT_PATH, ["push", "origin", url], {
+        FAKE_SSH_AUTH_OUTPUT: "Hi danish-work! You've successfully authenticated, but GitHub does not provide shell access.",
+      });
+      assert.notEqual(result.code, 0, `${url}: an assigned repository let a push through unchecked`);
+      assert.match(result.stderr, /^REASON_ID: push-identity-not-configured$/m, url);
+      const decision = evaluatePush(testPolicy(WORK_IDENTITY), { remoteName: "origin", remoteUrl: url, sshCommandOverrides: [], githubAccountCheck: { kind: "authenticated-user", login: "danish-work" } });
+      assert.deepEqual(decision.reasons.map((r) => r.id), ["push-identity-not-configured"], url);
     }
+    // Commits are still enforced exactly as before for the same policy.
+    assert.equal((await runScript(repo, ["commit"])).code, 0);
   } finally {
     await cleanup(repo);
+    await fs.rm(fakeSshBin, { recursive: true, force: true }).catch(() => undefined);
   }
 });
 
@@ -252,7 +262,8 @@ test("an identity with a GitHub login but no trusted alias blocks every push", a
     const result = await runScript(repo, ["push", "origin", "git@github-work:AcmeSoftware/acme-frontend.git"]);
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /push-route-unverified/);
-    assert.match(result.stderr, /\(none configured\)/);
+    assert.match(result.stderr, /lists no trusted SSH host alias, so no push route can be verified/);
+    assert.match(result.stderr, /every push from this repository is blocked until one is configured/);
   } finally {
     await cleanup(repo);
   }
@@ -279,9 +290,14 @@ test("no message from the script ever claims cryptographic account verification"
 // ====================================================================
 
 const VALID_ONE_LINE_POLICY =
-  '{ "policyVersion": 3, "lockId": "lock-1", "assignedAt": 1, "generatedAt": 1, "identityId": "work", "identityLabel": "Work",' +
+  '{ "policyVersion": 4, "lockId": "lock-1", "assignedAt": 1, "generatedAt": 1, "identityId": "work", "identityLabel": "Work",' +
   ' "expectedGitName": "Danish Irfan", "expectedGitEmail": "work@example.com",' +
-  ' "trustedSshHostAliases": ["github-work"], "enforcedActions": ["commit"] }';
+  ' "trustedSshHostAliases": ["github-work"] }';
+
+/** VALID_ONE_LINE_POLICY with one extra top-level field appended. */
+function withField(field: string): string {
+  return VALID_ONE_LINE_POLICY.replace('"trustedSshHostAliases": ["github-work"]', `"trustedSshHostAliases": ["github-work"], ${field}`);
+}
 
 test("policy parsing: a VALID policy formatted entirely on one line is honoured — both the allow AND the block half", async () => {
   const repo = await makeTempRepo();
@@ -312,24 +328,28 @@ test("policy parsing: a TRUNCATED policy (partial write) fails CLOSED as policy-
 
 const ADVERSARIAL_POLICIES: ReadonlyArray<readonly [string, string, RegExp]> = [
   ["duplicate expectedGitEmail (which of the two was meant?)", VALID_ONE_LINE_POLICY.replace('"expectedGitEmail": "work@example.com"', '"expectedGitEmail": "work@example.com", "expectedGitEmail": "attacker@example.com"'), /duplicate key/],
-  ["duplicate top-level field", `{ "policyVersion": 3, ${VALID_ONE_LINE_POLICY.slice(1)}`, /duplicate key/],
+  ["duplicate top-level field", `{ "policyVersion": 4, ${VALID_ONE_LINE_POLICY.slice(1)}`, /duplicate key/],
   ["trailing content after the policy object", `${VALID_ONE_LINE_POLICY} and then some junk`, /trailing content/],
-  ["enforcedActions is not an array", VALID_ONE_LINE_POLICY.replace('"enforcedActions": ["commit"]', '"enforcedActions": "commit"'), /enforcedActions must be an array/],
-  ["enforcedActions contains a non-string element", VALID_ONE_LINE_POLICY.replace('"enforcedActions": ["commit"]', '"enforcedActions": ["commit", 7]'), /enforcedActions must contain only strings/],
-  ["enforcedActions names an action the evaluator does not know", VALID_ONE_LINE_POLICY.replace('"enforcedActions": ["commit"]', '"enforcedActions": ["commit", "rebase"]'), /must contain only "commit" and "push"/],
-  ["enforcedActions drops commit enforcement", VALID_ONE_LINE_POLICY.replace('"enforcedActions": ["commit"]', '"enforcedActions": ["push"]'), /must include "commit"/],
-  ["enforcedActions claims push with no expected GitHub login", VALID_ONE_LINE_POLICY.replace('"enforcedActions": ["commit"]', '"enforcedActions": ["commit", "push"]'), /exactly when expectedGitHubLogin is set/],
-  ["expected GitHub login without push enforcement", VALID_ONE_LINE_POLICY.replace('"identityLabel": "Work"', '"identityLabel": "Work", "expectedGitHubLogin": "danish-work"'), /exactly when expectedGitHubLogin is set/],
+  // v4 has no per-action switch: a v3-style list (that could take push out
+  // of the lock) is refused in any shape, never silently honoured or ignored.
+  ["a v3-style enforcedActions list that drops push", withField('"enforcedActions": ["commit"]'), /must not contain an enforcedActions field/],
+  ["a v3-style enforcedActions list naming both actions", withField('"enforcedActions": ["commit", "push"]'), /must not contain an enforcedActions field/],
+  ["an enforcedActions field of any other shape", withField('"enforcedActions": null'), /must not contain an enforcedActions field/],
   ["trustedSshHostAliases is not an array", VALID_ONE_LINE_POLICY.replace('"trustedSshHostAliases": ["github-work"]', '"trustedSshHostAliases": null'), /trustedSshHostAliases must be an array/],
   ["expectedGitHubLogin is not a string", VALID_ONE_LINE_POLICY.replace('"identityLabel": "Work"', '"identityLabel": "Work", "expectedGitHubLogin": 12345'), /expectedGitHubLogin must be a string/],
   ["missing required expectedGitEmail", VALID_ONE_LINE_POLICY.replace('"expectedGitEmail": "work@example.com", ', ""), /expectedGitEmail/],
   ["empty required identityLabel", VALID_ONE_LINE_POLICY.replace('"identityLabel": "Work"', '"identityLabel": ""'), /identityLabel/],
   ["missing lockId", VALID_ONE_LINE_POLICY.replace('"lockId": "lock-1", ', ""), /lockId/],
   ["missing assignedAt", VALID_ONE_LINE_POLICY.replace('"assignedAt": 1, ', ""), /assignedAt/],
-  ["a legacy Shield (v2) policy", VALID_ONE_LINE_POLICY.replace('"policyVersion": 3', '"policyVersion": 2'), /legacy Repo Identity Guard "Shield" policy/],
-  ["a future policyVersion", VALID_ONE_LINE_POLICY.replace('"policyVersion": 3', '"policyVersion": 4'), /policyVersion/],
+  ["a legacy Shield (v2) policy", VALID_ONE_LINE_POLICY.replace('"policyVersion": 4', '"policyVersion": 2'), /legacy Repo Identity Guard "Shield" policy/],
+  [
+    "a previous identity-lock (v3) policy, even a well-formed one",
+    withField('"enforcedActions": ["commit"]').replace('"policyVersion": 4', '"policyVersion": 3'),
+    /earlier version of Repo Identity Guard \(policy version 3\)/,
+  ],
+  ["a future policyVersion", VALID_ONE_LINE_POLICY.replace('"policyVersion": 4', '"policyVersion": 5'), /policyVersion/],
   ["a secret-shaped field that should never have been persisted", VALID_ONE_LINE_POLICY.replace('"generatedAt": 1', '"generatedAt": 1, "token": "ghp_example"'), /must not contain a "token" field/],
-  ["unterminated string", '{ "policyVersion": 3, "identityLabel": "Work', /unterminated string|raw control character inside a string/],
+  ["unterminated string", '{ "policyVersion": 4, "identityLabel": "Work', /unterminated string|raw control character inside a string/],
   ["invalid escape sequence inside a string", VALID_ONE_LINE_POLICY.replace('"identityLabel": "Work"', '"identityLabel": "Wo\\qrk"'), /invalid escape/],
   ["invalid number", VALID_ONE_LINE_POLICY.replace('"generatedAt": 1', '"generatedAt": 01'), /policy-corrupt/],
   ["the whole file is a JSON array, not an object", "[1, 2, 3]", /must contain a JSON object/],

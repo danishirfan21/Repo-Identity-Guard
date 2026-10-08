@@ -252,7 +252,7 @@ test("stale inputs: an identity edited after the last scan is honoured when the 
 
     const policy = await readPolicy(repo);
     assert.equal(policy.expectedGitHubLogin, "danish-work");
-    assert.deepEqual(policy.enforcedActions, ["commit", "push"]);
+    assert.equal("enforcedActions" in policy, false, "policy v4 governs commit and push unconditionally");
     // And a health check against the same live identity sees no drift.
     const health = await manager.healthCheck(repo.dir, {
       evaluatorScriptSource: EVALUATOR_SOURCE,

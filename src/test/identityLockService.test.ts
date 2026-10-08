@@ -9,9 +9,12 @@ import { identitiesFromLegacyProfiles } from "../identity/identityConfig";
 import { IdentityLockService } from "../identity/identityLockService";
 import type { Identity } from "../identity/types";
 import { SHIELD_ARTIFACT_MARKER, SHIELD_ARTIFACT_VERSION, SHIELD_CHAIN_ORIGINAL_SUFFIX } from "../shield/artifacts";
+import { shieldInstallRecordFilePath, writeShieldInstallRecord } from "../shield/installRecord";
 import { ShieldManager } from "../shield/manager";
 import { parseShieldPolicy } from "../shield/policy";
-import { EVALUATOR_SOURCE, WORK_IDENTITY, identityWith, parseBlockPrelude } from "./testUtil/lockFixtures";
+import { runEvaluatorScript } from "./testUtil/evaluatorShell";
+import { EVALUATOR_SOURCE, WORK_IDENTITY, WORK_IDENTITY_WITH_LOGIN, identityWith, parseBlockPrelude } from "./testUtil/lockFixtures";
+import { AUTHENTICATED_AS, makeRouteFakeSsh } from "./testUtil/routeFakeSsh";
 
 /**
  * The product contract of the identity lock, end to end, against real
@@ -24,12 +27,20 @@ import { EVALUATOR_SOURCE, WORK_IDENTITY, identityWith, parseBlockPrelude } from
  *    worktrees share it, an unrelated clone does not), and is
  *    all-or-nothing;
  *  - change/unlock/repair/drift behave transactionally;
- *  - legacy Shield installations are migrated conservatively.
+ *  - an ASSIGNED repository always governs push too: an identity with no
+ *    GitHub login (or no trusted alias) blocks every push and is never
+ *    reported active;
+ *  - legacy Shield installations are migrated conservatively, and v3
+ *    locks from the previous release are upgraded in place (assignment
+ *    kept, pushes fail-closed).
  */
 
 const execFileAsync = promisify(execFile);
 
-const WORK = WORK_IDENTITY;
+/** A COMPLETE (enforcement-ready) identity: Git identity + GitHub login + trusted alias. */
+const WORK = WORK_IDENTITY_WITH_LOGIN;
+/** The same person's identity with NO GitHub login configured — structurally valid, not enforcement-ready. */
+const WORK_NO_LOGIN = WORK_IDENTITY;
 const PERSONAL: Identity = { id: "personal", label: "Personal", gitName: "Danish", gitEmail: "me@example.com" };
 
 interface Repo {
@@ -178,10 +189,10 @@ test("ASSIGN: assignment is enforcement — the right identity commits, the wron
   const assigned = await svc.assign(repoRef, WORK, { identities: [WORK, PERSONAL] });
   assert.equal(assigned.ok, true, `${assigned.message} ${assigned.details.join(" | ")}`);
   assert.equal(assigned.message, 'This repository is locked to "Work".');
-  assert.match(assigned.details.join(" "), /declares no GitHub login, so pushes are not account-checked/);
+  assert.deepEqual(assigned.details, [], "a complete identity has nothing to warn about");
   assert.equal(assigned.status?.enforcement.state, "active");
   assert.equal(assigned.status?.enforcement.commitEnforced, true);
-  assert.equal(assigned.status?.enforcement.push, "not_configured");
+  assert.equal(assigned.status?.enforcement.push, "enforced");
   assert.deepEqual(assigned.status?.assignment, { repoKey: repoRef.repoKey, identityId: "work", assignedAt: 1_700_000_000_000 });
   assert.equal(assigned.status?.assignmentView?.identityStillDefined, true);
 
@@ -222,16 +233,90 @@ test("ASSIGN: an identity with a GitHub login also governs push — an unverifia
   assert.equal(remoteHead, null, "nothing may have reached the remote");
 });
 
-test("ASSIGN: a login without any trusted alias is reported as needs-attention (every push would be blocked)", async () => {
+test("ASSIGN: a login without any trusted alias is needs-attention, and every push is really BLOCKED (whatever the route)", async () => {
   const repo = await makeRepo();
+  const remoteParent = await tempDir("rig-lock-remote-");
+  const bare = path.join(remoteParent, "remote.git");
+  await execFileAsync("git", ["init", "-q", "--bare", bare]);
   const svc = service();
   const repoRef = await ref(svc, repo);
   const noAlias = identityWith({ expectedGitHubLogin: "danish-work", trustedSshHostAliases: [] });
   const assigned = await svc.assign(repoRef, noAlias);
   assert.equal(assigned.ok, true);
-  assert.match(assigned.details.join(" "), /every push from this repository will be blocked/);
+  assert.match(assigned.details.join(" "), /lists no trusted SSH host alias.*every push is blocked until an alias is added/);
   assert.equal(assigned.status?.enforcement.state, "needs_attention");
   assert.equal(assigned.status?.enforcement.push, "unverifiable");
+  assert.equal(assigned.status?.enforcement.commitEnforced, true);
+
+  // Commits with the assigned identity are still allowed.
+  const committed = await commitAs(repo, noAlias.gitEmail);
+  assert.equal(committed.code, 0, committed.stderr);
+
+  // A real push (git only runs pre-push once the remote is reachable, so a
+  // local bare repository stands in for it; other route shapes are covered
+  // against the evaluator directly in identityLockOutput.test.ts).
+  await git(repo, ["remote", "add", "origin", bare]);
+  const pushed = await tryGit(repo, ["push", "origin", "main"]);
+  assert.notEqual(pushed.code, 0);
+  assert.equal(parseBlockPrelude(pushed.stderr).REASON, "push_route_unverified");
+  assert.match(pushed.stderr, /lists no trusted SSH host alias/);
+  const remoteHead = await execFileAsync("git", ["--git-dir", bare, "rev-parse", "--verify", "refs/heads/main"]).catch(() => null);
+  assert.equal(remoteHead, null, "nothing may have reached the remote");
+});
+
+test("ASSIGN without a GitHub login: commits are locked, EVERY push is blocked (push_identity_not_configured), and the status is needs-attention — never active", async () => {
+  const repo = await makeRepo();
+  const remoteParent = await tempDir("rig-lock-remote-");
+  const bare = path.join(remoteParent, "remote.git");
+  await execFileAsync("git", ["init", "-q", "--bare", bare]);
+  const svc = service();
+  const repoRef = await ref(svc, repo);
+
+  const assigned = await svc.assign(repoRef, WORK_NO_LOGIN, { identities: [WORK_NO_LOGIN] });
+  assert.equal(assigned.ok, true, assigned.details.join(" | "));
+  assert.equal(assigned.message, 'This repository is locked to "Work".');
+  assert.match(assigned.details.join(" "), /"Work" has no GitHub account configured for push verification, so every push from this repository is blocked/);
+  assert.doesNotMatch(assigned.details.join(" "), /not account-checked|Commits only/i);
+  const status = await svc.getStatus(repoRef, [WORK_NO_LOGIN]);
+  assert.equal(status.enforcement.state, "needs_attention");
+  assert.notEqual(status.enforcement.state, "active");
+  assert.equal(status.enforcement.push, "needs_configuration");
+  assert.equal(status.enforcement.commitEnforced, true);
+  assert.equal(status.enforcement.repairAvailable, false, "repair cannot help until the identity is completed");
+  assert.equal(status.enforcement.unlockAvailable, true);
+  assert.match(status.enforcement.reason ?? "", /Configure the GitHub account \(expectedGitHubLogin\) for "Work"/);
+  assert.equal(status.assignment?.identityId, "work", "it is still assigned");
+
+  // Commit: correct Git identity allowed, wrong one blocked.
+  const ok = await commitAs(repo, WORK_NO_LOGIN.gitEmail);
+  assert.equal(ok.code, 0, ok.stderr);
+  const wrong = await commitAs(repo, PERSONAL.gitEmail);
+  assert.notEqual(wrong.code, 0);
+  assert.equal(parseBlockPrelude(wrong.stderr).REASON, "wrong_identity");
+  await commitAs(repo, WORK_NO_LOGIN.gitEmail);
+
+  // Push: a real `git push` through the installed pre-push hook is blocked
+  // (every other route shape is covered against the evaluator directly).
+  await git(repo, ["remote", "add", "origin", bare]);
+  const pushed = await tryGit(repo, ["push", "origin", "main"]);
+  assert.notEqual(pushed.code, 0);
+  const prelude = parseBlockPrelude(pushed.stderr);
+  assert.equal(prelude.ACTION, "push");
+  assert.equal(prelude.REASON, "push_identity_not_configured");
+  assert.equal(prelude.IDENTITY, "Work");
+  assert.match(pushed.stderr, /does not yet have\na GitHub account configured for push verification/);
+  const remoteHead = await execFileAsync("git", ["--git-dir", bare, "rev-parse", "--verify", "refs/heads/main"]).catch(() => null);
+  assert.equal(remoteHead, null, "nothing may have reached the remote");
+
+  // Completing the identity (in settings) shows as drift; Repair applies it and the lock becomes active.
+  const completed: Identity = { ...WORK_NO_LOGIN, expectedGitHubLogin: "danish-work", trustedSshHostAliases: ["github-work"] };
+  const drifted = await svc.getStatus(repoRef, [completed]);
+  assert.equal(drifted.enforcement.state, "needs_attention");
+  assert.equal(drifted.enforcement.repairAvailable, true);
+  const repaired = await svc.repair(repoRef, [completed]);
+  assert.equal(repaired.ok, true, repaired.details.join(" | "));
+  assert.equal(repaired.status?.enforcement.state, "active");
+  assert.equal(repaired.status?.enforcement.push, "enforced");
 });
 
 test("ASSIGN: an invalid identity is refused and nothing is written", async () => {
@@ -334,10 +419,10 @@ test("CHANGE that cannot complete leaves the PREVIOUS lock fully in place", asyn
   const repoRef = await ref(svc, repo);
   assert.equal((await svc.assign(repoRef, WORK)).ok, true);
 
-  // A foreign pre-push hook takes over the (commit-only) Work lock's
-  // ungoverned pre-push slot. Changing to an identity WITH a GitHub login
-  // needs that slot, and chaining was not requested — so the change must
-  // be refused up front, leaving Work's lock exactly as it was.
+  // A foreign pre-push hook replaces the Work lock's own pre-push hook.
+  // Changing identity re-installs every slot (push is always governed),
+  // and chaining was not requested — so the change must be refused up
+  // front, leaving Work's lock (policy, pre-commit) exactly as it was.
   await fs.writeFile(path.join(await hooksDir(repo), "pre-push"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   const personalWithLogin = { ...PERSONAL, expectedGitHubLogin: "danish-personal", trustedSshHostAliases: ["github-personal"] };
   const result = await svc.assign(repoRef, personalWithLogin, { identities: [WORK, personalWithLogin] });
@@ -530,7 +615,11 @@ test("LEGACY A: a provable exactRepos binding is migrated to an identity lock fo
   assert.equal(outcome.kind, "migrated", JSON.stringify(outcome));
   assert.equal(outcome.kind === "migrated" && outcome.identityLabel, "Work");
   const status = await svc.getStatus(repoRef, identities);
-  assert.equal(status.enforcement.state, "active");
+  // The legacy profile declared no GitHub login: the migrated lock governs
+  // commits AND pushes, so it is needs_attention (pushes blocked), never active.
+  assert.equal(status.enforcement.state, "needs_attention");
+  assert.equal(status.enforcement.push, "needs_configuration");
+  assert.equal(status.enforcement.commitEnforced, true);
   assert.equal(status.assignment?.identityId, "work");
   assert.equal(status.inspection.hooks.find((h) => h.fileName === "pre-commit")?.version, SHIELD_ARTIFACT_VERSION);
 
@@ -538,6 +627,14 @@ test("LEGACY A: a provable exactRepos binding is migrated to an identity lock fo
   const wrong = await commitAs(repo, PERSONAL.gitEmail);
   assert.notEqual(wrong.code, 0);
   assert.match(wrong.stderr, /^REASON: wrong_identity$/m);
+
+  const remoteParent = await tempDir("rig-lock-remote-");
+  const bare = path.join(remoteParent, "remote.git");
+  await execFileAsync("git", ["init", "-q", "--bare", bare]);
+  await git(repo, ["remote", "add", "local", bare]);
+  const pushed = await tryGit(repo, ["push", "local", "main"]);
+  assert.notEqual(pushed.code, 0);
+  assert.equal(parseBlockPrelude(pushed.stderr).REASON, "push_identity_not_configured");
 
   assert.deepEqual(await svc.migrateLegacy(repoRef, { legacyProfiles, identities }), { kind: "none" }, "idempotent");
 });
@@ -693,6 +790,255 @@ test("REAL 0.2.0 LEGACY, owner pattern only: removed completely, the user's chai
   // Protected branch, wrong identity: nothing restricts Git any more.
   const committed = await commitAs(repo, PERSONAL.gitEmail);
   assert.equal(committed.code, 0, committed.stderr);
+});
+
+// ==================== v3 (release 0.3.0) locks are upgraded in place ====================
+//
+// src/test/fixtures/identity-lock-v6/ holds the exact pre-commit / pre-push
+// hooks and shield-evaluate.sh that release 0.3.0 (commit 1acdacd) installed
+// for an identity lock — generated from that commit's own sources,
+// byte-for-byte. With a v3 policy for an identity that had no GitHub login
+// ("commit-only"), that evaluator let EVERY push through unchecked: the bug
+// this upgrade closes.
+
+const V6_LOCK_FIXTURES = path.join(__dirname, "..", "..", "src", "test", "fixtures", "identity-lock-v6");
+
+function v3PolicyFor(identity: Identity, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const policy: Record<string, unknown> = {
+    policyVersion: 3,
+    lockId: "lock-from-0.3.0",
+    assignedAt: 1_600_000_000_000,
+    generatedAt: 1_600_000_000_000,
+    identityId: identity.id,
+    identityLabel: identity.label,
+    expectedGitEmail: identity.gitEmail,
+    trustedSshHostAliases: identity.trustedSshHostAliases ?? [],
+    enforcedActions: identity.expectedGitHubLogin ? ["commit", "push"] : ["commit"],
+    ...overrides,
+  };
+  if (identity.gitName) policy.expectedGitName = identity.gitName;
+  if (identity.expectedGitHubLogin) policy.expectedGitHubLogin = identity.expectedGitHubLogin;
+  return policy;
+}
+
+/** Installs a lock exactly as release 0.3.0 left it: v3 policy, v6 evaluator, v6 hooks, and an install record naming the hooks dir. */
+async function installV3Lock(repo: Repo, identity: Identity, options: { skipPrePush?: boolean } = {}): Promise<void> {
+  const storage = path.join(await commonDir(repo), "repo-identity-guard");
+  await fs.mkdir(storage, { recursive: true });
+  await fs.writeFile(path.join(storage, "shield-policy.json"), JSON.stringify(v3PolicyFor(identity), null, 2));
+  await fs.copyFile(path.join(V6_LOCK_FIXTURES, "shield-evaluate.sh"), path.join(storage, "shield-evaluate.sh"));
+  await fs.chmod(path.join(storage, "shield-evaluate.sh"), 0o755);
+  const hooks = await hooksDir(repo);
+  await fs.mkdir(hooks, { recursive: true });
+  for (const [name, fixture] of [
+    ["pre-commit", "pre-commit"],
+    ["pre-merge-commit", "pre-commit"],
+    ["pre-push", "pre-push"],
+  ] as const) {
+    if (name === "pre-push" && options.skipPrePush) continue;
+    await fs.copyFile(path.join(V6_LOCK_FIXTURES, fixture), path.join(hooks, name));
+    await fs.chmod(path.join(hooks, name), 0o755);
+  }
+  assert.equal(await writeShieldInstallRecord(shieldInstallRecordFilePath(storage), [hooks], 1_600_000_000_000), true);
+}
+
+async function bareRemote(): Promise<string> {
+  const bare = path.join(await tempDir("rig-lock-remote-"), "remote.git");
+  await execFileAsync("git", ["init", "-q", "--bare", bare]);
+  return bare;
+}
+
+test("MIGRATION (real 0.3.0 artifacts): a commit-only v3 lock stays assigned and commit-enforced, but its pushes become BLOCKED until a GitHub login is configured", async () => {
+  const repo = await makeRepo();
+  const bare = await bareRemote();
+  await git(repo, ["remote", "add", "origin", bare]);
+  await installV3Lock(repo, WORK_NO_LOGIN);
+  const svc = service();
+  const repoRef = await ref(svc, repo);
+
+  // Before: the real 0.3.0 evaluator enforces commits but lets the push through unchecked — the bug.
+  assert.notEqual((await commitAs(repo, PERSONAL.gitEmail)).code, 0, "0.3.0 enforced commits");
+  assert.equal((await commitAs(repo, WORK_NO_LOGIN.gitEmail)).code, 0);
+  const unchecked = await tryGit(repo, ["push", "-q", "origin", "main"]);
+  assert.equal(unchecked.code, 0, `the 0.3.0 artifacts really did allow it: ${unchecked.stderr}`);
+
+  // Passive status: still ASSIGNED (never unassigned, never "legacy"), but needs attention — not active.
+  const before = await svc.getStatus(repoRef, [WORK_NO_LOGIN]);
+  assert.equal(before.legacy, false, "a v3 identity lock is not a legacy Shield installation — it is never removed");
+  assert.equal(before.inspection.policyNeedsUpgrade, true);
+  assert.equal(before.assignment?.identityId, "work");
+  assert.equal(before.assignment?.assignedAt, 1_600_000_000_000);
+  assert.equal(before.enforcement.state, "needs_attention");
+  assert.equal(before.enforcement.push, "needs_configuration");
+  assert.equal(before.enforcement.repairAvailable, true);
+  assert.match(before.enforcement.reason ?? "", /earlier version.*upgraded.*every push from this repository is blocked/);
+  // Legacy-Shield migration never touches it.
+  assert.deepEqual(await svc.migrateLegacy(repoRef, { legacyProfiles: [], identities: [WORK_NO_LOGIN] }), { kind: "none" });
+
+  // Upgrade (what a trusted-workspace scan runs).
+  const upgraded = await svc.upgradePreviousLock(repoRef, { identities: [WORK_NO_LOGIN] });
+  assert.equal(upgraded.kind, "upgraded", JSON.stringify(upgraded));
+  assert.ok(upgraded.kind === "upgraded");
+  assert.match(upgraded.message, /still assigned and commits are still checked/);
+  assert.match(upgraded.message, /every push from this repository is blocked/);
+  const policy = parseShieldPolicy(await fs.readFile(path.join(await commonDir(repo), "repo-identity-guard", "shield-policy.json"), "utf8"));
+  assert.ok(policy.ok, "the policy is now a valid v4 policy");
+  assert.equal(policy.policy.policyVersion, 4);
+  assert.equal(policy.policy.lockId, "lock-from-0.3.0", "same assignment: lockId kept");
+  assert.equal(policy.policy.assignedAt, 1_600_000_000_000, "same assignment: assignedAt kept");
+  assert.equal(policy.policy.expectedGitHubLogin, undefined, "a login is never guessed");
+
+  const after = await svc.getStatus(repoRef, [WORK_NO_LOGIN]);
+  assert.equal(after.inspection.policyNeedsUpgrade, false);
+  assert.equal(after.assignment?.identityId, "work");
+  assert.equal(after.enforcement.state, "needs_attention");
+  assert.equal(after.enforcement.push, "needs_configuration");
+  assert.equal(after.enforcement.commitEnforced, true);
+  for (const hook of after.inspection.hooks) assert.equal(hook.version, SHIELD_ARTIFACT_VERSION, hook.fileName);
+
+  // Commits: unchanged. Pushes: now fail-closed.
+  assert.equal((await commitAs(repo, WORK_NO_LOGIN.gitEmail)).code, 0);
+  const wrong = await commitAs(repo, PERSONAL.gitEmail);
+  assert.notEqual(wrong.code, 0);
+  assert.equal(parseBlockPrelude(wrong.stderr).REASON, "wrong_identity");
+  await commitAs(repo, WORK_NO_LOGIN.gitEmail);
+  const pushed = await tryGit(repo, ["push", "origin", "main"]);
+  assert.notEqual(pushed.code, 0, "a migrated commit-only lock must block the push");
+  assert.equal(parseBlockPrelude(pushed.stderr).REASON, "push_identity_not_configured");
+
+  assert.deepEqual(await svc.upgradePreviousLock(repoRef, { identities: [WORK_NO_LOGIN] }), { kind: "none" }, "idempotent");
+});
+
+test("MIGRATION: a v3 lock is upgraded from its RECORDED snapshot — even when its identity was since removed from settings — and a v3 lock with a login becomes active", async () => {
+  const removedRepo = await makeRepo();
+  await installV3Lock(removedRepo, WORK_NO_LOGIN);
+  const svc = service();
+  const removedRef = await ref(svc, removedRepo);
+  const stillShown = await svc.getStatus(removedRef, []);
+  assert.equal(stillShown.assignmentView?.identityStillDefined, false);
+  assert.equal(stillShown.enforcement.repairAvailable, true, "an upgrade needs no live identity");
+  const repaired = await svc.repair(removedRef, []);
+  assert.equal(repaired.ok, true, `${repaired.message} ${repaired.details.join(" | ")}`);
+  assert.equal(repaired.status?.assignment?.identityId, "work");
+  assert.equal(repaired.status?.enforcement.push, "needs_configuration");
+  assert.notEqual((await commitAs(removedRepo, PERSONAL.gitEmail)).code, 0, "still enforcing the recorded identity");
+
+  const completeRepo = await makeRepo();
+  await installV3Lock(completeRepo, WORK);
+  const completeRef = await ref(svc, completeRepo);
+  const outcome = await svc.upgradePreviousLock(completeRef, { identities: [WORK] });
+  assert.equal(outcome.kind, "upgraded", JSON.stringify(outcome));
+  const status = await svc.getStatus(completeRef, [WORK]);
+  assert.equal(status.enforcement.state, "active");
+  assert.equal(status.enforcement.push, "enforced");
+  assert.equal(status.inspection.policySnapshot?.expectedGitHubLogin, "danish-work");
+});
+
+test("MIGRATION: a v3 commit-only lock whose pre-push slot holds a FOREIGN hook is never silently chained — the upgrade is refused and the lock left as it was (needs attention); Repair with chaining completes it", async () => {
+  const repo = await makeRepo();
+  await installV3Lock(repo, WORK_NO_LOGIN, { skipPrePush: true });
+  const foreign = "#!/bin/sh\n# the user's own pre-push hook, left alone by the 0.3.0 commit-only lock\nexit 0\n";
+  const prePush = path.join(await hooksDir(repo), "pre-push");
+  await fs.writeFile(prePush, foreign, { mode: 0o755 });
+  const svc = service();
+  const repoRef = await ref(svc, repo);
+
+  const failed = await svc.upgradePreviousLock(repoRef, { identities: [WORK_NO_LOGIN] });
+  assert.equal(failed.kind, "failed", JSON.stringify(failed));
+  assert.equal(await fs.readFile(prePush, "utf8"), foreign, "the foreign hook is untouched");
+  const status = await svc.getStatus(repoRef, [WORK_NO_LOGIN]);
+  assert.equal(status.assignment?.identityId, "work", "still assigned");
+  assert.equal(status.inspection.policyNeedsUpgrade, true, "left exactly as it was");
+  assert.equal(status.enforcement.state, "needs_attention");
+
+  const repaired = await svc.repair(repoRef, [WORK_NO_LOGIN], { chainForeignHooks: true });
+  assert.equal(repaired.ok, true, `${repaired.message} ${repaired.details.join(" | ")}`);
+  assert.equal(await fs.readFile(`${prePush}${SHIELD_CHAIN_ORIGINAL_SUFFIX}`, "utf8"), foreign, "chained, byte-for-byte");
+  const bare = await bareRemote();
+  await git(repo, ["remote", "add", "origin", bare]);
+  const pushed = await tryGit(repo, ["push", "origin", "main"]);
+  assert.notEqual(pushed.code, 0);
+  assert.equal(parseBlockPrelude(pushed.stderr).REASON, "push_identity_not_configured");
+});
+
+// ==================== the invariant, stated directly ====================
+
+test("NO PATH: an assigned repository whose push identity is unconfigured or unverifiable NEVER allows a push, and is NEVER reported active", async () => {
+  // Every way an assigned identity's push requirement can be incomplete,
+  // plus the complete identity as the control that proves the harness CAN
+  // allow a push (so a "blocked" below is a real decision, not a broken rig).
+  const variants: Array<{ name: string; identity: Identity; complete: boolean }> = [
+    { name: "complete (control)", identity: WORK, complete: true },
+    { name: "no GitHub login", identity: WORK_NO_LOGIN, complete: false },
+    { name: "no GitHub login, no alias", identity: { ...WORK_NO_LOGIN, trustedSshHostAliases: undefined }, complete: false },
+    { name: "login but no trusted alias", identity: { ...WORK, trustedSshHostAliases: undefined }, complete: false },
+    { name: "empty login", identity: { ...WORK, expectedGitHubLogin: "" }, complete: false },
+  ];
+  // The single route on which a complete identity's push IS allowed: its
+  // trusted alias, authenticating live as exactly the expected login.
+  const allowedRoute = "git@github-work:AcmeSoftware/acme.git";
+  const routes = [allowedRoute, "git@github.com:AcmeSoftware/acme.git", "https://github.com/AcmeSoftware/acme.git", "/srv/git/acme.git", "git@github-personal:AcmeSoftware/acme.git"];
+  const fakeSsh = await makeRouteFakeSsh();
+  tempDirs.push(fakeSsh);
+  const svc = service();
+
+  for (const variant of variants) {
+    for (const via of ["assigned", "migrated from v3"] as const) {
+      const repo = await makeRepo();
+      const repoRef = await ref(svc, repo);
+      if (via === "assigned") {
+        const assigned = await svc.assign(repoRef, variant.identity, { identities: [variant.identity] });
+        assert.equal(assigned.ok, true, `${variant.name}: ${assigned.message} ${assigned.details.join(" | ")}`);
+      } else {
+        await installV3Lock(repo, variant.identity);
+        const upgraded = await svc.upgradePreviousLock(repoRef, { identities: [variant.identity] });
+        assert.equal(upgraded.kind, "upgraded", `${variant.name}: ${JSON.stringify(upgraded)}`);
+      }
+      const where = `${variant.name} (${via})`;
+
+      const status = await svc.getStatus(repoRef, [variant.identity]);
+      assert.ok(status.assignment, `${where}: assigned`);
+      assert.equal(status.enforcement.commitEnforced, true, `${where}: commits are enforced`);
+      if (!variant.complete) {
+        assert.notEqual(status.enforcement.push, "enforced", where);
+        assert.notEqual(status.enforcement.state, "active", `${where}: an incomplete push requirement must never be reported active`);
+        assert.equal(status.enforcement.state, "needs_attention", where);
+      } else {
+        assert.equal(status.enforcement.state, "active", where);
+      }
+
+      // The INSTALLED evaluator — the real enforcement point with VS Code
+      // closed — over every route, with ssh answering as the right account.
+      const installedEvaluator = path.join(await commonDir(repo), "repo-identity-guard", "shield-evaluate.sh");
+      for (const url of routes) {
+        const result = await runEvaluatorScript(repo.dir, repo.env, fakeSsh, installedEvaluator, ["push", "origin", url], {
+          FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED_AS("danish-work"),
+        });
+        const expectAllowed = variant.complete && url === allowedRoute;
+        if (expectAllowed) {
+          assert.equal(result.code, 0, `${where} via ${url}: the control must be allowed: ${result.stderr}`);
+        } else {
+          assert.notEqual(result.code, 0, `${where} via ${url}: an assigned repository let a push through`);
+          assert.match(result.stderr, /^REPO_IDENTITY_GUARD_BLOCK$/m, `${where} via ${url}`);
+        }
+        if (!variant.complete) {
+          const reasonId = parseBlockPrelude(result.stderr).REASON_ID;
+          assert.ok(
+            reasonId === "push-identity-not-configured" || reasonId === "push-route-unverified",
+            `${where} via ${url}: blocked for the incomplete push identity, not some other reason (got ${reasonId})`,
+          );
+        }
+      }
+
+      // And through a real `git push` with the installed pre-push hook.
+      const bare = await bareRemote();
+      await git(repo, ["remote", "add", "origin", bare]);
+      const pushed = await tryGit(repo, ["push", "origin", "main"]);
+      assert.notEqual(pushed.code, 0, `${where}: a real git push got through`);
+      const remoteHead = await execFileAsync("git", ["--git-dir", bare, "rev-parse", "--verify", "refs/heads/main"]).catch(() => null);
+      assert.equal(remoteHead, null, `${where}: nothing may reach the remote`);
+    }
+  }
 });
 
 // ==================== passive status performs no network I/O ====================

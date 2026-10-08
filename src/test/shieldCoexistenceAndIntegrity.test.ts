@@ -680,7 +680,7 @@ test("integrity: identity drift (the assigned identity was edited in settings) i
     const afterRepair = await manager.inspect(repo.dir, { currentIdentities: [updatedIdentity] });
     assert.equal(afterRepair.identityDrift, false);
     assert.equal(afterRepair.state, "active");
-    assert.deepEqual(afterRepair.policySnapshot?.enforcedActions, ["commit", "push"]);
+    assert.equal(afterRepair.policySnapshot?.expectedGitHubLogin, updatedIdentity.expectedGitHubLogin);
   } finally {
     await cleanup(repo.dir);
   }

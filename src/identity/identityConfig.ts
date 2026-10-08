@@ -1,4 +1,4 @@
-import { Identity } from "./types";
+import { EnforcementReadyIdentity, Identity, PushEnforcement } from "./types";
 
 /**
  * Runtime validation for identities crossing a trust boundary: the
@@ -29,11 +29,15 @@ function cleanString(value: unknown): string | undefined {
 }
 
 /**
- * Validates one identity. Returns every problem at once (so a UI can show
- * them together) rather than silently dropping a malformed field: an
- * identity whose `expectedGitHubLogin` is invalid must NOT quietly become
- * an identity with no push enforcement — that would be a weaker lock than
- * the user asked for.
+ * Validates one identity STRUCTURALLY. Returns every problem at once (so
+ * a UI can show them together) rather than silently dropping a malformed
+ * field: an identity whose `expectedGitHubLogin` is invalid must NOT
+ * quietly become an identity with no GitHub login.
+ *
+ * A MISSING `expectedGitHubLogin` (or trusted alias) is not a structural
+ * error: such an identity is valid, storable and editable, just not
+ * enforcement-ready (see {@link isEnforcementReadyIdentity}) — a
+ * repository locked to it blocks every push until it is completed.
  */
 export function validateIdentity(raw: unknown): IdentityValidationResult {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -138,12 +142,42 @@ export function sanitizeIdentityList(raw: unknown): Identity[] {
 }
 
 /**
- * How push identity is enforced for an identity — see
- * `PushEnforcement` in `./types`.
+ * The push requirement a lock for this identity has — see
+ * `PushEnforcement` in `./types`. Anything other than `enforced` means
+ * every push from a repository locked to it is BLOCKED; there is no value
+ * for "push unconfigured, therefore allowed".
  */
-export function pushEnforcementFor(identity: Pick<Identity, "expectedGitHubLogin" | "trustedSshHostAliases">): "enforced" | "not_configured" | "unverifiable" {
-  if (!identity.expectedGitHubLogin) return "not_configured";
+export function pushEnforcementFor(identity: Pick<Identity, "expectedGitHubLogin" | "trustedSshHostAliases">): PushEnforcement {
+  if (!identity.expectedGitHubLogin) return "needs_configuration";
   return (identity.trustedSshHostAliases ?? []).length > 0 ? "enforced" : "unverifiable";
+}
+
+/**
+ * True when `identity` can enforce a lock in full (commit AND push) — see
+ * {@link EnforcementReadyIdentity}. A structurally valid identity that is
+ * not enforcement-ready is still a legitimate, storable, assignable
+ * identity; a repository locked to it simply blocks every push until it is
+ * completed.
+ */
+export function isEnforcementReadyIdentity(identity: Identity): identity is EnforcementReadyIdentity {
+  return pushEnforcementFor(identity) === "enforced";
+}
+
+/**
+ * What an identity still needs before it is enforcement-ready, as
+ * user-facing sentences (empty when it is ready). Never suggests a value:
+ * the GitHub login is never guessed from the email, remote, owner, alias
+ * or Git config.
+ */
+export function identityReadinessProblems(identity: Pick<Identity, "label" | "expectedGitHubLogin" | "trustedSshHostAliases">): string[] {
+  const problems: string[] = [];
+  if (!identity.expectedGitHubLogin) {
+    problems.push(`"${identity.label}" has no GitHub account (expectedGitHubLogin) configured for push verification.`);
+  }
+  if ((identity.trustedSshHostAliases ?? []).length === 0) {
+    problems.push(`"${identity.label}" lists no trusted SSH host alias (trustedSshHostAliases) to push through.`);
+  }
+  return problems;
 }
 
 // ==================== legacy profile → identity ====================

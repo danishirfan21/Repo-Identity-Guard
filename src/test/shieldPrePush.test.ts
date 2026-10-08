@@ -275,9 +275,9 @@ const SKIP_FAKE_SSH_PATH_SHADOW_ON_WINDOWS =
     ? "Git for Windows does not resolve ssh via PATH search -- this suite's PATH-shadow fake-ssh technique cannot intercept it here (see comment above). Covered on ubuntu-latest/macos-latest."
     : false;
 
-// ==================== commit-only lock: pushes are never account-checked ====================
+// ==================== no GitHub login: every push is blocked ====================
 
-test("a commit-only lock (identity without a GitHub login) never blocks a push", async () => {
+test("a lock whose identity has no GitHub login BLOCKS every push through the real pre-push hook (push_identity_not_configured)", async () => {
   const repo = await makeTempRepo();
   const remoteParent = await fs.mkdtemp(path.join(os.tmpdir(), "shield-remote-"));
   try {
@@ -285,8 +285,14 @@ test("a commit-only lock (identity without a GitHub login) never blocks a push",
     await enableShield(new ShieldManager(), repo, WORK_IDENTITY);
     await git(repo, ["remote", "add", "origin", bare]);
     const result = await push(repo, ["origin", "main"]);
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(await remoteRefSha(bare), await git(repo, ["rev-parse", "HEAD"]));
+    assert.notEqual(result.code, 0, "an assigned repository let a push through unchecked");
+    assert.match(result.stderr, /^REPO_IDENTITY_GUARD_BLOCK$/m);
+    assert.match(result.stderr, /^ACTION: push$/m);
+    assert.match(result.stderr, /^REASON: push_identity_not_configured$/m);
+    assert.match(result.stderr, /^IDENTITY: Work$/m);
+    assert.match(result.stderr, /Configure the GitHub account for "Work" in Repo Identity Guard|configure the GitHub account for "Work" in Repo Identity Guard/);
+    assert.match(result.stderr, /--no-verify/);
+    assert.equal(await remoteRefSha(bare), null, "nothing may reach the remote");
   } finally {
     await cleanup(repo.dir, remoteParent);
   }

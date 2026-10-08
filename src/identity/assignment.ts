@@ -7,7 +7,7 @@ import { RepoIdentityAssignment } from "./types";
  *
  * ## The record is the lock policy, inside the repository's own Git metadata
  *
- * An explicit assignment is persisted as the identity-lock policy (v3) at
+ * An explicit assignment is persisted as the identity-lock policy (v4) at
  * `<git-common-dir>/repo-identity-guard/shield-policy.json` — the same
  * file the hooks read at commit/push time — rather than in VS Code
  * extension storage. That single choice is what makes the transaction
@@ -52,9 +52,13 @@ export async function resolveRepository(startDir: string): Promise<RepositoryRef
   return { repoRoot, gitCommonDir, repoKey: await canonicalizeRepoPath(gitCommonDir) };
 }
 
-/** The assignment recorded by a valid v3 lock policy, if any. */
+/**
+ * The assignment recorded by a valid lock policy — the current version, or
+ * a well-formed previous-version (v3) lock awaiting upgrade, which is an
+ * assignment just the same and is never dropped.
+ */
 export function assignmentFromInspection(repoKey: string, inspection: ShieldInspection): RepoIdentityAssignment | undefined {
   const snapshot = inspection.policySnapshot;
-  if (!inspection.policyValid || !snapshot) return undefined;
+  if (!(inspection.policyValid || inspection.policyNeedsUpgrade) || !snapshot) return undefined;
   return { repoKey, identityId: snapshot.identityId, assignedAt: snapshot.assignedAt };
 }

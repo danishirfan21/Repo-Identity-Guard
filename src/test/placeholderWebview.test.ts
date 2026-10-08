@@ -166,6 +166,7 @@ const ACTIVE_ASSIGNMENT: RepoIdentityState["assignment"] = {
   identityLabel: "Work",
   gitName: "Danish Irfan",
   gitEmail: "work@example.com",
+  expectedGitHubLogin: "danish-work",
   assignedAt: 1,
   identityStillDefined: true,
 };
@@ -208,7 +209,7 @@ test("XSS: note text, repository name, identity label and reasons are inserted a
       repoState({
         repoName: payload,
         assignment: { ...ACTIVE_ASSIGNMENT!, identityLabel: payload },
-        enforcement: { state: "needs_attention", reason: payload, commitEnforced: true, push: "not_configured", repairAvailable: true, unlockAvailable: true },
+        enforcement: { state: "needs_attention", reason: payload, commitEnforced: true, push: "needs_configuration", repairAvailable: true, unlockAvailable: true },
         notes: [{ id: "n1", text: payload, pinned: false, createdAt: 1 }],
       }),
     ),
@@ -239,7 +240,7 @@ test("a new-note draft survives every state push, survives a failed save, and is
 
   // Background refreshes (file watcher, another repo changing) re-render.
   view.send({ type: "state", payload: wire(repoState()) });
-  view.send({ type: "state", payload: wire(repoState({ enforcement: { state: "active", commitEnforced: true, push: "not_configured", repairAvailable: false, unlockAvailable: true }, assignment: ACTIVE_ASSIGNMENT })) });
+  view.send({ type: "state", payload: wire(repoState({ enforcement: { state: "active", commitEnforced: true, push: "enforced", repairAvailable: false, unlockAvailable: true }, assignment: ACTIVE_ASSIGNMENT })) });
   assert.equal(view.document.getElementById("newNoteText")?.value, "half-written note");
 
   view.button("Add note")!.dispatch("click");
@@ -308,7 +309,7 @@ test("assigned repository: shows the identity, offers Change (excluding the curr
   const view = loadView();
   view.send({
     type: "state",
-    payload: wire(repoState({ assignment: ACTIVE_ASSIGNMENT, enforcement: { state: "active", commitEnforced: true, push: "not_configured", repairAvailable: false, unlockAvailable: true } })),
+    payload: wire(repoState({ assignment: ACTIVE_ASSIGNMENT, enforcement: { state: "active", commitEnforced: true, push: "enforced", repairAvailable: false, unlockAvailable: true } })),
   });
   assert.equal(view.document.getElementById("lockState")?.textContent, "Locked");
   assert.equal(view.document.getElementById("assignedIdentity")?.textContent, "Work: Danish Irfan <work@example.com>");
@@ -437,7 +438,7 @@ test("dispatch: well-formed lock messages reach the actions with exactly the req
 // ==================== wire state ====================
 
 test("wire state: each repository carries its own state; no workspace aggregate; no local path for the selected repository", () => {
-  const assigned = repoState({ repoName: "acme", assignment: ACTIVE_ASSIGNMENT, enforcement: { state: "active", commitEnforced: true, push: "not_configured", repairAvailable: false, unlockAvailable: true } });
+  const assigned = repoState({ repoName: "acme", assignment: ACTIVE_ASSIGNMENT, enforcement: { state: "active", commitEnforced: true, push: "enforced", repairAvailable: false, unlockAvailable: true } });
   const other = repoState({ repoName: "side-project", repoRoot: "/home/me/side", repoKey: "/home/me/side/.git" });
   const state = toWireState({
     repos: [

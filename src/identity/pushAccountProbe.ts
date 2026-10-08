@@ -27,8 +27,8 @@ export type PushAccountCheckStatus =
   | "mismatch"
   /** The account could not be established. A real push would be blocked. */
   | "unverifiable"
-  /** The identity declares no GitHub login, so pushes are not account-checked. */
-  | "not_configured"
+  /** The identity has no GitHub login configured, so a real push is BLOCKED (`push-identity-not-configured`) — never allowed unchecked. */
+  | "needs_configuration"
   /** There is no push remote to check. */
   | "no_push_remote";
 
@@ -77,14 +77,18 @@ export async function probeGitHubAccount(
 
 export async function checkPushAccount(input: PushAccountProbeInput): Promise<PushAccountCheckResult> {
   const { identity } = input;
+  const policy = buildShieldPolicy({ identity, lockId: "probe", assignedAt: 0, now: 0 });
   if (!identity.expectedGitHubLogin) {
-    return { status: "not_configured", message: `"${identity.label}" declares no GitHub login, so pushes are not account-checked.` };
+    // Same decision function as the hook: with no login, every push is
+    // blocked whatever the remote — so this is reported as a block, never
+    // as "nothing to check".
+    const reason = evaluatePush(policy, { remoteName: "", remoteUrl: input.pushRemoteUrl ?? "", sshCommandOverrides: [] }).reasons[0];
+    return { status: "needs_configuration", reasonId: reason.id, message: `A push from this repository would be blocked: ${reason.message}` };
   }
   if (!input.pushRemoteUrl) {
     return { status: "no_push_remote", message: "This repository has no push remote to check." };
   }
 
-  const policy = buildShieldPolicy({ identity, lockId: "probe", assignedAt: 0, now: 0 });
   const sshCommandOverrides = resolveSshCommandOverrides(input.transport);
   const base = { remoteName: "", remoteUrl: input.pushRemoteUrl, sshCommandOverrides };
 

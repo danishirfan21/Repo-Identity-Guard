@@ -65,6 +65,7 @@ test("the reason taxonomy is exactly the identity-lock set: commit identity, pus
     "policy-missing",
     "push-account-mismatch",
     "push-account-unverified",
+    "push-identity-not-configured",
     "push-route-override",
     "push-route-unverified",
   ]);
@@ -73,6 +74,7 @@ test("the reason taxonomy is exactly the identity-lock set: commit identity, pus
   for (const code of codes) assert.match(code, /^[a-z_]+$/);
   assert.equal(SHIELD_REASON_CATALOG["commit-identity-mismatch"].code, "wrong_identity");
   assert.equal(SHIELD_REASON_CATALOG["push-account-mismatch"].code, "wrong_push_account");
+  assert.equal(SHIELD_REASON_CATALOG["push-identity-not-configured"].code, "push_identity_not_configured");
 });
 
 test("isShieldReasonId accepts only known reason ids", () => {

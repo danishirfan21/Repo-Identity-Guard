@@ -268,6 +268,56 @@ test("the on-demand push check (TypeScript) agrees with the hook: verified / mis
   assert.equal(overridden.status, "unverifiable");
   assert.equal(overridden.reasonId, "push-route-override");
 
-  assert.equal((await checkPushAccount({ ...base, identity: WORK_IDENTITY, pushRemoteUrl: "x" })).status, "not_configured");
+  // No GitHub login: a BLOCK (whatever the remote, even none), never "nothing to check" — and no ssh call.
+  for (const pushRemoteUrl of ["git@github-work:AcmeSoftware/acme.git", "x", undefined]) {
+    const beforeNoLogin = log.length;
+    const noLogin = await checkPushAccount({ ...base, identity: WORK_IDENTITY, pushRemoteUrl, runner: routeFakeRunner({ FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED_AS("danish-work") }, log) });
+    assert.equal(noLogin.status, "needs_configuration", String(pushRemoteUrl));
+    assert.equal(noLogin.reasonId, "push-identity-not-configured", String(pushRemoteUrl));
+    assert.match(noLogin.message, /would be blocked.*does not yet have a GitHub account configured for push verification/);
+    assert.equal(log.length, beforeNoLogin, "no ssh probe without a login to verify");
+  }
   assert.equal((await checkPushAccount({ ...base, pushRemoteUrl: undefined })).status, "no_push_remote");
+});
+
+// ==================== incomplete push requirement: block output ====================
+
+test("push identity not configured: exact prelude, actionable message, no-bypass note — and the remote URL is never echoed", async () => {
+  const repo = await makeRepo();
+  cleanupDirs.push(repo);
+  await writePolicy(repo, serializeShieldPolicy(testPolicy(WORK_IDENTITY)));
+  const result = await evaluate(repo, ["push", "origin", "https://x-access-token:ghp_SUPERSECRET0123456789@github.com/AcmeSoftware/acme.git"]);
+  assert.notEqual(result.code, 0);
+  assert.deepEqual(preludeLines(result.stderr), [
+    "REPO_IDENTITY_GUARD_BLOCK",
+    "ACTION: push",
+    "REASON: push_identity_not_configured",
+    "REASON_ID: push-identity-not-configured",
+    "IDENTITY: Work",
+    "EXPECTED_GITHUB_LOGIN: (not configured)",
+    "DETAIL: github_login_not_configured",
+    "REMOTE: origin",
+  ]);
+  assert.match(result.stderr, /\n\nRepo Identity Guard blocked this push\.\n/);
+  assert.match(result.stderr, /This repository is locked to "Work", but that identity does not yet have\na GitHub account configured for push verification/);
+  assert.match(result.stderr, /configure the GitHub account for "Work" in Repo Identity Guard/);
+  assert.match(result.stderr, /Do not bypass this check \(for example with --no-verify\)/);
+  assert.doesNotMatch(result.stderr, /SUPERSECRET|x-access-token/);
+  assert.doesNotMatch(result.stderr, /not account-checked|Commits only/i);
+});
+
+test("login present but NO trusted SSH alias: blocked as push_route_unverified, and the message explains the alias requirement", async () => {
+  const repo = await makeRepo();
+  cleanupDirs.push(repo);
+  await writePolicy(repo, serializeShieldPolicy(testPolicy({ ...WORK_IDENTITY_WITH_LOGIN, trustedSshHostAliases: [] })));
+  for (const url of ["git@github-work:AcmeSoftware/acme.git", "https://github.com/AcmeSoftware/acme.git", "git@github.com:AcmeSoftware/acme.git"]) {
+    const result = await evaluate(repo, ["push", "origin", url], { FAKE_SSH_AUTH_OUTPUT: AUTHENTICATED_AS("danish-work") });
+    assert.notEqual(result.code, 0, url);
+    const prelude = parseBlockPrelude(result.stderr);
+    assert.equal(prelude.REASON, "push_route_unverified", url);
+    assert.equal(prelude.EXPECTED_GITHUB_LOGIN, "danish-work", url);
+    assert.match(result.stderr, /"Work" lists no trusted SSH host alias, so no push route can be verified as "danish-work"/, url);
+    assert.match(result.stderr, /every push from this repository is blocked until one is configured/, url);
+    assert.match(result.stderr, /trustedSshHostAliases/, url);
+  }
 });

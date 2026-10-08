@@ -25,7 +25,15 @@ import {
   shieldInstallRecordFilePath,
   writeShieldInstallRecord,
 } from "./installRecord";
-import { LegacyPolicyInfo, ShieldPolicy, buildShieldPolicy, parseShieldPolicy, readLegacyPolicyInfo, serializeShieldPolicy } from "./policy";
+import {
+  LegacyPolicyInfo,
+  ShieldPolicy,
+  buildShieldPolicy,
+  parseShieldPolicy,
+  readLegacyPolicyInfo,
+  serializeShieldPolicy,
+  upgradePreviousLockPolicy,
+} from "./policy";
 import { shieldEvaluatorScriptFilePath, shieldPolicyFilePath, shieldStorageDir } from "./storage";
 import { ShieldAction, ShieldLifecycleState } from "./types";
 
@@ -173,7 +181,7 @@ export type ShieldHookFileName = "pre-commit" | "pre-merge-commit" | "pre-push";
 
 export interface ShieldHookInspection {
   fileName: ShieldHookFileName;
-  /** The Git action this hook file governs — used to decide whether its absence matters (only when `policy.enabledActions` includes this action). */
+  /** The Git action this hook file governs. Every lock governs both actions, so every hook's absence matters. */
   action: ShieldAction;
   path: string;
   ownership: ShieldArtifactOwnership;
@@ -213,9 +221,11 @@ export interface ShieldInspection {
   /** The assigned identity's label as recorded in a valid policy. */
   policyIdentityLabel?: string;
   /**
-   * Non-secret facts read straight off the valid, parsed lock policy —
-   * `undefined` whenever `policyValid` is `false`. This IS the assignment
-   * record (see `src/identity/assignment.ts`).
+   * Non-secret facts read straight off the lock policy — the valid,
+   * current-version policy, or (with `policyNeedsUpgrade`) the assignment
+   * carried by a well-formed previous-version (v3) lock policy. `undefined`
+   * otherwise. This IS the assignment record (see
+   * `src/identity/assignment.ts`).
    */
   policySnapshot?: {
     lockId: string;
@@ -226,8 +236,15 @@ export interface ShieldInspection {
     expectedGitEmail: string;
     expectedGitHubLogin?: string;
     trustedSshHostAliases: string[];
-    enforcedActions: ShieldAction[];
   };
+  /**
+   * True when the policy file is a well-formed identity-lock policy from an
+   * earlier version (v3): a real assignment that this build's evaluator
+   * refuses to enforce until it is upgraded in place (assignment kept) —
+   * see `IdentityLockService.upgradePreviousLock`. `policyValid` is
+   * `false` in that case; `policySnapshot` still carries the assignment.
+   */
+  policyNeedsUpgrade: boolean;
   /** Set when the policy file is a legacy (v1/v2) "Shield Mode" policy — never enforced by this build, only migrated. */
   legacyPolicy?: LegacyPolicyInfo;
   evaluatorPath?: string;
@@ -612,6 +629,7 @@ export class ShieldManager {
         })),
         policyPresent: false,
         policyValid: false,
+        policyNeedsUpgrade: false,
         evaluatorPresent: false,
         evaluatorOwned: false,
         evaluatorModified: false,
@@ -645,6 +663,11 @@ export class ShieldManager {
     ]);
 
     const policyResult = policyRaw !== null ? parseShieldPolicy(policyRaw) : undefined;
+    // A previous-version (v3) lock policy is an assignment awaiting
+    // upgrade, not corruption: it is reported (and its assignment kept)
+    // separately from a policy that is genuinely invalid.
+    const previousLockPolicy = policyRaw !== null && !policyResult?.ok ? upgradePreviousLockPolicy(policyRaw) : undefined;
+    const recordedPolicy: ShieldPolicy | undefined = policyResult?.ok ? policyResult.policy : previousLockPolicy;
     const evaluatorOwned = evaluatorRaw !== null && isOwnedBytes(evaluatorRaw);
     const evaluatorVersion = evaluatorOwned ? versionOfBytes(evaluatorRaw as Buffer) : undefined;
     const evaluatorSource = options.evaluatorScriptSource
@@ -720,14 +743,12 @@ export class ShieldManager {
       hooks.some((h) => h.ownership === "shield") ||
       orphanedHookPaths.length > 0;
 
-    // Only a hook whose action this policy actually enforces matters for
-    // "is the lock fully active" — a commit-only lock (no expected GitHub
-    // login) must not report degraded over a missing or foreign pre-push
-    // hook it does not need.
-    const enforcedActions = policyResult?.ok ? policyResult.policy.enforcedActions : undefined;
-    const governs = (h: ShieldHookInspection) => (enforcedActions ? enforcedActions.includes(h.action) : true);
-    const missingGovernedHooks = hooks.filter((h) => h.ownership === "absent" && governs(h));
-    const foreignHooks = hooks.filter((h) => h.ownership === "foreign" && governs(h));
+    // Every hook matters for "is the lock fully active": a lock governs
+    // commit AND push unconditionally (policy v4), including for an
+    // identity with no GitHub login — whose pre-push hook is exactly what
+    // blocks its pushes.
+    const missingGovernedHooks = hooks.filter((h) => h.ownership === "absent");
+    const foreignHooks = hooks.filter((h) => h.ownership === "foreign");
     const outdatedOrIncompatibleHooks = hooks.filter(
       (h) => h.ownership === "shield" && (h.version === undefined || h.version !== SHIELD_ARTIFACT_VERSION),
     );
@@ -735,8 +756,8 @@ export class ShieldManager {
 
     let identityDrift = false;
     let identityDriftDetails: string[] = [];
-    if (policyResult?.ok && options.currentIdentities) {
-      const policy = policyResult.policy;
+    if (recordedPolicy && options.currentIdentities) {
+      const policy = recordedPolicy;
       identityDriftDetails = identityDriftFields(
         policy,
         options.currentIdentities.find((identity) => identity.id === policy.identityId),
@@ -786,6 +807,15 @@ export class ShieldManager {
     } else if (!policyResult) {
       state = "degraded";
       reasons.push('Identity-lock files are present but no policy file was found, so every commit and push is blocked. Run "Repair Identity Lock" or "Unlock Current Repository".');
+    } else if (previousLockPolicy) {
+      // A real assignment from an earlier version. Its installed (older)
+      // evaluator keeps enforcing commits, but would let every push from an
+      // identity with no GitHub login through unchecked — so this is never
+      // reported as active, and is upgraded in place (assignment kept).
+      state = "degraded";
+      reasons.push(
+        'This repository\'s identity lock was installed by an earlier version of Repo Identity Guard and must be upgraded (the assignment is kept): until then its installed hooks are out of date. Open the repository in a trusted VS Code workspace or run "Repair Identity Lock" to upgrade it.',
+      );
     } else if (!policyResult.ok) {
       state = "broken";
       reasons.push(
@@ -834,7 +864,7 @@ export class ShieldManager {
       state = "degraded";
       reasons.push(
         identityDriftDetails[0] === "identity removed"
-          ? `The identity this repository is locked to ("${policyResult?.ok ? policyResult.policy.identityId : "?"}") no longer exists in settings. The lock keeps enforcing the identity recorded when it was installed until you assign another identity or unlock the repository.`
+          ? `The identity this repository is locked to ("${recordedPolicy?.identityId ?? "?"}") no longer exists in settings. The lock keeps enforcing the identity recorded when it was installed until you assign another identity or unlock the repository.`
           : `The assigned identity was edited in settings since this lock was installed (${identityDriftDetails.join(", ")}), but the lock still enforces the previous values. Run "Repair Identity Lock" to apply the edit.`,
       );
     } else {
@@ -849,20 +879,20 @@ export class ShieldManager {
       policyPath,
       policyPresent: policyRaw !== null,
       policyValid: policyResult?.ok ?? false,
-      policyIdentityLabel: policyResult?.ok ? policyResult.policy.identityLabel : undefined,
-      policySnapshot: policyResult?.ok
+      policyIdentityLabel: recordedPolicy?.identityLabel,
+      policySnapshot: recordedPolicy
         ? {
-            lockId: policyResult.policy.lockId,
-            assignedAt: policyResult.policy.assignedAt,
-            identityId: policyResult.policy.identityId,
-            identityLabel: policyResult.policy.identityLabel,
-            expectedGitName: policyResult.policy.expectedGitName,
-            expectedGitEmail: policyResult.policy.expectedGitEmail,
-            expectedGitHubLogin: policyResult.policy.expectedGitHubLogin,
-            trustedSshHostAliases: [...policyResult.policy.trustedSshHostAliases],
-            enforcedActions: [...policyResult.policy.enforcedActions],
+            lockId: recordedPolicy.lockId,
+            assignedAt: recordedPolicy.assignedAt,
+            identityId: recordedPolicy.identityId,
+            identityLabel: recordedPolicy.identityLabel,
+            expectedGitName: recordedPolicy.expectedGitName,
+            expectedGitEmail: recordedPolicy.expectedGitEmail,
+            expectedGitHubLogin: recordedPolicy.expectedGitHubLogin,
+            trustedSshHostAliases: [...recordedPolicy.trustedSshHostAliases],
           }
         : undefined,
+      policyNeedsUpgrade: !!previousLockPolicy,
       legacyPolicy: policyRaw !== null && !policyResult?.ok ? readLegacyPolicyInfo(policyRaw) : undefined,
       evaluatorPath,
       evaluatorPresent: evaluatorRaw !== null,
@@ -1030,14 +1060,13 @@ export class ShieldManager {
     //
     // An identity lock must never be reported (or persisted) as assigned
     // while a hook it needs could not be installed. So in all-or-nothing
-    // mode, any slot governing an ENFORCED action that would be skipped
-    // (foreign hook without chaining, a symlink, a non-executable file, a
-    // stale chained-original sidecar) refuses the whole operation up
-    // front. A skipped slot for an action the lock does not enforce (the
-    // pre-push slot of a commit-only lock) is fine: nothing is lost by
-    // leaving a foreign hook there untouched.
+    // mode, any slot that would be skipped (foreign hook without chaining,
+    // a symlink, a non-executable file, a stale chained-original sidecar)
+    // refuses the whole operation up front. Every slot counts: a lock
+    // governs commit AND push for every identity, including one with no
+    // GitHub login, whose pre-push hook is what blocks its pushes.
     if (input.requireComplete) {
-      const blockingSkips = hookWrites.filter((w) => w.mode === "skip" && policy.enforcedActions.includes(w.spec.action));
+      const blockingSkips = hookWrites.filter((w) => w.mode === "skip");
       if (blockingSkips.length > 0) {
         const refusals: string[] = [];
         for (const write of blockingSkips) {
