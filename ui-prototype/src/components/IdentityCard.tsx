@@ -28,13 +28,19 @@ export function IdentityCard({ identity, onClick, showGitName = false, trailing,
     <>
       <IdentityAvatar identity={identity} size={compact ? 26 : 32} />
       <span className="min-w-0 flex-1">
-        <span className="block truncate font-title-md text-title-md text-on-surface">{identity.label}</span>
+        <span className="block truncate font-title-md text-title-md text-on-surface" title={identity.label}>
+          {identity.label}
+        </span>
         {showGitName && (
-          <span className="block truncate font-body-sm text-body-sm text-on-surface-variant">{identity.gitName}</span>
+          <span className="block truncate font-body-sm text-body-sm text-on-surface-variant" title={identity.gitName}>
+            {identity.gitName}
+          </span>
         )}
-        <span className="block truncate font-code-sm text-code-sm text-on-surface-variant">{identity.gitEmail}</span>
+        <span className="block truncate font-code-sm text-code-sm text-on-surface-variant" title={identity.gitEmail}>
+          {identity.gitEmail}
+        </span>
         {!compact && (
-          <span className="block truncate font-label-sm text-label-sm text-outline">
+          <span className="block truncate font-label-sm text-label-sm text-outline" title={`GitHub · ${identity.githubUsername || 'not set'}`}>
             GitHub · {identity.githubUsername || 'not set'}
           </span>
         )}

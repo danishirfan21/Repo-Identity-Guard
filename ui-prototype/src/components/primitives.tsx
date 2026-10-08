@@ -187,10 +187,17 @@ export function NavRow({ icon, label, subtitle, onClick, tone = 'neutral', chevr
         <Icon name={icon} size={18} className={quiet ? 'text-outline' : 'text-on-surface-variant'} />
       )}
       <span className="min-w-0 flex-1">
-        <span className={`block truncate ${large ? 'font-title-md text-title-md' : 'font-body-md text-body-md'} ${quiet ? 'text-on-surface-variant' : 'text-on-surface'}`}>
+        <span
+          className={`block truncate ${large ? 'font-title-md text-title-md' : 'font-body-md text-body-md'} ${quiet ? 'text-on-surface-variant' : 'text-on-surface'}`}
+          title={label}
+        >
           {label}
         </span>
-        {subtitle && <span className="block truncate font-body-sm text-body-sm text-on-surface-variant">{subtitle}</span>}
+        {subtitle && (
+          <span className="block truncate font-body-sm text-body-sm text-on-surface-variant" title={typeof subtitle === 'string' ? subtitle : undefined}>
+            {subtitle}
+          </span>
+        )}
       </span>
       {chevron && <Icon name="chevron_right" size={18} className="text-outline" />}
     </button>

@@ -96,8 +96,14 @@ export function Header({ title, subtitle, onBack, actions }: HeaderProps) {
     <header className="h-12 shrink-0 flex items-center gap-1 px-1.5 border-b border-outline-variant/50 bg-surface-container-low">
       {onBack ? <IconButton icon="arrow_back" label="Back" onClick={onBack} /> : <span className="w-1" />}
       <div className="min-w-0 flex-1 px-1">
-        <h1 className="font-headline-sm text-headline-sm text-on-surface truncate">{title}</h1>
-        {subtitle && <p className="font-label-sm text-label-sm text-on-surface-variant truncate">{subtitle}</p>}
+        <h1 className="font-headline-sm text-headline-sm text-on-surface truncate" title={title}>
+          {title}
+        </h1>
+        {subtitle && (
+          <p className="font-label-sm text-label-sm text-on-surface-variant truncate" title={subtitle}>
+            {subtitle}
+          </p>
+        )}
       </div>
       {actions && <div className="flex items-center gap-0.5">{actions}</div>}
     </header>
