@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { RepositoryRef } from "./identity/assignment";
+import { resolveCurrentRepo } from "./identity/currentRepo";
 import { IdentityLockService, LockOperationResult, LockStatus } from "./identity/identityLockService";
 import { Identity, RepoIdentityState } from "./identity/types";
 import {
@@ -124,18 +125,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // ==================== state ====================
 
+  // Unlike `commandTarget()`, this never lets the active editor override an
+  // explicit sidebar selection — the (legacy, placeholder-only) sidebar
+  // repository picker still works exactly as before. The production
+  // contract being built in this phase has no such picker at all (see
+  // `src/identity/currentRepo.ts`); this function is not part of it.
   function selectedEntry(): RepoEntry | undefined {
     return repos.find((repo) => repo.id === selectedId) ?? repos[0];
   }
 
-  /** The repository a Command Palette command acts on: the active editor's repository when it has one, else the sidebar's selection. */
-  function commandTarget(): RepoEntry | undefined {
+  /**
+   * The ONE repository the sidebar and every Command Palette command act
+   * on right now — see `src/identity/currentRepo.ts` for the rule. This is
+   * also `selectedEntry()`'s and `commandTargetFrom()`'s single shared
+   * implementation: there is no repository picker, so "the sidebar's
+   * selection" and "the command's target" are the same resolved value.
+   */
+  function commandTarget(list: RepoEntry[] = repos): RepoEntry | undefined {
     const activeFile = vscode.window.activeTextEditor?.document;
-    if (activeFile?.uri.scheme === "file") {
-      const match = repos.find((repo) => isSubpath(activeFile.uri.fsPath, repo.ref.repoRoot));
-      if (match) return match;
-    }
-    return selectedEntry();
+    return resolveCurrentRepo({
+      repos: list.map((entry) => ({ id: entry.id, repoRoot: entry.ref.repoRoot, entry })),
+      activeFilePath: activeFile?.uri.scheme === "file" ? activeFile.uri.fsPath : undefined,
+      previousId: selectedId,
+    })?.entry;
   }
 
   function toState(entry: RepoEntry): RepoIdentityState {
@@ -255,12 +267,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   }
 
   function commandTargetFrom(list: RepoEntry[]): RepoEntry | undefined {
-    const activeFile = vscode.window.activeTextEditor?.document;
-    if (activeFile?.uri.scheme === "file") {
-      const match = list.find((repo) => isSubpath(activeFile.uri.fsPath, repo.ref.repoRoot));
-      if (match) return match;
-    }
-    return list[0];
+    return commandTarget(list);
   }
 
   async function migrateLegacyInstallation(ref: RepositoryRef, identities: Identity[], current: LockStatus): Promise<LockStatus> {
@@ -725,11 +732,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 export function deactivate(): void {
   for (const disposables of repoWatchers.values()) disposables.forEach((d) => d.dispose());
   repoWatchers.clear();
-}
-
-function isSubpath(candidate: string, root: string): boolean {
-  const rel = path.relative(root, candidate);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
 
 function errorMessage(error: unknown): string {
