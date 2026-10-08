@@ -20,6 +20,14 @@ src/**
 tsconfig.json
 tailwind.config.js
 
+# The disposable React/Vite UI prototype (design/UX reference only — see
+# ui-prototype/README or the task that introduced it). It is never
+# imported by production code and must never enter the VSIX: its own
+# node_modules, build config and (should it ever be built) dist output
+# would otherwise bloat the package with something no installed extension
+# reads. Asserted in src/test/vsixPackaging.test.ts.
+ui-prototype/**
+
 # Compiled tests, and source maps, which would otherwise more than double
 # the package for no user-facing benefit.
 out/test/**

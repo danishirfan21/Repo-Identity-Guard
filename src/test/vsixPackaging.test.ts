@@ -182,6 +182,9 @@ test("PART 11 — the packaged VSIX contains everything the lock, notes and the 
       [/^extension\/scripts\//, "developer scripts"],
       [/^extension\/\.claude\//, "local agent/workspace state"],
       [/^extension\/\.tmp-/, "temporary test repositories or generated test data"],
+      // The disposable UI prototype is design/UX reference only — never
+      // wired to production code, and must never ship in the VSIX.
+      [/^extension\/ui-prototype\//, "the disposable UI prototype (design reference only)"],
       [/(^|\/)\.env($|\.)/, "environment files"],
       [/\.(pem|key|p12)$/, "keys or certificates"],
       [/\.vsix$/, "a nested VSIX"],
@@ -268,7 +271,40 @@ test("PART 11 — .vscodeignore never excludes resources/, out/ (non-test), or m
     assert.ok(!/^package\.json$/.test(rule), `.vscodeignore excludes package.json: "${rule}"`);
   }
   // And the exclusions that MUST be there are.
-  for (const required of ["src/**", "out/test/**", "node_modules/**", ".git/**"]) {
+  for (const required of ["src/**", "out/test/**", "node_modules/**", ".git/**", "ui-prototype/**"]) {
     assert.ok(rules.includes(required), `.vscodeignore is missing the required exclusion "${required}"`);
   }
+});
+
+test("PART 11 — the disposable UI prototype directory exists on disk but is never referenced by any shipped (non-test) TypeScript source", async () => {
+  // Belt-and-braces alongside the .vscodeignore rule and the packaged-VSIX
+  // check above: even if .vscodeignore regressed, production code must
+  // never import from ui-prototype/ in the first place — see "PROTOTYPE
+  // DIRECTORY" in the task spec.
+  const prototypeDir = path.join(REPO_ROOT, "ui-prototype");
+  assert.ok(
+    await fs.stat(prototypeDir).then((s) => s.isDirectory()).catch(() => false),
+    "ui-prototype/ is expected to exist as design reference material",
+  );
+
+  const srcDir = path.join(REPO_ROOT, "src");
+  const selfPath = path.join(REPO_ROOT, "src", "test", "vsixPackaging.test.ts");
+  const importPattern = /(?:from\s+["'][^"']*ui-prototype|require\(\s*["'][^"']*ui-prototype)/;
+  const offenders: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.name.endsWith(".ts") && full !== selfPath) {
+        // Excludes this file itself, which legitimately talks ABOUT
+        // ui-prototype/ in prose — only actual import/require statements
+        // elsewhere would mean production or test code depends on it.
+        const content = await fs.readFile(full, "utf8");
+        if (importPattern.test(content)) offenders.push(path.relative(REPO_ROOT, full));
+      }
+    }
+  };
+  await walk(srcDir);
+  assert.deepEqual(offenders, [], `production/test TypeScript must never import from ui-prototype/: ${offenders.join(", ")}`);
 });
