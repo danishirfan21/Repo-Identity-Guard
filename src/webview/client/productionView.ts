@@ -187,6 +187,7 @@ function Button(label, onClick, opts) {
         (o.block ? " w-full" : "") +
         (o.className ? " " + o.className : ""),
       disabled: disabled,
+      title: o.title,
       attrs: o.ariaLabel ? { "aria-label": o.ariaLabel } : o.ariaExpanded !== undefined ? { "aria-expanded": o.ariaExpanded } : undefined,
       dataset: o.dataset,
       on: { click: onClick },
@@ -646,6 +647,22 @@ function plural(n, singular, pluralWord) {
 
 const EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;
 
+// ==================== workspace trust ====================
+
+/**
+ * Inline, non-blocking notice shown wherever an Identity Lock action would
+ * otherwise fail silently-until-clicked because the workspace isn't
+ * trusted — never a full blocking page (see "WORKSPACE TRUST" in the task
+ * spec): Repo Notes is unaffected and stays fully usable regardless.
+ */
+function TrustNotice() {
+  return h("div", { className: "flex items-start gap-1.5 rounded-lg bg-tertiary/10 border border-tertiary/25 px-2.5 py-2", attrs: { role: "status" } }, [
+    leaf("p", "font-body-sm text-body-sm text-on-surface", "This workspace isn't trusted, so Repo Identity Guard can't lock, change, or unlock an identity here. Repo Notes still works normally."),
+  ]);
+}
+
+const TRUST_DISABLED_TITLE = "This workspace isn't trusted.";
+
 // ==================== main screen ====================
 
 function renderMain() {
@@ -733,6 +750,7 @@ function renderIdentityLock(route) {
   } else {
     body = renderLocked(route, lock, repoName);
   }
+  if (!stale && state && !state.isWorkspaceTrusted) body = [TrustNotice()].concat(body);
   return Screen({ header: header, children: body });
 }
 
@@ -780,7 +798,7 @@ function UnlockRow(route) {
             },
           });
         },
-        { size: "sm", variant: "attention", loading: pendingUnlock },
+        { size: "sm", variant: "attention", loading: pendingUnlock, disabled: !state.isWorkspaceTrusted, title: state.isWorkspaceTrusted ? undefined : TRUST_DISABLED_TITLE },
       ),
     ]),
   ]);
@@ -887,7 +905,7 @@ function renderGitMismatch(route, lock, identity, repoName) {
             onFailure: (msg) => showToast(msg.message || "Couldn't update the Git identity.", "info"),
           });
         },
-        { variant: "primary", block: true, className: "mt-space-md", loading: pendingApply },
+        { variant: "primary", block: true, className: "mt-space-md", loading: pendingApply, disabled: !state.isWorkspaceTrusted, title: state.isWorkspaceTrusted ? undefined : TRUST_DISABLED_TITLE },
       ),
       h("div", { className: "mt-2.5" }, [
         Collapsible(
@@ -990,7 +1008,7 @@ function renderRepair(route, lock, repoName) {
         Button(
           pendingRepair ? "Repairing\\u2026" : "Try again",
           () => doRepair(route),
-          { variant: "primary", block: true, className: "mt-space-md", loading: pendingRepair },
+          { variant: "primary", block: true, className: "mt-space-md", loading: pendingRepair, disabled: !state.isWorkspaceTrusted, title: state.isWorkspaceTrusted ? undefined : TRUST_DISABLED_TITLE },
         ),
         h("div", { className: "mt-2.5" }, [Collapsible(detailsOpen, [leaf("p", "font-body-sm text-body-sm text-on-surface-variant", route.repairFailedMessage)], "Details")]),
       ]),
@@ -1006,7 +1024,14 @@ function renderRepair(route, lock, repoName) {
       Button(
         pendingRepair ? "Repairing\\u2026" : "Repair",
         () => doRepair(route),
-        { variant: "primary", block: true, className: "mt-space-md", loading: pendingRepair, disabled: !lock.detail || lock.detail.repairAvailable === false },
+        {
+          variant: "primary",
+          block: true,
+          className: "mt-space-md",
+          loading: pendingRepair,
+          disabled: !lock.detail || lock.detail.repairAvailable === false || !state.isWorkspaceTrusted,
+          title: state.isWorkspaceTrusted ? undefined : TRUST_DISABLED_TITLE,
+        },
       ),
       reasons.length ? h("div", { className: "mt-2.5" }, [Collapsible(detailsOpen, [KeyValueList(reasons.map((r, i) => ({ k: "Reason " + (i + 1), v: r })), true)], "Details")]) : null,
     ]),
@@ -1078,6 +1103,7 @@ function renderAssignmentConfirm(route) {
   return Screen({
     header: Header({ title: "Assign identity", subtitle: repoName, onBack: navPop }),
     children: [
+      !state.isWorkspaceTrusted ? TrustNotice() : null,
       Card([
         h("div", { className: "flex items-start gap-2.5" }, [
           IconTile("info"),
@@ -1108,7 +1134,7 @@ function renderAssignmentConfirm(route) {
                 onFailure: (msg) => showToast(msg.message || "Couldn't lock this repository.", "info"),
               });
             },
-            { variant: "primary", loading: pending },
+            { variant: "primary", loading: pending, disabled: !state.isWorkspaceTrusted, title: state.isWorkspaceTrusted ? undefined : TRUST_DISABLED_TITLE },
           ),
         ]),
       ]),
