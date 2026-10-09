@@ -333,14 +333,11 @@ Version 0.3.0 removes most of the earlier product (see
 - Repo Identity Guard: Use Assigned Identity in Git Config
 - Repo Identity Guard: Edit Identities
 
-Command Palette commands act on the repository of the active editor (or
-the sidebar's selected repository); sidebar buttons act on the repository
-the sidebar shows.
-
-## Status of the UI
-
-The sidebar in this build is a deliberately minimal placeholder over the
-new backend; a redesigned UI is in progress.
+There is no repository picker: Command Palette commands and the sidebar
+both act on the same one repository — whichever the active editor's file
+belongs to, or (if the active editor doesn't name one, e.g. a settings
+file or an output panel) the repository that was current just before.
+Never a repository chosen independently in the sidebar.
 
 ## Run locally
 
