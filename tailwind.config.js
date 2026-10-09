@@ -42,11 +42,21 @@ module.exports = {
         "input-fg": "var(--rig-input-fg)",
         "input-border": "var(--rig-input-border)",
         chip: "var(--rig-chip-bg)",
+        // Added for the production sidebar UI (src/webview/client/productionView.ts),
+        // which reuses the frozen ui-prototype's utility-class vocabulary so its
+        // hierarchy/spacing/density can be reproduced faithfully. Every value below
+        // still resolves to a --rig-* (and therefore --vscode-*) semantic variable —
+        // never a fixed hex value — so theme-following behavior is unaffected.
+        secondary: "var(--rig-success)",
+        "on-secondary": "var(--rig-button-fg)",
+        "secondary-container": "var(--rig-success-bg)",
+        "on-secondary-container": "var(--rig-success)",
+        "surface-bright": "var(--rig-surface-container-highest)",
       },
       borderRadius: {
         DEFAULT: "2px",
         lg: "4px",
-        xl: "6px",
+        xl: "8px",
         full: "9999px",
       },
       spacing: {
@@ -57,6 +67,15 @@ module.exports = {
         xs: "4px",
         gutter: "10px",
         md: "8px",
+        // Added for the production sidebar UI — same scale the frozen prototype
+        // uses (space-xs/sm/md/lg/xl, margin), kept as plain pixel values rather
+        // than rem so sizing never drifts with a user's root font-size setting.
+        "space-xs": "4px",
+        "space-sm": "8px",
+        "space-md": "12px",
+        "space-lg": "16px",
+        "space-xl": "20px",
+        margin: "12px",
       },
       fontFamily: {
         "label-caps": ["var(--vscode-font-family)"],
@@ -65,6 +84,15 @@ module.exports = {
         "body-base": ["var(--vscode-font-family)"],
         "code-mono": ["var(--vscode-editor-font-family)", "monospace"],
         "headline-lg": ["var(--vscode-font-family)"],
+        // Added for the production sidebar UI — deliberately the SAME VS Code
+        // font variables as above (never a web font such as the prototype's
+        // Inter/JetBrains Mono): see "DEPENDENCIES" / "CSP" in the task spec.
+        "label-sm": ["var(--vscode-font-family)"],
+        "title-md": ["var(--vscode-font-family)"],
+        "body-sm": ["var(--vscode-font-family)"],
+        "body-md": ["var(--vscode-font-family)"],
+        "headline-sm": ["var(--vscode-font-family)"],
+        "code-sm": ["var(--vscode-editor-font-family)", "monospace"],
       },
       fontSize: {
         "label-caps": ["10px", { lineHeight: "14px", letterSpacing: "0.06em", fontWeight: "700" }],
@@ -73,6 +101,14 @@ module.exports = {
         "body-base": ["12px", { lineHeight: "17px", fontWeight: "400" }],
         "code-mono": ["11px", { lineHeight: "16px", fontWeight: "400" }],
         "headline-lg": ["16px", { lineHeight: "22px", letterSpacing: "-0.01em", fontWeight: "600" }],
+        // Added for the production sidebar UI — same scale as the frozen
+        // prototype (src/*/tailwind.config.js), reproduced in pixels.
+        "label-sm": ["11px", { lineHeight: "14px", fontWeight: "500" }],
+        "title-md": ["13px", { lineHeight: "18px", fontWeight: "600" }],
+        "code-sm": ["11px", { lineHeight: "16px", fontWeight: "400" }],
+        "body-sm": ["12px", { lineHeight: "16px", fontWeight: "400" }],
+        "headline-sm": ["14px", { lineHeight: "20px", fontWeight: "600" }],
+        "body-md": ["13px", { lineHeight: "18px", fontWeight: "400" }],
       },
     },
   },
