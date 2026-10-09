@@ -1,6 +1,48 @@
 # Changelog
 
-## Unreleased — an assigned repository always governs push
+## 0.3.0 — Unreleased: identity lock, notes, and the redesigned UI
+
+Repo Identity Guard is reduced to two jobs: **explicit per-repository
+identity locking** and **private per-repository notes**, now presented
+through a redesigned sidebar UI built on top of that backend. See the
+README and [docs/IDENTITY_LOCK.md](docs/IDENTITY_LOCK.md).
+
+### Added
+
+- A full redesigned sidebar UI replaces the earlier minimal placeholder: a
+  Main screen (Identity Lock + Repo Notes summary), Identity Lock screens
+  for locked / needs-attention / needs-repair states (each with its own
+  actionable next step, e.g. "Use \<identity\> identity" for a Git-config
+  mismatch, "Finish setup" for a missing GitHub username or SSH profile),
+  Assign/Change Identity with an explicit confirmation step, Manage/Add/Edit
+  Identities, Repo Notes (list, search, pin, add/edit/delete, Copy,
+  Export/Import), and an inline, non-blocking Workspace Trust notice. Built
+  as plain TypeScript/DOM with no framework or bundler, embedded as a
+  single inline nonce'd `<script>` (see "Security" below); its screens and
+  interactions are based on a disposable, frozen `ui-prototype/` reference
+  that is never imported, compiled, or packaged into the extension.
+- A single typed request/acknowledgement protocol
+  (`src/ui/protocol.ts`) replaces the placeholder webview's ad hoc
+  `noteResult` messages: every mutating action gets back one
+  `operationResult` correlated by its own `requestId`, and `ok: true` is
+  only ever sent once the authoritative state has been (or is about to be)
+  refreshed — a `state` push arriving is never, on its own, treated as
+  proof that a specific action succeeded.
+- A stale-action guard: every repo-scoped webview message carries the
+  `repoId` of the repository the visible screen was bound to, and the host
+  (`validateRepoTarget` in `src/extension.ts`) rejects a request whose
+  `repoId` no longer matches the actual current repository
+  (`{ code: "repository_changed" }`) rather than silently acting on either
+  the stale repository or whichever one is current when the request
+  arrives. Closes a TOCTOU race where the active editor switches
+  repositories between the last `state` push the webview rendered and a
+  click reaching the extension host.
+- Passive effective-identity inspection: a lock the engine itself reports
+  as fully installed ("active") is now also checked against the real,
+  live Git config that would apply to the next commit, surfaced as a new
+  `git_identity_mismatch` needs-attention cause with a one-click "Use
+  \<identity\> identity" fix, rather than only trusting the lock's own
+  installed-artifacts state.
 
 ### Fixed
 
@@ -18,6 +60,29 @@
 
 ### Changed
 
+- **Assigning an identity to a repository is now the only way to enforce
+  anything, and enforcement is the only effect of assigning.** The hook
+  engine formerly exposed as Shield Mode enforces the assigned identity:
+  commit author/committer always, and the pushing GitHub account whenever
+  the identity has `expectedGitHubLogin` (SSH route through a trusted
+  alias, `ssh -G` + `ssh -T` verification — unchanged in rigor).
+- **Unassigned repositories are never touched**: no hooks, no files, no
+  blocked commits or pushes.
+- **No automatic matching.** Identities are never matched to repositories
+  by remote owner, organization, `exactRepos`, upstream remotes or
+  anything else. There is no repository picker anywhere in the product:
+  the sidebar and every Command Palette command act on the one repository
+  the active editor currently points at, falling back to the
+  previously-resolved repository when the active editor doesn't name one
+  — never an independently "selected" repository.
+- Assign / change identity is all-or-nothing (preflight + rollback);
+  unlock removes hooks before the record and never reports "unlocked"
+  while a lock hook remains.
+- Block messages start with a machine-readable prelude
+  (`REPO_IDENTITY_GUARD_BLOCK`, `ACTION`, `REASON`, `REASON_ID`,
+  `IDENTITY`, `EXPECTED_*` / `FOUND_*`, push `DETAIL` / `REMOTE` /
+  `ROUTE_HOST`); a narrow reason catalog is shared by the shell evaluator
+  and TypeScript.
 - Lock policy **v4**: no `enforcedActions`; commit and push are always
   both governed. A missing `expectedGitHubLogin` means "push requirement
   incomplete — block", not "push outside the lock". A v4 policy that
@@ -29,7 +94,8 @@
 - Identities without a GitHub login remain valid and editable
   (structurally valid vs. enforcement-ready: `EnforcementReadyIdentity`,
   `isEnforcementReadyIdentity`, `identityReadinessProblems`). Assigning
-  one is allowed and warns that every push will be blocked.
+  one is allowed and the confirmation screen warns that every push will be
+  blocked.
 - **Check Identity Lock** reports a missing GitHub login as a block
   (`needs_configuration`), not as "nothing to check".
 - The "no trusted SSH alias" push block now explains the alias
@@ -37,56 +103,15 @@
 - Every lock installs all three hooks; a foreign hook in any slot (now
   including `pre-push`) needs explicit chaining. **Repair Identity Lock**
   offers to chain one instead of failing.
-
-### Migration
-
-- **v3 locks from earlier 0.3.0 builds are upgraded in place** (on scan
-  in a trusted workspace, or by Repair): same assignment (`identityId`,
-  `lockId`, `assignedAt`, taken from the recorded v3 snapshot), commit
-  enforcement unchanged, pushes fail-closed. A v3 commit-only lock is
-  never unlocked and never treated as a legacy Shield installation; it
-  reports Needs attention until a GitHub login is configured. If a foreign
-  `pre-push` hook occupies the slot, the automatic upgrade changes nothing
-  and Repair asks to chain it. The v7 evaluator never enforces a v3
-  policy (fails closed).
-
-## 0.3.0 — Unreleased: identity lock and notes only
-
-Repo Identity Guard is reduced to two jobs: **explicit per-repository
-identity locking** and **private per-repository notes**. See the README
-and [docs/IDENTITY_LOCK.md](docs/IDENTITY_LOCK.md).
-
-### Changed
-
-- **Assigning an identity to a repository is now the only way to enforce
-  anything, and enforcement is the only effect of assigning.** The hook
-  engine formerly exposed as Shield Mode enforces the assigned identity:
-  commit author/committer always, and the pushing GitHub account when the
-  identity has `expectedGitHubLogin` (SSH route through a trusted alias,
-  `ssh -G` + `ssh -T` verification — unchanged in rigor).
-- **Unassigned repositories are never touched**: no hooks, no files, no
-  blocked commits or pushes.
-- **No automatic matching.** Identities are never matched to repositories
-  by remote owner, organization, `exactRepos`, upstream remotes or
-  anything else.
-- Assign / change identity is all-or-nothing (preflight + rollback);
-  unlock removes hooks before the record and never reports "unlocked"
-  while a lock hook remains.
-- Block messages start with a machine-readable prelude
-  (`REPO_IDENTITY_GUARD_BLOCK`, `ACTION`, `REASON`, `REASON_ID`,
-  `IDENTITY`, `EXPECTED_*` / `FOUND_*`, push `DETAIL` / `REMOTE` /
-  `ROUTE_HOST`); a narrow reason catalog is shared by the shell evaluator
-  and TypeScript.
-- Policy schema v3 (identity snapshot, `lockId`, `assignedAt`, derived
-  `enforcedActions`); hook/evaluator artifacts v6.
 - Settings: `repoIdentityGuard.identities` (user scope only) replaces
   `repoIdentityGuard.profiles`.
 - Workspace Trust is required only for assign / change / repair / unlock
-  (and legacy migration); notes work fully in untrusted workspaces.
+  (and legacy migration); notes work fully in untrusted workspaces, and
+  the sidebar now shows this inline instead of a locked action silently
+  doing nothing.
 - Passive refreshes never run `ssh`; the push account is checked live
   only on a real push, right after assigning, and by **Check Identity
   Lock**.
-- The sidebar is a minimal placeholder pending a UI redesign.
 
 ### Removed
 
@@ -103,9 +128,21 @@ and [docs/IDENTITY_LOCK.md](docs/IDENTITY_LOCK.md).
 - Commands removed: Rescan, Show Status, Fix Commit Identity, Add Profile
   for Current Repo, Copy Context for AI, Copy Workspace Safety Summary,
   Open Settings, Enable/Disable/Repair Shield, Check Shield Health.
+- The placeholder sidebar webview and its ad hoc `noteResult` message
+  dispatcher (formerly `src/ui/sidebarMessages.ts` / `src/ui/wireState.ts`),
+  replaced by the production UI and protocol described above.
 
 ### Migration
 
+- **v3 locks from earlier 0.3.0 builds are upgraded in place** (on scan
+  in a trusted workspace, or by Repair): same assignment (`identityId`,
+  `lockId`, `assignedAt`, taken from the recorded v3 snapshot), commit
+  enforcement unchanged, pushes fail-closed. A v3 commit-only lock is
+  never unlocked and never treated as a legacy Shield installation; it
+  reports Needs attention until a GitHub login is configured. If a foreign
+  `pre-push` hook occupies the slot, the automatic upgrade changes nothing
+  and Repair asks to chain it. The v7 evaluator never enforces a v3
+  policy (fails closed).
 - **Profiles → identities** (once, when no identities exist yet, user
   settings only): `id`, `label`, `gitName`, `gitEmail`,
   `expectedGitHubLogin`, `trustedSshHostAliases` are kept;
@@ -135,9 +172,17 @@ and [docs/IDENTITY_LOCK.md](docs/IDENTITY_LOCK.md).
 - An SSH user or host beginning with `-` in a push URL is refused before
   `ssh` is invoked (it would be parsed as an option); identity aliases may
   not begin with `-`.
-- Sidebar actions act on the sidebar's selected repository, never
-  implicitly on the active editor's repository.
-- The webview CSP nonce comes from a CSPRNG.
+- There is no repository picker: every repo-scoped webview action is
+  rejected by the extension host if the repository it targeted is no
+  longer the current one (see "Added" above), rather than acting
+  implicitly on whichever repository happens to be current by the time the
+  request is handled.
+- The webview CSP nonce comes from a CSPRNG (`node:crypto`'s
+  `randomBytes`, never `Math.random()`); the CSP itself is
+  `default-src 'none'`, with `script-src` restricted to that one nonce and
+  no `unsafe-inline` / `unsafe-eval`. All user and repository data (note
+  text, identity fields, repository names) is rendered with
+  `textContent` / `value`, never `innerHTML` or equivalent.
 
 ## Earlier unreleased work (pre-0.3.0, superseded by the above)
 
