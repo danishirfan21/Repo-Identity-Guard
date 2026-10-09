@@ -15,6 +15,19 @@ import { RepoIdentityUiState } from "./productionState";
  * webview always renders whatever repository `state.payload.repo` names,
  * decided by `src/identity/currentRepo.ts`.
  *
+ * Every repo-scoped message carries a `repoId`: the id of the repository
+ * the VISIBLE SCREEN was bound to when the user acted, NOT a repository
+ * picker — the user never chooses it, and the webview never offers a
+ * choice of repository. It exists purely as an internal stale-action
+ * guard against a TOCTOU race: the active editor can switch to a
+ * different repository between the last `state` push the screen rendered
+ * and this request arriving, and the host must reject a request whose
+ * `repoId` no longer matches the ACTUAL current repository rather than
+ * silently retargeting it at whatever is current now (see
+ * `src/extension.ts`'s `validateRepoTarget`). `saveIdentity` and
+ * `deleteIdentity` are identity-settings CRUD, not repo-scoped, and never
+ * carry a `repoId`; neither does `ready` or `openFolder`.
+ *
  * `ExtensionMessage.state` pushes are never, on their own, evidence that a
  * mutation succeeded — see "OPERATION RESULT RULE": a state push can
  * arrive for reasons unrelated to any particular pending request (another
@@ -27,21 +40,21 @@ import { RepoIdentityUiState } from "./productionState";
 
 export type WebviewMessage =
   | { type: "ready" }
-  | { type: "assignIdentity"; identityId: string; requestId: string }
-  | { type: "changeIdentity"; identityId: string; requestId: string }
-  | { type: "unlockRepository"; requestId: string }
-  | { type: "repairLock"; requestId: string }
-  | { type: "verifyLock"; requestId: string }
-  | { type: "applyAssignedIdentity"; requestId: string }
+  | { type: "assignIdentity"; repoId: string; identityId: string; requestId: string }
+  | { type: "changeIdentity"; repoId: string; identityId: string; requestId: string }
+  | { type: "unlockRepository"; repoId: string; requestId: string }
+  | { type: "repairLock"; repoId: string; requestId: string }
+  | { type: "verifyLock"; repoId: string; requestId: string }
+  | { type: "applyAssignedIdentity"; repoId: string; requestId: string }
   | { type: "saveIdentity"; identity: IdentityDraft; requestId: string }
   | { type: "deleteIdentity"; identityId: string; requestId: string }
-  | { type: "addNote"; text: string; requestId: string }
-  | { type: "updateNote"; noteId: string; text: string; requestId: string }
-  | { type: "deleteNote"; noteId: string; requestId: string }
-  | { type: "togglePinNote"; noteId: string; requestId: string }
-  | { type: "copyNote"; noteId: string }
-  | { type: "importNotes" }
-  | { type: "exportNotes" }
+  | { type: "addNote"; repoId: string; text: string; requestId: string }
+  | { type: "updateNote"; repoId: string; noteId: string; text: string; requestId: string }
+  | { type: "deleteNote"; repoId: string; noteId: string; requestId: string }
+  | { type: "togglePinNote"; repoId: string; noteId: string; requestId: string }
+  | { type: "copyNote"; repoId: string; noteId: string; requestId: string }
+  | { type: "importNotes"; repoId: string }
+  | { type: "exportNotes"; repoId: string }
   | { type: "openFolder" };
 
 /** Every `WebviewMessage` variant's own `type` literal — used to keep the runtime validator exhaustive with the type union (see the `satisfies`-style check in `protocol.test.ts`). */
@@ -106,43 +119,58 @@ export function parseWebviewMessage(raw: unknown): WebviewMessage | undefined {
 
   switch (m.type) {
     case "ready":
-    case "copyNote":
+    case "openFolder":
+      return { type: m.type };
+
     case "importNotes":
     case "exportNotes":
-    case "openFolder":
-      if (m.type === "copyNote") return isNonEmptyString(m.noteId) ? { type: "copyNote", noteId: m.noteId } : undefined;
-      return { type: m.type };
+      return isNonEmptyString(m.repoId) ? { type: m.type, repoId: m.repoId } : undefined;
+
+    case "copyNote":
+      return isNonEmptyString(m.repoId) && isNonEmptyString(m.noteId) && isNonEmptyString(m.requestId)
+        ? { type: "copyNote", repoId: m.repoId, noteId: m.noteId, requestId: m.requestId }
+        : undefined;
 
     case "assignIdentity":
     case "changeIdentity":
+      return isNonEmptyString(m.repoId) && isNonEmptyString(m.identityId) && isNonEmptyString(m.requestId)
+        ? { type: m.type, repoId: m.repoId, identityId: m.identityId, requestId: m.requestId }
+        : undefined;
+
     case "deleteIdentity":
+      // Not repo-scoped — identity-settings CRUD, no `repoId`.
       return isNonEmptyString(m.identityId) && isNonEmptyString(m.requestId)
-        ? { type: m.type, identityId: m.identityId, requestId: m.requestId }
+        ? { type: "deleteIdentity", identityId: m.identityId, requestId: m.requestId }
         : undefined;
 
     case "unlockRepository":
     case "repairLock":
     case "verifyLock":
     case "applyAssignedIdentity":
-      return isNonEmptyString(m.requestId) ? { type: m.type, requestId: m.requestId } : undefined;
+      return isNonEmptyString(m.repoId) && isNonEmptyString(m.requestId) ? { type: m.type, repoId: m.repoId, requestId: m.requestId } : undefined;
 
     case "saveIdentity": {
+      // Not repo-scoped — identity-settings CRUD, no `repoId`.
       if (!isNonEmptyString(m.requestId)) return undefined;
       const identity = readIdentityDraft(m.identity);
       return identity ? { type: "saveIdentity", identity, requestId: m.requestId } : undefined;
     }
 
     case "addNote":
-      return isNonEmptyString(m.text) && isNonEmptyString(m.requestId) ? { type: "addNote", text: m.text, requestId: m.requestId } : undefined;
+      return isNonEmptyString(m.repoId) && isNonEmptyString(m.text) && isNonEmptyString(m.requestId)
+        ? { type: "addNote", repoId: m.repoId, text: m.text, requestId: m.requestId }
+        : undefined;
 
     case "updateNote":
-      return isNonEmptyString(m.noteId) && typeof m.text === "string" && isNonEmptyString(m.requestId)
-        ? { type: "updateNote", noteId: m.noteId, text: m.text, requestId: m.requestId }
+      return isNonEmptyString(m.repoId) && isNonEmptyString(m.noteId) && typeof m.text === "string" && isNonEmptyString(m.requestId)
+        ? { type: "updateNote", repoId: m.repoId, noteId: m.noteId, text: m.text, requestId: m.requestId }
         : undefined;
 
     case "deleteNote":
     case "togglePinNote":
-      return isNonEmptyString(m.noteId) && isNonEmptyString(m.requestId) ? { type: m.type, noteId: m.noteId, requestId: m.requestId } : undefined;
+      return isNonEmptyString(m.repoId) && isNonEmptyString(m.noteId) && isNonEmptyString(m.requestId)
+        ? { type: m.type, repoId: m.repoId, noteId: m.noteId, requestId: m.requestId }
+        : undefined;
 
     default:
       // In particular: no "selectRepo" case, deliberately — see this

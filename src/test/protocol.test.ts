@@ -8,6 +8,12 @@ import { WEBVIEW_MESSAGE_TYPES, WebviewMessage, operationRequiresTrust, parseWeb
  * coerced, never a guessed default), every malformed one is dropped, and
  * there is no `selectRepo` — see "GENERIC REQUEST/ACK PROTOCOL" and
  * FROZEN PRODUCT RULES in the task spec.
+ *
+ * Every repo-scoped message also carries a `repoId` — an internal
+ * stale-action guard (see this module's own doc comment), never a
+ * repository picker — and `parseWebviewMessage` must validate it with the
+ * same discipline as every other field: missing, empty, or non-string is
+ * dropped, never coerced or defaulted.
  */
 
 test("no 'selectRepo' message exists in the protocol", () => {
@@ -19,24 +25,39 @@ test("ready parses with no further fields required", () => {
   assert.deepEqual(parseWebviewMessage({ type: "ready" }), { type: "ready" });
 });
 
-test("assignIdentity / changeIdentity / deleteIdentity require both identityId and requestId", () => {
-  for (const type of ["assignIdentity", "changeIdentity", "deleteIdentity"] as const) {
-    assert.deepEqual(parseWebviewMessage({ type, identityId: "work", requestId: "r1" }), { type, identityId: "work", requestId: "r1" });
-    assert.equal(parseWebviewMessage({ type, requestId: "r1" }), undefined, `${type} without identityId must be dropped`);
-    assert.equal(parseWebviewMessage({ type, identityId: "work" }), undefined, `${type} without requestId must be dropped`);
-    assert.equal(parseWebviewMessage({ type, identityId: "", requestId: "r1" }), undefined, `${type} with an empty identityId must be dropped`);
+test("assignIdentity / changeIdentity require repoId, identityId and requestId", () => {
+  for (const type of ["assignIdentity", "changeIdentity"] as const) {
+    assert.deepEqual(parseWebviewMessage({ type, repoId: "repo-a", identityId: "work", requestId: "r1" }), { type, repoId: "repo-a", identityId: "work", requestId: "r1" });
+    assert.equal(parseWebviewMessage({ type, identityId: "work", requestId: "r1" }), undefined, `${type} without repoId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "repo-a", requestId: "r1" }), undefined, `${type} without identityId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "repo-a", identityId: "work" }), undefined, `${type} without requestId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "", identityId: "work", requestId: "r1" }), undefined, `${type} with an empty repoId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "repo-a", identityId: "", requestId: "r1" }), undefined, `${type} with an empty identityId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: 42, identityId: "work", requestId: "r1" }), undefined, `${type} with a non-string repoId must be dropped`);
   }
 });
 
-test("unlockRepository / repairLock / verifyLock / applyAssignedIdentity require a requestId", () => {
+test("deleteIdentity is identity-settings CRUD, not repo-scoped: it requires identityId and requestId but no repoId, and a repoId on it is simply ignored (not validated, not echoed)", () => {
+  assert.deepEqual(parseWebviewMessage({ type: "deleteIdentity", identityId: "work", requestId: "r1" }), { type: "deleteIdentity", identityId: "work", requestId: "r1" });
+  assert.equal(parseWebviewMessage({ type: "deleteIdentity", requestId: "r1" }), undefined, "deleteIdentity without identityId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "deleteIdentity", identityId: "work" }), undefined, "deleteIdentity without requestId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "deleteIdentity", identityId: "", requestId: "r1" }), undefined, "deleteIdentity with an empty identityId must be dropped");
+  const withStrayRepoId = parseWebviewMessage({ type: "deleteIdentity", identityId: "work", requestId: "r1", repoId: "repo-a" });
+  assert.deepEqual(withStrayRepoId, { type: "deleteIdentity", identityId: "work", requestId: "r1" });
+});
+
+test("unlockRepository / repairLock / verifyLock / applyAssignedIdentity require repoId and requestId", () => {
   for (const type of ["unlockRepository", "repairLock", "verifyLock", "applyAssignedIdentity"] as const) {
-    assert.deepEqual(parseWebviewMessage({ type, requestId: "r1" }), { type, requestId: "r1" });
-    assert.equal(parseWebviewMessage({ type }), undefined);
-    assert.equal(parseWebviewMessage({ type, requestId: "" }), undefined);
+    assert.deepEqual(parseWebviewMessage({ type, repoId: "repo-a", requestId: "r1" }), { type, repoId: "repo-a", requestId: "r1" });
+    assert.equal(parseWebviewMessage({ type, requestId: "r1" }), undefined, `${type} without repoId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "repo-a" }), undefined, `${type} without requestId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "", requestId: "r1" }), undefined, `${type} with an empty repoId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "repo-a", requestId: "" }), undefined, `${type} with an empty requestId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: null, requestId: "r1" }), undefined, `${type} with a null repoId must be dropped`);
   }
 });
 
-test("saveIdentity: a well-formed draft (label, gitEmail, sshAliases) parses, with the full alias array preserved", () => {
+test("saveIdentity: a well-formed draft (label, gitEmail, sshAliases) parses, with the full alias array preserved; saveIdentity is not repo-scoped (no repoId)", () => {
   const msg = parseWebviewMessage({
     type: "saveIdentity",
     requestId: "r1",
@@ -70,31 +91,49 @@ test("saveIdentity: a non-string entry in sshAliases is dropped from the array, 
   assert.deepEqual(msg.identity.sshAliases, ["ok", "also-ok"]);
 });
 
-test("addNote requires non-empty text and a requestId", () => {
-  assert.deepEqual(parseWebviewMessage({ type: "addNote", text: "hello", requestId: "r1" }), { type: "addNote", text: "hello", requestId: "r1" });
-  assert.equal(parseWebviewMessage({ type: "addNote", text: "", requestId: "r1" }), undefined);
-  assert.equal(parseWebviewMessage({ type: "addNote", requestId: "r1" }), undefined);
+test("addNote requires repoId, non-empty text and a requestId", () => {
+  assert.deepEqual(parseWebviewMessage({ type: "addNote", repoId: "repo-a", text: "hello", requestId: "r1" }), { type: "addNote", repoId: "repo-a", text: "hello", requestId: "r1" });
+  assert.equal(parseWebviewMessage({ type: "addNote", text: "hello", requestId: "r1" }), undefined, "addNote without repoId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "addNote", repoId: "repo-a", text: "", requestId: "r1" }), undefined);
+  assert.equal(parseWebviewMessage({ type: "addNote", repoId: "repo-a", requestId: "r1" }), undefined);
+  assert.equal(parseWebviewMessage({ type: "addNote", repoId: "", text: "hello", requestId: "r1" }), undefined, "addNote with an empty repoId must be dropped");
 });
 
-test("updateNote allows empty text (clearing a note is a valid edit) but requires noteId and requestId", () => {
-  assert.deepEqual(parseWebviewMessage({ type: "updateNote", noteId: "n1", text: "", requestId: "r1" }), { type: "updateNote", noteId: "n1", text: "", requestId: "r1" });
-  assert.equal(parseWebviewMessage({ type: "updateNote", text: "x", requestId: "r1" }), undefined);
+test("updateNote allows empty text (clearing a note is a valid edit) but requires repoId, noteId and requestId", () => {
+  assert.deepEqual(parseWebviewMessage({ type: "updateNote", repoId: "repo-a", noteId: "n1", text: "", requestId: "r1" }), {
+    type: "updateNote",
+    repoId: "repo-a",
+    noteId: "n1",
+    text: "",
+    requestId: "r1",
+  });
+  assert.equal(parseWebviewMessage({ type: "updateNote", noteId: "n1", text: "x", requestId: "r1" }), undefined, "updateNote without repoId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "updateNote", repoId: "repo-a", text: "x", requestId: "r1" }), undefined);
 });
 
-test("deleteNote and togglePinNote now carry a requestId (extended ack coverage, see 'NOTES ACKS')", () => {
-  assert.deepEqual(parseWebviewMessage({ type: "deleteNote", noteId: "n1", requestId: "r1" }), { type: "deleteNote", noteId: "n1", requestId: "r1" });
-  assert.deepEqual(parseWebviewMessage({ type: "togglePinNote", noteId: "n1", requestId: "r1" }), { type: "togglePinNote", noteId: "n1", requestId: "r1" });
-  assert.equal(parseWebviewMessage({ type: "deleteNote", noteId: "n1" }), undefined, "deleteNote without a requestId must be dropped");
+test("deleteNote and togglePinNote require repoId, noteId and requestId", () => {
+  for (const type of ["deleteNote", "togglePinNote"] as const) {
+    assert.deepEqual(parseWebviewMessage({ type, repoId: "repo-a", noteId: "n1", requestId: "r1" }), { type, repoId: "repo-a", noteId: "n1", requestId: "r1" });
+    assert.equal(parseWebviewMessage({ type, noteId: "n1", requestId: "r1" }), undefined, `${type} without a repoId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "repo-a", requestId: "r1" }), undefined, `${type} without a noteId must be dropped`);
+    assert.equal(parseWebviewMessage({ type, repoId: "repo-a", noteId: "n1" }), undefined, `${type} without a requestId must be dropped`);
+  }
 });
 
-test("copyNote is fire-and-forget (no requestId) but still requires a noteId", () => {
-  assert.deepEqual(parseWebviewMessage({ type: "copyNote", noteId: "n1" }), { type: "copyNote", noteId: "n1" });
-  assert.equal(parseWebviewMessage({ type: "copyNote" }), undefined);
+test("copyNote is now ack-based (see 'COPY MUST NOT ANNOUNCE SUCCESS BEFORE SUCCESS'): it requires repoId, noteId AND a requestId", () => {
+  assert.deepEqual(parseWebviewMessage({ type: "copyNote", repoId: "repo-a", noteId: "n1", requestId: "r1" }), { type: "copyNote", repoId: "repo-a", noteId: "n1", requestId: "r1" });
+  assert.equal(parseWebviewMessage({ type: "copyNote", noteId: "n1", requestId: "r1" }), undefined, "copyNote without repoId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "copyNote", repoId: "repo-a", requestId: "r1" }), undefined, "copyNote without noteId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "copyNote", repoId: "repo-a", noteId: "n1" }), undefined, "copyNote without requestId must be dropped");
 });
 
-test("importNotes / exportNotes parse with no further fields (reachable from the new protocol, unchanged behavior)", () => {
-  assert.deepEqual(parseWebviewMessage({ type: "importNotes" }), { type: "importNotes" });
-  assert.deepEqual(parseWebviewMessage({ type: "exportNotes" }), { type: "exportNotes" });
+test("importNotes / exportNotes require a repoId (single-repo export/import is repo-scoped)", () => {
+  assert.deepEqual(parseWebviewMessage({ type: "importNotes", repoId: "repo-a" }), { type: "importNotes", repoId: "repo-a" });
+  assert.deepEqual(parseWebviewMessage({ type: "exportNotes", repoId: "repo-a" }), { type: "exportNotes", repoId: "repo-a" });
+  assert.equal(parseWebviewMessage({ type: "importNotes" }), undefined, "importNotes without a repoId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "exportNotes" }), undefined, "exportNotes without a repoId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "importNotes", repoId: "" }), undefined, "importNotes with an empty repoId must be dropped");
+  assert.equal(parseWebviewMessage({ type: "importNotes", repoId: 1 }), undefined, "importNotes with a non-string repoId must be dropped");
 });
 
 test("openFolder parses with no further fields and is listed in WEBVIEW_MESSAGE_TYPES", () => {
