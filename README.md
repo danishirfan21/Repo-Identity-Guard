@@ -114,8 +114,9 @@ installed (restoring your own hooks exactly) before removing the lock
 record; if something cannot be removed, the repository keeps reporting the
 lock instead of pretending it is gone. Your notes are kept either way.
 
-Assign, change, repair and unlock change Git hooks, so they require
-[Workspace Trust](#workspace-trust).
+Assign, change, repair and unlock change Git hooks, and **Use Assigned
+Identity in Git Config** writes repository Git config, so all of these
+require [Workspace Trust](#workspace-trust).
 
 ### What a lock checks
 
@@ -271,7 +272,11 @@ In an untrusted workspace you can still see each repository's lock state
 and use notes fully (they are local data that is never executed).
 Assigning, changing, repairing and unlocking an identity — and migrating a
 legacy installation — install or remove Git hooks, so they only run in a
-trusted workspace.
+trusted workspace. **Use Assigned Identity in Git Config** only runs in a
+trusted workspace too, because it writes the repository's Git config
+(`user.name` / `user.email`) — it does not install or remove any hook.
+Identity settings (add, edit, delete) and Repo Notes remain usable without
+Workspace Trust.
 
 ## Upgrading locks from earlier 0.3.0 builds
 

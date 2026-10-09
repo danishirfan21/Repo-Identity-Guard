@@ -106,9 +106,11 @@ README and [docs/IDENTITY_LOCK.md](docs/IDENTITY_LOCK.md).
 - Settings: `repoIdentityGuard.identities` (user scope only) replaces
   `repoIdentityGuard.profiles`.
 - Workspace Trust is required only for assign / change / repair / unlock
-  (and legacy migration); notes work fully in untrusted workspaces, and
-  the sidebar now shows this inline instead of a locked action silently
-  doing nothing.
+  (which mutate the lock/hook state), Use Assigned Identity in Git Config
+  (which writes repository Git config), and legacy migration; notes work
+  fully in untrusted workspaces, identity settings (add/edit/delete) remain
+  trust-exempt, and the sidebar now shows this inline instead of a locked
+  action silently doing nothing.
 - Passive refreshes never run `ssh`; the push account is checked live
   only on a real push, right after assigning, and by **Check Identity
   Lock**.
