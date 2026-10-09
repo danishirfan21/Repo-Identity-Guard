@@ -598,6 +598,18 @@ test("needs_attention / identity_missing: offers 'Assign a new identity' and Unl
   assert.ok(view.button("Unlock repository"));
 });
 
+test("needs_attention / inspection_failed (see 'STATUS INSPECTION FAILURE'): never claims unassigned/unrestricted, offers no Repair and no Unlock, and shows safe, non-raw copy", () => {
+  const view = loadView();
+  pushState(view, uiState({ lock: { state: "needs_attention", cause: "inspection_failed", repairAvailable: false } }));
+  openIdentityLockRow(view);
+  assert.match(view.document.app.textContent, /couldn't inspect this repository/i);
+  assert.equal(view.document.app.textContent.includes("No identity assigned"), false, "must never claim unassigned");
+  assert.equal(view.document.app.textContent.includes("Git is unrestricted"), false, "must never claim Git is unrestricted");
+  assert.equal(view.document.app.textContent.includes("needs repair"), false, "repair is never implied by an inspection failure alone");
+  assert.equal(view.button("Repair") === undefined, true);
+  assert.equal(view.button("Unlock repository") === undefined, true);
+});
+
 // ==================== identity lock: repair ====================
 
 test("repair: lists the engine's own reasons verbatim, and a failed repair shows a transient 'Try again' without persisting as backend state", () => {

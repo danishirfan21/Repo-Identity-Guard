@@ -221,6 +221,49 @@ test("no repository open -> lock.state 'unassigned' and repo is undefined", () =
   assert.equal(ui.repo, undefined);
 });
 
+// ==================== status inspection failure (see "STATUS INSPECTION FAILURE") ====================
+
+test("STATUS INSPECTION FAILURE 1/3: no repo at all (status undefined, repo also undefined) -> lock.state 'unassigned', repo undefined (unchanged no-repository behavior)", () => {
+  const ui = buildRepoIdentityUiState({ liveIdentities: [PERSONAL], notes: [], isWorkspaceTrusted: true });
+  assert.equal(ui.lock.state, "unassigned");
+  assert.equal(ui.repo, undefined);
+});
+
+test("STATUS INSPECTION FAILURE 2/3: a real repo with a genuine unassigned LockStatus -> lock.state 'unassigned' (unchanged)", async () => {
+  const repo = await makeRepo();
+  const svc = service();
+  const repoRef = await svc.resolveRepository(repo.dir);
+  assert.ok(repoRef);
+  const status = await svc.getStatus(repoRef, [WORK]);
+  const ui = buildRepoIdentityUiState({ status, liveIdentities: [WORK], notes: [], isWorkspaceTrusted: true, repo: { id: repo.dir, name: "x" } });
+  assert.equal(ui.lock.state, "unassigned");
+  assert.ok(ui.repo, "a genuinely unassigned repository still carries its repo identity");
+});
+
+test("STATUS INSPECTION FAILURE 3/3: repo IS present but status is undefined (inspection threw, e.g. scan()'s getStatus failed) -> NEVER 'unassigned' — a needs_attention/inspection_failed state instead, with no claim of lock/unlock state", () => {
+  const ui = buildRepoIdentityUiState({
+    repo: { id: "repo-1", name: "acme" },
+    status: undefined,
+    liveIdentities: [PERSONAL],
+    notes: [],
+    isWorkspaceTrusted: true,
+  });
+  assert.notEqual(ui.lock.state, "unassigned", "inspection failing must never be reported as 'unassigned' — it proves nothing about whether an identity is locked");
+  assert.equal(ui.lock.state, "needs_attention");
+  assert.ok(ui.repo, "the repository is still named — this is not the no-repository case");
+  if (ui.lock.state === "needs_attention") {
+    assert.equal(ui.lock.cause, "inspection_failed");
+    assert.equal(ui.lock.repairAvailable, false, "repair is never implied by an inspection failure alone");
+    assert.equal(ui.lock.identity, undefined);
+  }
+  // The UI-facing DTO must never use "unassigned"/"unrestricted" wording for this case — asserted structurally
+  // (the DTO carries no free-text copy at all, only the `cause` enum the webview branches on), and the webview's
+  // own rendering of this cause is covered separately in productionWebview.test.ts.
+  const serialized = JSON.stringify(ui).toLowerCase();
+  assert.equal(serialized.includes("unrestricted"), false);
+  assert.equal(/"state":"unassigned"/.test(serialized), false);
+});
+
 test("identities list never leaks Shield internals, and incomplete identities are still listed with missing-field flags", () => {
   const ui = buildRepoIdentityUiState({ liveIdentities: [WORK_NO_LOGIN, PERSONAL], notes: [], isWorkspaceTrusted: true });
   assert.equal(ui.identities.length, 2);
