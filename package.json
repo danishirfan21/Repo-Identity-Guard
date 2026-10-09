@@ -145,7 +145,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "Notes (add, edit, delete, search, copy, export, import) work in untrusted workspaces — they are local data that is never executed. Assigning, changing, repairing or unlocking an identity lock installs or removes Git hooks, so those actions require Workspace Trust; legacy Shield installations are also only migrated once the workspace is trusted."
+      "description": "Notes (add, edit, delete, search, copy, export, import) work in untrusted workspaces — they are local data that is never executed. Assigning, changing, repairing or unlocking an identity lock installs or removes Git hooks, and using the assigned identity in Git config writes repository Git config, so all of those actions require Workspace Trust; legacy Shield installations are also only migrated once the workspace is trusted."
     }
   },
   "devDependencies": {
