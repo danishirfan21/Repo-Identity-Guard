@@ -34,6 +34,15 @@ export type NeedsAttentionCause =
   | "push_identity_unverifiable"
   | "identity_missing"
   | "repair_required"
+  /**
+   * The repository exists but its lock status could not be inspected
+   * (e.g. `getStatus` threw) — see "STATUS INSPECTION FAILURE" in the
+   * task spec. This is NEVER the same thing as `unassigned`: inspection
+   * failing proves nothing about whether an identity is actually locked,
+   * so the UI must not claim "No identity assigned" / "Git is
+   * unrestricted" for it.
+   */
+  | "inspection_failed"
   | "other";
 
 // ==================== identities ====================
@@ -127,7 +136,15 @@ export interface RepoIdentityUiState {
 
 export interface BuildUiStateInput {
   repo?: { id: string; name: string };
-  /** `undefined` only when `repo` is also undefined (no repository open at all). */
+  /**
+   * `undefined` in TWO distinct cases, told apart by whether `repo` is
+   * also set — see "STATUS INSPECTION FAILURE" in the task spec:
+   *  - `repo` also undefined: no repository is open at all → `unassigned`
+   *    (existing No-Repository behavior, unchanged).
+   *  - `repo` IS set: a repository exists but its lock status could not
+   *    be inspected (the engine's own `getStatus` threw) → this is never
+   *    mapped to `unassigned` — see cause `"inspection_failed"`.
+   */
   status?: LockStatus;
   /** The live (settings) identity list — used for the identity picker and to build `IdentitySummary`s with their full `trustedSshHostAliases`. */
   liveIdentities: Identity[];
@@ -220,7 +237,14 @@ export function buildRepoIdentityUiState(input: BuildUiStateInput): RepoIdentity
   const base = { identities, notes, isWorkspaceTrusted: input.isWorkspaceTrusted, repo: input.repo };
 
   if (!input.status) {
-    return { ...base, lock: { state: "unassigned" } };
+    // No `status` means EITHER no repository is open at all (`repo` also
+    // undefined — the existing, unchanged "unassigned" behavior) OR a
+    // repository IS open but its lock status could not be inspected. The
+    // second case must never be reported as "unassigned": inspection
+    // failing proves nothing about whether an identity is locked here —
+    // see "STATUS INSPECTION FAILURE" in the task spec.
+    if (!input.repo) return { ...base, lock: { state: "unassigned" } };
+    return { ...base, lock: { state: "needs_attention", cause: "inspection_failed", repairAvailable: false } };
   }
   const { status } = input;
   const enforcement = status.enforcement;

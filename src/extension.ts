@@ -116,6 +116,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return resolved?.entry;
   }
 
+  /**
+   * Host-side defense against the webview targeting race: the UI shows
+   * repo A; the active editor switches to repo B; the debounced scan/state
+   * push hasn't reached the webview yet; the user clicks a repo-A action.
+   * `repoId` is the id the VISIBLE SCREEN was bound to (never a picker —
+   * see `src/ui/protocol.ts`); this resolves the ACTUAL current repository
+   * right now and returns it ONLY when it still matches `repoId`. A
+   * mismatch returns `undefined` and the caller must reject the request
+   * (never act on A, the stale target, and never act on B, the resolver's
+   * current answer, either) with `{ code: "repository_changed" }` and
+   * refresh the webview's authoritative state — see `repositoryChanged()`.
+   *
+   * Once a caller has a validated target, it must pass that SAME
+   * `RepoEntry` explicitly into whatever it calls next (`assignIdentity`,
+   * `unlockRepository`, `noteMutation`, …) rather than letting that
+   * function fall back to its own `commandTarget()` default — a second
+   * resolution deeper in the same request would reopen the exact race
+   * this function exists to close.
+   */
+  function validateRepoTarget(repoId: string): RepoEntry | undefined {
+    const current = commandTarget();
+    return current && current.id === repoId ? current : undefined;
+  }
+
+  const REPOSITORY_CHANGED_RESULT: OperationResult = {
+    ok: false,
+    code: "repository_changed",
+    message: "The current repository changed. Please try again.",
+  };
+
+  /** Called when `validateRepoTarget` rejects a stale repo-scoped request. Mutates nothing; only pushes the webview's authoritative state so it can reconcile (e.g. drop a now-stale screen) on its own. */
+  function repositoryChanged(): OperationResult {
+    refreshViews();
+    return REPOSITORY_CHANGED_RESULT;
+  }
+
   function toState(entry: RepoEntry): RepoIdentityState {
     const notes = memoryStore.getMemory(entry.memoryKeys).notes;
     if (!entry.status) {
@@ -627,9 +663,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // ==================== notes actions (no Workspace Trust needed: local data only, never executed) ====================
 
-  async function noteMutation(mutate: (keys: MemoryKeys) => Promise<unknown>): Promise<OperationResult> {
-    const entry = commandTarget();
-    if (!entry) return { ok: false, message: "Open a Git repository first." };
+  /**
+   * `entry` must already be a validated target (see `validateRepoTarget`)
+   * — this never re-resolves the current repository itself, so a caller
+   * that validated repo A at the start of a request stays bound to A for
+   * that whole request, even if the active editor moves on in the
+   * meantime.
+   */
+  async function noteMutation(entry: RepoEntry, mutate: (keys: MemoryKeys) => Promise<unknown>): Promise<OperationResult> {
     try {
       await mutate(entry.memoryKeys);
     } catch (error) {
@@ -656,7 +697,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     await vscode.window.showInformationMessage(`Exported notes to ${uri.fsPath}`);
   }
 
-  async function exportNotes(all: boolean): Promise<void> {
+  /**
+   * `repoId` is only meaningful (and required) when `all` is false —
+   * exportAllNotes covers every repository and is never repo-scoped. For
+   * the single-repo export, the target is validated and captured HERE,
+   * before anything async, and used throughout: see
+   * `validateRepoTarget`'s doc comment on why a validated target must not
+   * be re-resolved later in the same request (the save dialog below is
+   * async, and the user could switch repos while it's open).
+   */
+  async function exportNotes(all: boolean, repoId?: string): Promise<void> {
     if (all) {
       if (repos.length === 0) {
         await vscode.window.showInformationMessage("No repositories detected to export.");
@@ -670,14 +720,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       return;
     }
-    const entry = commandTarget();
-    if (!entry) return;
+    const entry = repoId !== undefined ? validateRepoTarget(repoId) : undefined;
+    if (!entry) {
+      if (repoId !== undefined) {
+        refreshViews();
+        vscode.window.setStatusBarMessage("Repo Identity Guard: the current repository changed. Please try again.", 4000);
+      }
+      return;
+    }
     await writeExport(memoryStore.exportMemory(entry.memoryKeys, entry.repoName), `repo-notes-${entry.repoName.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 60) || "repo"}.json`);
   }
 
-  async function importNotes(): Promise<void> {
-    const entry = commandTarget();
-    if (!entry) return;
+  /**
+   * The target is validated and captured BEFORE the native open dialog —
+   * never re-resolved afterward — because the dialog is async and the
+   * user could switch repos while it's open (see `validateRepoTarget`).
+   */
+  async function importNotes(repoId: string): Promise<void> {
+    const entry = validateRepoTarget(repoId);
+    if (!entry) {
+      refreshViews();
+      vscode.window.setStatusBarMessage("Repo Identity Guard: the current repository changed. Please try again.", 4000);
+      return;
+    }
     const uris = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { "Repo Notes export": ["json"] }, title: "Import Repo Notes" });
     if (!uris || uris.length === 0) return;
 
@@ -766,39 +831,80 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   function buildProductionActions(): ProductionSidebarActions {
     return {
       getState: () => buildProductionState(),
-      assignIdentity: async (identityId) => toOperationResult(await assignIdentity(identityId, "assign", commandTarget(), { silent: true })),
-      changeIdentity: async (identityId) => toOperationResult(await assignIdentity(identityId, "change", commandTarget(), { silent: true })),
-      unlockRepository: async () => toOperationResult(await unlockRepository(commandTarget(), { silent: true })),
-      repairLock: async () => toOperationResult(await repairLock(commandTarget(), { silent: true })),
-      verifyLock: async () => {
-        const result = await checkLock({ silent: true, target: commandTarget() });
+      // Every repo-scoped action below validates `repoId` against the
+      // ACTUAL current repository FIRST (see `validateRepoTarget`) and,
+      // once validated, passes that SAME `RepoEntry` explicitly into
+      // whatever it calls next — never `commandTarget()` again in the
+      // same request (see that function's doc comment on why a second
+      // resolution would reopen the exact race this closes).
+      assignIdentity: async (repoId, identityId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        return toOperationResult(await assignIdentity(identityId, "assign", target, { silent: true }));
+      },
+      changeIdentity: async (repoId, identityId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        return toOperationResult(await assignIdentity(identityId, "change", target, { silent: true }));
+      },
+      unlockRepository: async (repoId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        return toOperationResult(await unlockRepository(target, { silent: true }));
+      },
+      repairLock: async (repoId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        return toOperationResult(await repairLock(target, { silent: true }));
+      },
+      verifyLock: async (repoId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        const result = await checkLock({ silent: true, target });
         return { ok: result.ok, message: result.message };
       },
-      applyAssignedIdentity: async () => {
-        const result = await applyIdentityToGitConfig(commandTarget(), { silent: true });
+      applyAssignedIdentity: async (repoId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        const result = await applyIdentityToGitConfig(target, { silent: true });
         return { ok: result.ok, message: result.message };
       },
       saveIdentity: (identity) => webviewSaveIdentity(identity),
       deleteIdentity: (identityId) => webviewDeleteIdentity(identityId),
-      addNote: (text) => noteMutation((keys) => memoryStore.addNote(keys, text)),
-      updateNote: (noteId, text) => noteMutation((keys) => memoryStore.updateNote(keys, noteId, text)),
-      deleteNote: (noteId) => noteMutation((keys) => memoryStore.removeNote(keys, noteId)),
-      togglePinNote: (noteId) => noteMutation((keys) => memoryStore.togglePin(keys, noteId)),
-      copyNote: async (noteId) => {
-        const entry = commandTarget();
-        if (!entry) return;
-        const text = memoryStore.getNoteText(entry.memoryKeys, noteId);
-        if (text === undefined) return;
+      addNote: async (repoId, text) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        return noteMutation(target, (keys) => memoryStore.addNote(keys, text));
+      },
+      updateNote: async (repoId, noteId, text) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        return noteMutation(target, (keys) => memoryStore.updateNote(keys, noteId, text));
+      },
+      deleteNote: async (repoId, noteId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        return noteMutation(target, (keys) => memoryStore.removeNote(keys, noteId));
+      },
+      togglePinNote: async (repoId, noteId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        return noteMutation(target, (keys) => memoryStore.togglePin(keys, noteId));
+      },
+      copyNote: async (repoId, noteId) => {
+        const target = validateRepoTarget(repoId);
+        if (!target) return repositoryChanged();
+        const text = memoryStore.getNoteText(target.memoryKeys, noteId);
+        if (text === undefined) return { ok: false, message: "That note no longer exists." };
         try {
           await vscode.env.clipboard.writeText(text);
         } catch (error) {
-          // copyNote is fire-and-forget in the protocol (no requestId/ack) —
-          // a concise, non-modal fallback is the best available feedback.
-          vscode.window.setStatusBarMessage(`Repo Identity Guard: couldn't copy the note (${errorMessage(error)}).`, 4000);
+          return { ok: false, message: `Couldn't copy the note (${errorMessage(error)}).` };
         }
+        return { ok: true };
       },
-      importNotes: () => importNotes(),
-      exportNotes: () => exportNotes(false),
+      importNotes: (repoId) => importNotes(repoId),
+      exportNotes: (repoId) => exportNotes(false, repoId),
       openFolder: async () => {
         await vscode.commands.executeCommand("vscode.openFolder");
       },

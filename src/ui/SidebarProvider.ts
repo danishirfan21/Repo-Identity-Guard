@@ -20,22 +20,34 @@ import { PRODUCTION_VIEW_JS } from "../webview/client/productionView";
  */
 export interface ProductionSidebarActions {
   getState(): Promise<RepoIdentityUiState>;
-  assignIdentity(identityId: string): Promise<OperationResult>;
-  changeIdentity(identityId: string): Promise<OperationResult>;
-  unlockRepository(): Promise<OperationResult>;
-  repairLock(): Promise<OperationResult>;
-  verifyLock(): Promise<OperationResult>;
-  applyAssignedIdentity(): Promise<OperationResult>;
+  /**
+   * Every repo-scoped action below takes the `repoId` the webview sent —
+   * the repository id the VISIBLE SCREEN was bound to, never a picker
+   * (see `src/ui/protocol.ts`). Implementations must validate it against
+   * the ACTUAL current repository before doing anything (see
+   * `validateRepoTarget` in `extension.ts`) and must reject a mismatch
+   * with `{ ok: false, code: "repository_changed" }` rather than silently
+   * acting on either repository — this interface only carries the id
+   * through; it is not itself the enforcement point.
+   */
+  assignIdentity(repoId: string, identityId: string): Promise<OperationResult>;
+  changeIdentity(repoId: string, identityId: string): Promise<OperationResult>;
+  unlockRepository(repoId: string): Promise<OperationResult>;
+  repairLock(repoId: string): Promise<OperationResult>;
+  verifyLock(repoId: string): Promise<OperationResult>;
+  applyAssignedIdentity(repoId: string): Promise<OperationResult>;
+  /** Not repo-scoped — identity-settings CRUD, no `repoId`. */
   saveIdentity(identity: unknown): Promise<OperationResult>;
   deleteIdentity(identityId: string): Promise<OperationResult>;
-  addNote(text: string): Promise<OperationResult>;
-  updateNote(noteId: string, text: string): Promise<OperationResult>;
-  deleteNote(noteId: string): Promise<OperationResult>;
-  togglePinNote(noteId: string): Promise<OperationResult>;
-  copyNote(noteId: string): Promise<void>;
-  importNotes(): Promise<void>;
-  exportNotes(): Promise<void>;
-  /** The real VS Code "open folder" flow, for the No-Repository screen's one action. */
+  addNote(repoId: string, text: string): Promise<OperationResult>;
+  updateNote(repoId: string, noteId: string, text: string): Promise<OperationResult>;
+  deleteNote(repoId: string, noteId: string): Promise<OperationResult>;
+  togglePinNote(repoId: string, noteId: string): Promise<OperationResult>;
+  /** Ack-based (see "COPY MUST NOT ANNOUNCE SUCCESS BEFORE SUCCESS"): resolves only after the clipboard write actually succeeds or fails. */
+  copyNote(repoId: string, noteId: string): Promise<OperationResult>;
+  importNotes(repoId: string): Promise<void>;
+  exportNotes(repoId: string): Promise<void>;
+  /** The real VS Code "open folder" flow, for the No-Repository screen's one action — not repo-scoped (there is no repository yet). */
   openFolder(): Promise<void>;
 }
 
@@ -77,22 +89,22 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
         await this.postState();
         return;
       case "assignIdentity":
-        await this.runOperation(message.requestId, () => this.actions.assignIdentity(message.identityId));
+        await this.runOperation(message.requestId, () => this.actions.assignIdentity(message.repoId, message.identityId));
         return;
       case "changeIdentity":
-        await this.runOperation(message.requestId, () => this.actions.changeIdentity(message.identityId));
+        await this.runOperation(message.requestId, () => this.actions.changeIdentity(message.repoId, message.identityId));
         return;
       case "unlockRepository":
-        await this.runOperation(message.requestId, () => this.actions.unlockRepository());
+        await this.runOperation(message.requestId, () => this.actions.unlockRepository(message.repoId));
         return;
       case "repairLock":
-        await this.runOperation(message.requestId, () => this.actions.repairLock());
+        await this.runOperation(message.requestId, () => this.actions.repairLock(message.repoId));
         return;
       case "verifyLock":
-        await this.runOperation(message.requestId, () => this.actions.verifyLock());
+        await this.runOperation(message.requestId, () => this.actions.verifyLock(message.repoId));
         return;
       case "applyAssignedIdentity":
-        await this.runOperation(message.requestId, () => this.actions.applyAssignedIdentity());
+        await this.runOperation(message.requestId, () => this.actions.applyAssignedIdentity(message.repoId));
         return;
       case "saveIdentity":
         await this.runOperation(message.requestId, () => this.actions.saveIdentity(message.identity));
@@ -101,25 +113,25 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
         await this.runOperation(message.requestId, () => this.actions.deleteIdentity(message.identityId));
         return;
       case "addNote":
-        await this.runOperation(message.requestId, () => this.actions.addNote(message.text));
+        await this.runOperation(message.requestId, () => this.actions.addNote(message.repoId, message.text));
         return;
       case "updateNote":
-        await this.runOperation(message.requestId, () => this.actions.updateNote(message.noteId, message.text));
+        await this.runOperation(message.requestId, () => this.actions.updateNote(message.repoId, message.noteId, message.text));
         return;
       case "deleteNote":
-        await this.runOperation(message.requestId, () => this.actions.deleteNote(message.noteId));
+        await this.runOperation(message.requestId, () => this.actions.deleteNote(message.repoId, message.noteId));
         return;
       case "togglePinNote":
-        await this.runOperation(message.requestId, () => this.actions.togglePinNote(message.noteId));
+        await this.runOperation(message.requestId, () => this.actions.togglePinNote(message.repoId, message.noteId));
         return;
       case "copyNote":
-        await this.actions.copyNote(message.noteId);
+        await this.runOperation(message.requestId, () => this.actions.copyNote(message.repoId, message.noteId));
         return;
       case "importNotes":
-        await this.actions.importNotes();
+        await this.actions.importNotes(message.repoId);
         return;
       case "exportNotes":
-        await this.actions.exportNotes();
+        await this.actions.exportNotes(message.repoId);
         return;
       case "openFolder":
         await this.actions.openFolder();

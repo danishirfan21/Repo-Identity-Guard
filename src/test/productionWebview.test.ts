@@ -489,6 +489,7 @@ test("locked: 'Change identity' lists every OTHER identity (never the currently 
   assert.equal(view.headerTitle(), "Assign identity");
   view.button("Lock repository")!.dispatch("click");
   assert.equal(view.lastPosted("changeIdentity")?.identityId, "personal");
+  assert.equal(view.lastPosted("changeIdentity")?.repoId, "repo-1", "the message carries the repoId the screen was bound to");
   assert.equal(view.lastPosted("assignIdentity"), undefined, "a repository that is already locked must send changeIdentity, never assignIdentity");
 });
 
@@ -508,11 +509,12 @@ test("unlock: requires an inline confirmation (not an immediate action), and onl
   confirmButtons[confirmButtons.length - 1]!.dispatch("click");
   const msg = view.lastPosted("unlockRepository")!;
   assert.ok(typeof msg.requestId === "string" && msg.requestId.length > 0);
+  assert.equal(msg.repoId, "repo-1", "the message carries the repoId the screen was bound to");
   view.ack(msg.requestId as string, { ok: true });
   assert.match(view.document.app.textContent, /unlocked/);
 });
 
-test("verify lock: available only when locked, via the overflow menu, posts verifyLock and toasts the result without changing the screen", () => {
+test("verify lock: available only when locked, via the overflow menu, posts verifyLock (with repoId) and toasts the result without changing the screen", () => {
   const view = loadView();
   pushState(view, uiState()); // unassigned
   openIdentityLockRow(view);
@@ -522,6 +524,7 @@ test("verify lock: available only when locked, via the overflow menu, posts veri
   view.find((el) => el.getAttribute("aria-label") === "More Identity Lock actions")[0]!.dispatch("click");
   view.find((el) => el.getAttribute("role") === "menuitem" && el.textContent === "Verify lock")[0]!.dispatch("click");
   const msg = view.lastPosted("verifyLock")!;
+  assert.equal(msg.repoId, "repo-1");
   view.ack(msg.requestId as string, { ok: true, message: "acme is locked to Work. The push account is verified." });
   assert.equal(view.headerTitle(), "Identity Lock");
   assert.match(view.document.app.textContent, /push account is verified/);
@@ -547,6 +550,7 @@ test("needs_attention / git_identity_mismatch: shows effective vs expected email
   const applyButton = view.button("Use Work identity")!;
   applyButton.dispatch("click");
   const msg = view.lastPosted("applyAssignedIdentity")!;
+  assert.equal(msg.repoId, "repo-1", "the message carries the repoId the screen was bound to");
   assert.ok(view.button("Applying…"), "the button shows a loading label while the request is pending");
 
   // The ack arrives, but no new `state` push does — this is the critical
@@ -607,6 +611,7 @@ test("repair: lists the engine's own reasons verbatim, and a failed repair shows
 
   view.button("Repair")!.dispatch("click");
   const msg = view.lastPosted("repairLock")!;
+  assert.equal(msg.repoId, "repo-1", "the message carries the repoId the screen was bound to");
   view.ack(msg.requestId as string, { ok: false, message: "A foreign hook still occupies pre-push." });
   assert.match(view.document.app.textContent, /Repair failed/);
   assert.ok(view.button("Try again"));
@@ -662,6 +667,7 @@ test("assignment confirmation: assigning from unassigned sends assignIdentity; w
   view.find((el) => el.tagName === "button" && el.textContent.indexOf("Work") !== -1)[0]!.dispatch("click");
   view.button("Lock repository")!.dispatch("click");
   assert.equal(view.lastPosted("assignIdentity")?.identityId, "work");
+  assert.equal(view.lastPosted("assignIdentity")?.repoId, "repo-1", "the message carries the repoId the screen was bound to");
 });
 
 test("assignment confirmation: on success, pops back exactly to Identity Lock (not reset to the main screen) and toasts; on failure, stays put with a message", () => {
@@ -932,6 +938,7 @@ test("add note draft: survives every unrelated state push and a failed save, and
 
   view.button("Add note")!.dispatch("click"); // the "Add note" submit button in the editor footer
   let msg = view.posted.filter((m) => m.type === "addNote").at(-1)!;
+  assert.equal(msg.repoId, "repo-1", "the message carries the repoId the screen was bound to");
   // The note editor's failure banner is a fixed, generic message (unlike
   // the identity form, which does surface route.saveError.message) — the
   // backend's specific `message` is accepted here only to prove it does
@@ -976,7 +983,7 @@ test("edit note draft: Ctrl+Enter saves; Escape with no changes leaves immediate
   editor3 = view.document.getElementById("note-editor")!;
   editor3.dispatch("keydown", { key: "Enter", ctrlKey: true, target: editor3 });
   const msg = view.lastPosted("updateNote")!;
-  assert.deepEqual({ noteId: msg.noteId, text: msg.text }, { noteId: "n1", text: "original edited" });
+  assert.deepEqual({ repoId: msg.repoId, noteId: msg.noteId, text: msg.text }, { repoId: "repo-1", noteId: "n1", text: "original edited" });
 });
 
 test("note editor: Save is disabled for empty/whitespace-only text, and the empty-text addNote message is never sent", () => {
@@ -992,16 +999,33 @@ test("note editor: Save is disabled for empty/whitespace-only text, and the empt
   assert.equal(view.button("Add note", view.document.app)!.disabled, true);
 });
 
-test("copy: posts copyNote by id with no requestId (fire-and-forget), shows an immediate '✓ Copied' label, and never runs the note text", () => {
+test("copy: posts copyNote with repoId, noteId AND a requestId, and shows '✓ Copied' only AFTER the ack reports ok:true — never optimistically on click", () => {
   const view = loadView();
   pushState(view, uiState({ notes: [note("n1", "npm run deploy")] }));
   openRepoNotes(view);
   view.button("Copy")!.dispatch("click");
-  assert.deepEqual(view.lastPosted("copyNote"), { type: "copyNote", noteId: "n1" });
-  assert.match(view.document.app.textContent, /Copied/);
+  const msg = view.lastPosted("copyNote")!;
+  assert.equal(msg.repoId, "repo-1");
+  assert.equal(msg.noteId, "n1");
+  assert.ok(typeof msg.requestId === "string" && msg.requestId.length > 0, "copyNote is now ack-based, not fire-and-forget");
+  assert.equal(view.document.app.textContent.includes("✓ Copied"), false, "must not show success before the host confirms the clipboard write succeeded");
   assert.equal(view.find((el) => el.tagName === "button" && /run|exec|terminal/i.test(el.textContent)).length, 0);
+
+  view.ack(msg.requestId as string, { ok: true });
+  assert.match(view.document.app.textContent, /✓ Copied/);
   view.runTimers();
   assert.equal(view.document.app.textContent.includes("✓ Copied"), false, "the 'Copied' label reverts after its timeout");
+});
+
+test("copy: when the host reports ok:false (e.g. the clipboard write failed), no '✓ Copied' is ever shown — only a failure toast", () => {
+  const view = loadView();
+  pushState(view, uiState({ notes: [note("n1", "npm run deploy")] }));
+  openRepoNotes(view);
+  view.button("Copy")!.dispatch("click");
+  const msg = view.lastPosted("copyNote")!;
+  view.ack(msg.requestId as string, { ok: false, message: "Couldn't copy the note (clipboard unavailable)." });
+  assert.equal(view.document.app.textContent.includes("✓ Copied"), false);
+  assert.match(view.document.app.textContent, /Couldn't copy the note/);
 });
 
 test("pin/unpin and delete: both carry a requestId and ack correctly; delete has a per-card inline confirmation", () => {
@@ -1012,6 +1036,7 @@ test("pin/unpin and delete: both carry a requestId and ack correctly; delete has
   view.find((el) => el.getAttribute("role") === "menuitem" && el.textContent === "Pin")[0]!.dispatch("click");
   const pinMsg = view.lastPosted("togglePinNote")!;
   assert.equal(pinMsg.noteId, "n1");
+  assert.equal(pinMsg.repoId, "repo-1", "the message carries the repoId the screen was bound to");
   assert.ok(typeof pinMsg.requestId === "string");
 
   view.find((el) => el.getAttribute("aria-label") === "More note actions")[0]!.dispatch("click");
@@ -1025,21 +1050,22 @@ test("pin/unpin and delete: both carry a requestId and ack correctly; delete has
   view.button("Delete")!.dispatch("click");
   const delMsg = view.lastPosted("deleteNote")!;
   assert.equal(delMsg.noteId, "n1");
+  assert.equal(delMsg.repoId, "repo-1", "the message carries the repoId the screen was bound to");
   view.ack(delMsg.requestId as string, { ok: true });
   assert.match(view.document.app.textContent, /Note deleted/);
 });
 
-test("export/import/about: post with no payload at all, and About shows the privacy line as a toast", () => {
+test("export/import/about: post with the bound repoId and nothing else (no requestId — still fire-and-forget), and About shows the privacy line as a toast", () => {
   const view = loadView();
   pushState(view, uiState({ notes: [note("n1", "x")] }));
   openRepoNotes(view);
   view.find((el) => el.getAttribute("aria-label") === "More Repo Notes actions")[0]!.dispatch("click");
   view.find((el) => el.getAttribute("role") === "menuitem" && el.textContent === "Export notes")[0]!.dispatch("click");
-  assert.deepEqual(view.lastPosted("exportNotes"), { type: "exportNotes" });
+  assert.deepEqual(view.lastPosted("exportNotes"), { type: "exportNotes", repoId: "repo-1" });
 
   view.find((el) => el.getAttribute("aria-label") === "More Repo Notes actions")[0]!.dispatch("click");
   view.find((el) => el.getAttribute("role") === "menuitem" && el.textContent === "Import notes")[0]!.dispatch("click");
-  assert.deepEqual(view.lastPosted("importNotes"), { type: "importNotes" });
+  assert.deepEqual(view.lastPosted("importNotes"), { type: "importNotes", repoId: "repo-1" });
 
   view.find((el) => el.getAttribute("aria-label") === "More Repo Notes actions")[0]!.dispatch("click");
   view.find((el) => el.getAttribute("role") === "menuitem" && el.textContent === "About Repo Notes")[0]!.dispatch("click");
@@ -1080,6 +1106,7 @@ test("a late assignIdentity ack arriving AFTER a repo switch (and the resulting 
   view.find((el) => el.tagName === "button" && el.textContent.indexOf("Work") !== -1)[0]!.dispatch("click");
   view.button("Lock repository")!.dispatch("click");
   const msg = view.lastPosted("assignIdentity")!;
+  assert.equal(msg.repoId, "repo-A", "the wire message carries the repoId the screen was bound to when it was sent, not whatever is current later");
 
   pushState(view, uiState({ repo: { id: "repo-B", name: "widgets" } }));
   assert.doesNotThrow(() => view.ack(msg.requestId as string, { ok: true }));

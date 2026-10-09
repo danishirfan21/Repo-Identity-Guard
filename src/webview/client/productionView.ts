@@ -723,7 +723,7 @@ function renderIdentityLock(route) {
           {
             label: "Verify lock",
             onSelect: () => {
-              sendRequest({ type: "verifyLock" }, {
+              sendRequest({ type: "verifyLock", repoId: route.repoId }, {
                 kind: "verifyLock",
                 repoId: route.repoId,
                 onSuccess: (msg) => showToast(msg.message || "Lock verified", "success"),
@@ -785,7 +785,7 @@ function UnlockRow(route) {
       Button(
         "Unlock repository",
         () => {
-          sendRequest({ type: "unlockRepository" }, {
+          sendRequest({ type: "unlockRepository", repoId: route.repoId }, {
             kind: "unlockRepository",
             repoId: route.repoId,
             onSuccess: (msg) => {
@@ -844,6 +844,20 @@ function renderLocked(route, lock, repoName) {
 }
 
 function renderNeedsAttention(route, lock, repoName) {
+  if (lock.cause === "inspection_failed") {
+    // The repository exists but its lock status couldn't be inspected —
+    // never claim "unassigned"/"locked"/"repair" for this: none of those
+    // are proven. No raw error text, no Repair action (repair is only
+    // ever offered when the backend has structured state saying it
+    // applies, which an inspection failure is not).
+    return [
+      Card([
+        h("div", { className: "flex items-start gap-2.5" }, [IconTile("warning"), h("div", { className: "min-w-0 flex-1" }, [leaf("h2", "font-title-md text-title-md text-on-surface", "Needs attention"), StatusBadge("warning", "Needs attention")])]),
+        leaf("p", "mt-space-md font-body-sm text-body-sm text-on-surface-variant", "Repo Identity Guard couldn't inspect this repository right now."),
+        leaf("p", "mt-1 font-body-sm text-body-sm text-on-surface-variant", "Try again after checking that Git is available."),
+      ]),
+    ];
+  }
   const identity = lock.identity;
   if (!identity) {
     return [
@@ -898,7 +912,7 @@ function renderGitMismatch(route, lock, identity, repoName) {
       Button(
         pendingApply ? "Applying\\u2026" : "Use " + identity.label + " identity",
         () => {
-          sendRequest({ type: "applyAssignedIdentity" }, {
+          sendRequest({ type: "applyAssignedIdentity", repoId: route.repoId }, {
             kind: "applyAssignedIdentity",
             repoId: route.repoId,
             onSuccess: (msg) => showToast(msg.message || "Now using " + identity.label, "success"),
@@ -1040,7 +1054,7 @@ function renderRepair(route, lock, repoName) {
 
 function doRepair(route) {
   route.repairFailedMessage = null;
-  sendRequest({ type: "repairLock" }, {
+  sendRequest({ type: "repairLock", repoId: route.repoId }, {
     kind: "repairLock",
     repoId: route.repoId,
     onSuccess: (msg) => {
@@ -1123,7 +1137,7 @@ function renderAssignmentConfirm(route) {
           Button(
             pending ? "Locking\\u2026" : "Lock repository",
             () => {
-              sendRequest({ type: changing ? "changeIdentity" : "assignIdentity", identityId: identity.id }, {
+              sendRequest({ type: changing ? "changeIdentity" : "assignIdentity", repoId: route.repoId, identityId: identity.id }, {
                 kind: "assignIdentity",
                 repoId: route.repoId,
                 identityId: route.identityId,
@@ -1506,8 +1520,8 @@ function renderRepoNotes(route) {
   headerActions.push(
     OverflowMenu(
       [
-        { label: "Export notes", onSelect: () => post({ type: "exportNotes" }) },
-        { label: "Import notes", onSelect: () => post({ type: "importNotes" }) },
+        { label: "Export notes", onSelect: () => post({ type: "exportNotes", repoId: route.repoId }) },
+        { label: "Import notes", onSelect: () => post({ type: "importNotes", repoId: route.repoId }) },
         { label: "About Repo Notes", onSelect: () => showToast(PRIVACY_LINE, "info") },
       ],
       "More Repo Notes actions",
@@ -1621,8 +1635,9 @@ function renderNoteCard(route, note) {
           Button(
             pendingDelete ? "Deleting\\u2026" : "Delete",
             () => {
-              sendRequest({ type: "deleteNote", noteId: note.id }, {
+              sendRequest({ type: "deleteNote", repoId: route.repoId, noteId: note.id }, {
                 kind: "deleteNote",
+                repoId: route.repoId,
                 noteId: note.id,
                 onSuccess: () => {
                   route.confirmDeleteId = null;
@@ -1643,15 +1658,16 @@ function renderNoteCard(route, note) {
     children.push(
       h("div", { className: "mt-2 flex items-center gap-0.5 -mr-1.5" }, [
         leaf("span", "mr-auto font-label-sm text-label-sm text-outline", timeLabel),
-        InlineAction(copied ? "\\u2713 Copied" : "Copy", () => copyNote(note), "Copy note"),
+        InlineAction(copied ? "\\u2713 Copied" : "Copy", () => copyNote(route, note), "Copy note"),
         InlineAction("Edit", () => navPush({ name: "editNote", repoId: route.repoId, noteId: note.id, text: note.text, original: note.text }), "Edit note"),
         OverflowMenu(
           [
             {
               label: note.pinned ? "Unpin" : "Pin",
               onSelect: () => {
-                sendRequest({ type: "togglePinNote", noteId: note.id }, {
+                sendRequest({ type: "togglePinNote", repoId: route.repoId, noteId: note.id }, {
                   kind: "togglePinNote",
+                  repoId: route.repoId,
                   noteId: note.id,
                   onFailure: (msg) => showToast(msg.message || "Couldn't update this note.", "info"),
                 });
@@ -1668,15 +1684,31 @@ function renderNoteCard(route, note) {
   return h("article", { className: "rounded-xl bg-surface-container border border-outline-variant/40 pt-2.5 pb-1.5 px-space-md hover:border-outline-variant transition-colors" }, children);
 }
 
-function copyNote(note) {
-  post({ type: "copyNote", noteId: note.id });
-  copiedNotes.set(note.id, true);
-  render();
-  window.setTimeout(() => {
-    copiedNotes.delete(note.id);
-    render();
-  }, 1500);
-  announceLive("Note copied to the clipboard.");
+/**
+ * Ack-based (see "COPY MUST NOT ANNOUNCE SUCCESS BEFORE SUCCESS"): the
+ * "\\u2713 Copied" label and the accessible success announcement are only
+ * ever shown once the host confirms the clipboard write actually
+ * succeeded — never optimistically on click. A failure gets its own
+ * concise, non-modal feedback instead.
+ */
+function copyNote(route, note) {
+  sendRequest({ type: "copyNote", repoId: route.repoId, noteId: note.id }, {
+    kind: "copyNote",
+    repoId: route.repoId,
+    noteId: note.id,
+    onSuccess: () => {
+      copiedNotes.set(note.id, true);
+      render();
+      window.setTimeout(() => {
+        copiedNotes.delete(note.id);
+        render();
+      }, 1500);
+      announceLive("Note copied to the clipboard.");
+    },
+    onFailure: (msg) => {
+      showToast(msg.message || "Couldn't copy this note.", "info");
+    },
+  });
 }
 
 /** aria-live region for transient status announcements (copy/save/errors) that may have no persistent visible text — see "ACCESSIBILITY". */
@@ -1711,7 +1743,7 @@ function renderNoteEditor(route) {
     route.saveFailed = false;
     const clean = route.text.replace(/^\\s*\\n/, "").replace(/\\s+$/, "");
     if (isEdit) {
-      sendRequest({ type: "updateNote", noteId: route.noteId, text: clean }, {
+      sendRequest({ type: "updateNote", repoId: route.repoId, noteId: route.noteId, text: clean }, {
         kind: "updateNote",
         repoId: route.repoId,
         noteId: route.noteId,
@@ -1725,7 +1757,7 @@ function renderNoteEditor(route) {
         },
       });
     } else {
-      sendRequest({ type: "addNote", text: clean }, {
+      sendRequest({ type: "addNote", repoId: route.repoId, text: clean }, {
         kind: "addNote",
         repoId: route.repoId,
         onSuccess: () => {
