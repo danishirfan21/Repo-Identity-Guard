@@ -163,7 +163,7 @@ test("PART 11 — the packaged VSIX contains everything the lock, notes and the 
       // Webview assets and the activity-bar icon.
       "extension/media/sidebar.css",
       "extension/resources/repo-id.svg",
-      "extension/out/webview/client/placeholderView.js",
+      "extension/out/webview/client/productionView.js",
       // Package metadata.
       "extension/package.json",
     ];

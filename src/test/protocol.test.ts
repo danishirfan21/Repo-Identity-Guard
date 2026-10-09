@@ -97,6 +97,11 @@ test("importNotes / exportNotes parse with no further fields (reachable from the
   assert.deepEqual(parseWebviewMessage({ type: "exportNotes" }), { type: "exportNotes" });
 });
 
+test("openFolder parses with no further fields and is listed in WEBVIEW_MESSAGE_TYPES", () => {
+  assert.deepEqual(parseWebviewMessage({ type: "openFolder" }), { type: "openFolder" });
+  assert.ok((WEBVIEW_MESSAGE_TYPES as readonly string[]).includes("openFolder"));
+});
+
 test("malformed input of every shape is dropped, never throws", () => {
   for (const bad of [null, undefined, 42, "a string", [], {}, { type: 123 }, { noType: true }]) {
     assert.doesNotThrow(() => parseWebviewMessage(bad));
@@ -113,7 +118,7 @@ test("operationRequiresTrust: only Git-mutating operations require Workspace Tru
 });
 
 test("operationRequiresTrust: notes, identity SETTINGS edits, and the read-only lock check never require Workspace Trust", () => {
-  for (const type of ["ready", "verifyLock", "saveIdentity", "deleteIdentity", "addNote", "updateNote", "deleteNote", "togglePinNote", "copyNote", "importNotes", "exportNotes"] as const) {
+  for (const type of ["ready", "verifyLock", "saveIdentity", "deleteIdentity", "addNote", "updateNote", "deleteNote", "togglePinNote", "copyNote", "importNotes", "exportNotes", "openFolder"] as const) {
     assert.equal(operationRequiresTrust(type), false, `${type} must not require trust`);
   }
 });

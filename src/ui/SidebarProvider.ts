@@ -1,19 +1,51 @@
 import * as crypto from "node:crypto";
 import * as vscode from "vscode";
-import { NoteMutationResult, SidebarActions, dispatchSidebarMessage } from "./sidebarMessages";
-import { PLACEHOLDER_VIEW_JS } from "../webview/client/placeholderView";
-import { SidebarModel, toWireState } from "./wireState";
+import { OperationResult, parseWebviewMessage } from "./protocol";
+import { RepoIdentityUiState } from "./productionState";
+import { PRODUCTION_VIEW_JS } from "../webview/client/productionView";
 
-export type { NoteMutationResult, SidebarActions } from "./sidebarMessages";
+/**
+ * Everything the production webview can ask the extension host to do.
+ * Every handler re-validates its own preconditions (current repository,
+ * Workspace Trust for anything that mutates Git hooks/config) — the
+ * webview is never trusted to have done so; see `parseWebviewMessage` for
+ * the runtime validation boundary this provider sits behind.
+ *
+ * Methods that correspond to a `requestId`-bearing `WebviewMessage`
+ * return an `OperationResult`, which this provider echoes back as an
+ * `operationResult` ACK — see "OPERATION RESULT RULE" in the task spec:
+ * `ok: true` must mean the backend operation succeeded AND the
+ * authoritative state has already been (or is about to be) refreshed via
+ * a separate `state` push.
+ */
+export interface ProductionSidebarActions {
+  getState(): Promise<RepoIdentityUiState>;
+  assignIdentity(identityId: string): Promise<OperationResult>;
+  changeIdentity(identityId: string): Promise<OperationResult>;
+  unlockRepository(): Promise<OperationResult>;
+  repairLock(): Promise<OperationResult>;
+  verifyLock(): Promise<OperationResult>;
+  applyAssignedIdentity(): Promise<OperationResult>;
+  saveIdentity(identity: unknown): Promise<OperationResult>;
+  deleteIdentity(identityId: string): Promise<OperationResult>;
+  addNote(text: string): Promise<OperationResult>;
+  updateNote(noteId: string, text: string): Promise<OperationResult>;
+  deleteNote(noteId: string): Promise<OperationResult>;
+  togglePinNote(noteId: string): Promise<OperationResult>;
+  copyNote(noteId: string): Promise<void>;
+  importNotes(): Promise<void>;
+  exportNotes(): Promise<void>;
+  /** The real VS Code "open folder" flow, for the No-Repository screen's one action. */
+  openFolder(): Promise<void>;
+}
 
-/** Placeholder sidebar host — see `src/webview/client/placeholderView.ts`. */
+/** The production Repo Identity Guard sidebar — see `src/webview/client/productionView.ts`. */
 export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined;
-  private model: SidebarModel | undefined;
 
   public constructor(
     private readonly extensionUri: vscode.Uri,
-    private readonly actions: SidebarActions,
+    private readonly actions: ProductionSidebarActions,
   ) {}
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -22,30 +54,105 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
     };
-    webviewView.webview.onDidReceiveMessage((message) => {
-      if (message && typeof message === "object" && (message as { type?: unknown }).type === "ready") {
-        this.postState();
-        return;
-      }
-      void dispatchSidebarMessage(this.actions, message ?? {}, (requestId, result) => this.postNoteResult(requestId, result));
-    });
+    webviewView.webview.onDidReceiveMessage((raw) => void this.handleMessage(raw));
     webviewView.webview.html = this.getHtml();
-    this.postState();
+    void this.postState();
   }
 
-  public update(model: SidebarModel): void {
-    this.model = model;
-    this.postState();
+  /** Called by extension.ts whenever the authoritative state may have changed (scan, mutation, config/trust change, active-editor change). */
+  public update(): void {
+    void this.postState();
   }
 
-  private postState(): void {
-    if (!this.view || !this.model) return;
-    void this.view.webview.postMessage({ type: "state", payload: toWireState(this.model) });
+  private async handleMessage(raw: unknown): Promise<void> {
+    // Runtime validation boundary: a stale/compromised/future-version
+    // webview can send anything, and TS types vouch for nothing at
+    // runtime — see "CSP/WEBVIEW SECURITY" in the task spec. A message
+    // that doesn't parse is silently dropped, never partially acted on.
+    const message = parseWebviewMessage(raw);
+    if (!message) return;
+
+    switch (message.type) {
+      case "ready":
+        await this.postState();
+        return;
+      case "assignIdentity":
+        await this.runOperation(message.requestId, () => this.actions.assignIdentity(message.identityId));
+        return;
+      case "changeIdentity":
+        await this.runOperation(message.requestId, () => this.actions.changeIdentity(message.identityId));
+        return;
+      case "unlockRepository":
+        await this.runOperation(message.requestId, () => this.actions.unlockRepository());
+        return;
+      case "repairLock":
+        await this.runOperation(message.requestId, () => this.actions.repairLock());
+        return;
+      case "verifyLock":
+        await this.runOperation(message.requestId, () => this.actions.verifyLock());
+        return;
+      case "applyAssignedIdentity":
+        await this.runOperation(message.requestId, () => this.actions.applyAssignedIdentity());
+        return;
+      case "saveIdentity":
+        await this.runOperation(message.requestId, () => this.actions.saveIdentity(message.identity));
+        return;
+      case "deleteIdentity":
+        await this.runOperation(message.requestId, () => this.actions.deleteIdentity(message.identityId));
+        return;
+      case "addNote":
+        await this.runOperation(message.requestId, () => this.actions.addNote(message.text));
+        return;
+      case "updateNote":
+        await this.runOperation(message.requestId, () => this.actions.updateNote(message.noteId, message.text));
+        return;
+      case "deleteNote":
+        await this.runOperation(message.requestId, () => this.actions.deleteNote(message.noteId));
+        return;
+      case "togglePinNote":
+        await this.runOperation(message.requestId, () => this.actions.togglePinNote(message.noteId));
+        return;
+      case "copyNote":
+        await this.actions.copyNote(message.noteId);
+        return;
+      case "importNotes":
+        await this.actions.importNotes();
+        return;
+      case "exportNotes":
+        await this.actions.exportNotes();
+        return;
+      case "openFolder":
+        await this.actions.openFolder();
+        return;
+      default:
+        return;
+    }
   }
 
-  private postNoteResult(requestId: unknown, result: NoteMutationResult): void {
-    if (!this.view || typeof requestId !== "string" || !requestId) return;
-    void this.view.webview.postMessage({ type: "noteResult", requestId, ok: result.ok, error: result.error });
+  private async runOperation(requestId: string, run: () => Promise<OperationResult>): Promise<void> {
+    let result: OperationResult;
+    try {
+      result = await run();
+    } catch (error) {
+      result = { ok: false, message: error instanceof Error ? error.message : String(error) };
+    }
+    this.postOperationResult(requestId, result);
+    // A state push always follows an operation result, success or
+    // failure, so the webview's own authoritative render reflects reality
+    // regardless of which message arrives first — see "OPERATION RESULT
+    // RULE" in the task spec.
+    await this.postState();
+  }
+
+  private async postState(): Promise<void> {
+    if (!this.view) return;
+    const payload = await this.actions.getState();
+    void this.view.webview.postMessage({ type: "state", payload });
+  }
+
+  private postOperationResult(requestId: string, result: OperationResult): void {
+    if (!this.view) return;
+    void this.view.webview.postMessage({ type: "operationResult", requestId, ...result });
   }
 
   private getHtml(): string {
@@ -65,7 +172,7 @@ export class RepoIdentitySidebarProvider implements vscode.WebviewViewProvider {
 <body>
 <main id="app"></main>
 <script nonce="${nonce}">
-${PLACEHOLDER_VIEW_JS}
+${PRODUCTION_VIEW_JS}
 </script>
 </body>
 </html>`;

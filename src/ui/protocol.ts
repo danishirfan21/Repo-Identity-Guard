@@ -4,11 +4,11 @@ import { RepoIdentityUiState } from "./productionState";
 
 /**
  * The production webview message protocol — see "GENERIC REQUEST/ACK
- * PROTOCOL" in the task spec. This generalizes the existing
- * `noteResult`/`requestId` design (see `src/ui/sidebarMessages.ts`, still
- * in production use by the placeholder webview and left untouched by this
- * phase) into ONE typed operation acknowledgement covering every mutation,
- * not just notes.
+ * PROTOCOL" in the task spec. This generalizes the placeholder webview's
+ * earlier `noteResult`/`requestId` design (that webview, and the
+ * `src/ui/sidebarMessages.ts` host-side dispatcher it used, are now removed
+ * in favor of this protocol) into ONE typed operation acknowledgement
+ * covering every mutation, not just notes.
  *
  * There is NO `selectRepo` message, and never will be one here — Repo
  * Identity Guard has no repository picker (see FROZEN PRODUCT RULES); the
@@ -41,7 +41,8 @@ export type WebviewMessage =
   | { type: "togglePinNote"; noteId: string; requestId: string }
   | { type: "copyNote"; noteId: string }
   | { type: "importNotes" }
-  | { type: "exportNotes" };
+  | { type: "exportNotes" }
+  | { type: "openFolder" };
 
 /** Every `WebviewMessage` variant's own `type` literal — used to keep the runtime validator exhaustive with the type union (see the `satisfies`-style check in `protocol.test.ts`). */
 export const WEBVIEW_MESSAGE_TYPES = [
@@ -61,6 +62,7 @@ export const WEBVIEW_MESSAGE_TYPES = [
   "copyNote",
   "importNotes",
   "exportNotes",
+  "openFolder",
 ] as const;
 
 /** Operations that mutate Git (hooks/config) and therefore require Workspace Trust — see "WORKSPACE TRUST" in the task spec. Everything else (notes; identity SETTINGS edits, which execute no repository code) does not. */
@@ -107,6 +109,7 @@ export function parseWebviewMessage(raw: unknown): WebviewMessage | undefined {
     case "copyNote":
     case "importNotes":
     case "exportNotes":
+    case "openFolder":
       if (m.type === "copyNote") return isNonEmptyString(m.noteId) ? { type: "copyNote", noteId: m.noteId } : undefined;
       return { type: m.type };
 

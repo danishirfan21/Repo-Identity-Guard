@@ -184,7 +184,7 @@ const SHIPPED_TEXT_FILES = [
   "src/shield/manager.ts",
   "src/shield/reasonCatalog.ts",
   "docs/IDENTITY_LOCK.md",
-  "src/webview/client/placeholderView.ts",
+  "src/webview/client/productionView.ts",
   "src/identity/identityLockService.ts",
   "resources/shield/shield-evaluate.sh",
 ];

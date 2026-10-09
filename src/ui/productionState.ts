@@ -5,12 +5,12 @@ import { Identity } from "../identity/types";
 import type { MemoryNote } from "../types";
 
 /**
- * The production-facing state contract for the (future) real UI — see
- * "PRODUCTION UI DTO" in the task spec. This is deliberately a SEPARATE
- * module from `src/ui/wireState.ts` (the existing placeholder webview's
- * wire format, still in production use and left untouched by this phase):
- * `RepoIdentityUiState` is the contract the NEXT phase wires the frozen UI
- * prototype onto, not something the placeholder consumes today.
+ * The production-facing state contract for the real UI — see "PRODUCTION
+ * UI DTO" in the task spec. This was originally a SEPARATE module from the
+ * placeholder webview's own wire format (`src/ui/wireState.ts`, now
+ * removed along with the placeholder it served); `RepoIdentityUiState` is
+ * the contract the production webview (`src/webview/client/productionView.ts`)
+ * is actually wired onto.
  *
  * The webview must NEVER see: `ShieldLifecycleState` ("off"/"active"/
  * "degraded"/"broken" — an enforcement-engine concept), raw

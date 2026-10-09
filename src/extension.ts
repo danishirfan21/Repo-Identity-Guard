@@ -2,6 +2,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { RepositoryRef } from "./identity/assignment";
 import { resolveCurrentRepo } from "./identity/currentRepo";
+import { checkEffectiveIdentity, EffectiveIdentityCheck } from "./identity/effectiveIdentityCheck";
+import { IdentityDraft } from "./identity/identityCrud";
 import { IdentityLockService, LockOperationResult, LockStatus } from "./identity/identityLockService";
 import { Identity, RepoIdentityState } from "./identity/types";
 import {
@@ -15,14 +17,17 @@ import { SafeActionRunner } from "./services/safeActionRunner";
 import { IdentityStatusBar } from "./statusBar";
 import {
   affectsRepoIdentityGuardConfig,
+  createIdentitySetting,
+  deleteIdentitySetting,
   getIdentities,
-  getIdentityList,
   getLegacyProfilesRaw,
   migrateLegacyProfilesToIdentities,
+  updateIdentitySetting,
 } from "./storage/configStore";
 import { MAX_IMPORT_FILE_BYTES, MemoryExport, MemoryKeys, MemoryLimitError, MemoryStore } from "./storage/memoryStore";
-import { NoteMutationResult, RepoIdentitySidebarProvider } from "./ui/SidebarProvider";
-import { SidebarModel } from "./ui/wireState";
+import { ProductionSidebarActions, RepoIdentitySidebarProvider } from "./ui/SidebarProvider";
+import { buildRepoIdentityUiState, RepoIdentityUiState } from "./ui/productionState";
+import { OperationResult } from "./ui/protocol";
 
 /**
  * Repo Identity Guard does two things:
@@ -30,11 +35,25 @@ import { SidebarModel } from "./ui/wireState";
  *  2. private per-repository notes (`MemoryStore`).
  *
  * This file only wires those into VS Code: repository discovery, Workspace
- * Trust gating, confirmations, commands, and the (placeholder) sidebar.
- * An unassigned repository is never touched — the only automatic Git
+ * Trust gating, confirmations, commands, and the production sidebar. An
+ * unassigned repository is never touched — the only automatic Git
  * mutations are removing/migrating a LEGACY Shield installation and
  * upgrading an identity lock from an earlier version in place (assignment
  * kept, pushes made fail-closed), and only in a trusted workspace.
+ *
+ * There are two distinct entry points into the same underlying operations:
+ *  - Command Palette commands, which have no webview and so still confirm
+ *    destructive/consequential actions with NATIVE VS Code dialogs
+ *    (`showWarningMessage`), exactly as before this phase;
+ *  - the production webview (`src/ui/SidebarProvider.ts` /
+ *    `src/webview/client/productionView.ts`), which shows its OWN
+ *    confirmation screens (Assign/Unlock) — see "ASSIGNMENT CONFIRMATION"
+ *    in the task spec. To avoid confirming twice, webview-driven calls
+ *    pass `{ silent: true }`, which skips ONLY the native "are you sure"
+ *    dialog; Workspace Trust enforcement (`requireTrust`) and the
+ *    foreign-hook-chaining decision (`confirmChainingForeignHooks`, a
+ *    separate, rare, meaningful decision kept as a native dialog on
+ *    purpose) are never skipped.
  */
 
 interface RepoEntry {
@@ -50,7 +69,8 @@ interface RepoEntry {
 }
 
 let repos: RepoEntry[] = [];
-let selectedId: string | undefined;
+/** The last repository `commandTarget()` resolved to — fed back in as `previousId` so switching to an unrelated file (an output panel, a diff view) doesn't make the UI jump to a different repository than the one the user was just working in (see `src/identity/currentRepo.ts` rule C). Not a user-facing selection: there is no repository picker. */
+let lastResolvedRepoId: string | undefined;
 let scanSequence = 0;
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 const repoWatchers = new Map<string, vscode.Disposable[]>();
@@ -79,75 +99,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   });
   const notifiedMigrations = new Set<string>();
 
-  const sidebarProvider = new RepoIdentitySidebarProvider(context.extensionUri, {
-    selectRepo: async (id) => {
-      if (repos.some((repo) => repo.id === id)) selectedId = id;
-      refreshViews();
-    },
-    // Sidebar actions always act on the repository the sidebar shows as
-    // selected — never on whatever repository the active editor happens to
-    // be in (that is the Command Palette's rule, see `commandTarget`).
-    assignIdentity: (identityId) => assignIdentity(identityId, "assign", selectedEntry()),
-    changeIdentity: (identityId) => assignIdentity(identityId, "change", selectedEntry()),
-    unlockRepository: () => unlockRepository(selectedEntry()),
-    repairLock: () => repairLock(selectedEntry()),
-    checkLock: () => checkLock({ target: selectedEntry() }),
-    applyIdentityToGitConfig: () => applyIdentityToGitConfig(selectedEntry()),
-    editIdentities: () => editIdentities(),
-
-    addNote: (text) => noteMutation((keys) => memoryStore.addNote(keys, text)),
-    updateNote: (id, text) => noteMutation((keys) => memoryStore.updateNote(keys, id, text)),
-    removeNote: async (id) => {
-      const entry = selectedEntry();
-      if (!entry) return;
-      const choice = await vscode.window.showWarningMessage("Delete this note? This can't be undone.", "Delete", "Cancel");
-      if (choice !== "Delete") return;
-      await noteMutation((keys) => memoryStore.removeNote(keys, id));
-    },
-    togglePinNote: async (id) => {
-      await noteMutation((keys) => memoryStore.togglePin(keys, id));
-    },
-    copyNote: async (id) => {
-      const entry = selectedEntry();
-      if (!entry) return;
-      const text = memoryStore.getNoteText(entry.memoryKeys, id);
-      if (text === undefined) return;
-      await vscode.env.clipboard.writeText(text);
-      await vscode.window.showInformationMessage("Note copied to the clipboard.");
-    },
-    exportNotes: () => exportNotes(false),
-    exportAllNotes: () => exportNotes(true),
-    importNotes: () => importNotes(),
-  });
-
-  context.subscriptions.push(statusBar);
-  context.subscriptions.push(vscode.window.registerWebviewViewProvider("repoIdentityGuard.statusView", sidebarProvider));
-
   // ==================== state ====================
-
-  // Unlike `commandTarget()`, this never lets the active editor override an
-  // explicit sidebar selection — the (legacy, placeholder-only) sidebar
-  // repository picker still works exactly as before. The production
-  // contract being built in this phase has no such picker at all (see
-  // `src/identity/currentRepo.ts`); this function is not part of it.
-  function selectedEntry(): RepoEntry | undefined {
-    return repos.find((repo) => repo.id === selectedId) ?? repos[0];
-  }
 
   /**
    * The ONE repository the sidebar and every Command Palette command act
-   * on right now — see `src/identity/currentRepo.ts` for the rule. This is
-   * also `selectedEntry()`'s and `commandTargetFrom()`'s single shared
-   * implementation: there is no repository picker, so "the sidebar's
-   * selection" and "the command's target" are the same resolved value.
+   * on right now — see `src/identity/currentRepo.ts` for the rule.
    */
   function commandTarget(list: RepoEntry[] = repos): RepoEntry | undefined {
     const activeFile = vscode.window.activeTextEditor?.document;
-    return resolveCurrentRepo({
+    const resolved = resolveCurrentRepo({
       repos: list.map((entry) => ({ id: entry.id, repoRoot: entry.ref.repoRoot, entry })),
       activeFilePath: activeFile?.uri.scheme === "file" ? activeFile.uri.fsPath : undefined,
-      previousId: selectedId,
-    })?.entry;
+      previousId: lastResolvedRepoId,
+    });
+    lastResolvedRepoId = resolved?.id;
+    return resolved?.entry;
   }
 
   function toState(entry: RepoEntry): RepoIdentityState {
@@ -180,28 +146,61 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
   }
 
-  function buildModel(): SidebarModel {
-    const list = getIdentityList();
-    return {
-      repos: repos.map((entry) => ({ id: entry.id, folderName: entry.folderName, state: toState(entry) })),
-      selectedId: selectedEntry()?.id,
-      identities: list.identities,
-      identityProblems: list.rejected.map((r) => `Identity #${r.index + 1} in settings is ignored: ${r.errors.join(" ")}`),
+  /**
+   * The production UI's DTO for whatever repository is current right now
+   * — see `src/ui/productionState.ts`. The passive effective-identity
+   * check is only ever run for a FULLY active lock (see that module's
+   * doc comment), and only against the CURRENT repository: it is a cheap
+   * `git var` read, not a network call, but there is no reason to pay it
+   * for every other known repository on each refresh.
+   */
+  async function buildProductionState(): Promise<RepoIdentityUiState> {
+    const identities = getIdentities();
+    const entry = commandTarget();
+    if (!entry) {
+      return buildRepoIdentityUiState({ liveIdentities: identities, notes: [], isWorkspaceTrusted: vscode.workspace.isTrusted });
+    }
+    const notes = memoryStore.getMemory(entry.memoryKeys).notes;
+    let passiveIdentityCheck: EffectiveIdentityCheck | undefined;
+    if (entry.status?.enforcement.state === "active") {
+      const snapshot = entry.status.inspection.policySnapshot;
+      const view = entry.status.assignmentView;
+      const expectedGitEmail = snapshot?.expectedGitEmail ?? view?.gitEmail;
+      const expectedGitName = snapshot?.expectedGitName ?? view?.gitName;
+      if (expectedGitEmail) {
+        passiveIdentityCheck = await checkEffectiveIdentity(entry.ref.repoRoot, { gitEmail: expectedGitEmail, gitName: expectedGitName }).catch(
+          (): EffectiveIdentityCheck => ({ inspectionFailed: true, matches: false, effectiveAuthor: {}, effectiveCommitter: {}, authorViolates: false, committerViolates: false }),
+        );
+      }
+    }
+    return buildRepoIdentityUiState({
+      repo: { id: entry.id, name: entry.repoName },
+      status: entry.status,
+      liveIdentities: identities,
+      passiveIdentityCheck,
+      notes,
       isWorkspaceTrusted: vscode.workspace.isTrusted,
-    };
+    });
   }
 
+  const sidebarProvider = new RepoIdentitySidebarProvider(context.extensionUri, buildProductionActions());
+
+  context.subscriptions.push(statusBar);
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider("repoIdentityGuard.statusView", sidebarProvider));
+
   function refreshViews(): void {
-    sidebarProvider.update(buildModel());
-    const entry = selectedEntry();
+    sidebarProvider.update();
+    const entry = commandTarget();
     statusBar.update(entry ? toState(entry) : undefined);
   }
 
-  async function requireTrust(what: string): Promise<boolean> {
+  async function requireTrust(what: string, notify = true): Promise<boolean> {
     if (vscode.workspace.isTrusted) return true;
-    await vscode.window.showWarningMessage(
-      `This workspace isn't trusted, so Repo Identity Guard won't ${what}. Locking, changing or unlocking an identity installs or removes Git hooks and needs Workspace Trust; notes work without it.`,
-    );
+    if (notify) {
+      await vscode.window.showWarningMessage(
+        `This workspace isn't trusted, so Repo Identity Guard won't ${what}. Locking, changing or unlocking an identity installs or removes Git hooks and needs Workspace Trust; notes work without it.`,
+      );
+    }
     return false;
   }
 
@@ -259,15 +258,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     if (sequence !== scanSequence) return;
     repos = next;
-    if (!repos.some((repo) => repo.id === selectedId)) {
-      selectedId = commandTargetFrom(next)?.id;
-    }
     refreshViews();
     reconcileWatchers();
-  }
-
-  function commandTargetFrom(list: RepoEntry[]): RepoEntry | undefined {
-    return commandTarget(list);
   }
 
   async function migrateLegacyInstallation(ref: RepositoryRef, identities: Identity[], current: LockStatus): Promise<LockStatus> {
@@ -380,70 +372,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return picked?.identity;
   }
 
-  async function assignIdentity(identityId: string | undefined, mode: "assign" | "change", target: RepoEntry | undefined = commandTarget()): Promise<void> {
-    const entry = target;
-    if (!entry) {
-      await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
-      return;
-    }
-    const current = entry.status?.assignmentView;
-    if (mode === "change" && !current) {
-      await vscode.window.showInformationMessage("This repository has no assigned identity yet — use Assign Identity instead.");
-      return;
-    }
-    const identity = identityId ? getIdentities().find((candidate) => candidate.id === identityId) : await pickIdentity(current?.identityId);
-    if (!identity) {
-      if (identityId) await vscode.window.showErrorMessage("That identity no longer exists in settings.");
-      return;
-    }
-    if (!(await requireTrust("lock this repository"))) return;
-
-    const pushLine = identity.expectedGitHubLogin
-      ? (identity.trustedSshHostAliases ?? []).length > 0
-        ? ` Pushes must authenticate to GitHub as ${identity.expectedGitHubLogin} through one of: ${(identity.trustedSshHostAliases ?? []).join(", ")}.`
-        : ` WARNING: ${identity.label} expects GitHub user ${identity.expectedGitHubLogin} but lists no trusted SSH host alias, so every push will be blocked until one is added.`
-      : ` WARNING: ${identity.label} has no GitHub account configured for push verification, so every push will be blocked until one is configured.`;
-    const confirm = await vscode.window.showWarningMessage(
-      `${current ? `Change ${entry.repoName} from "${current.identityLabel}" to` : `Lock ${entry.repoName} to`} "${identity.label}"?\n\nCommits whose author or committer is not ${identity.gitName ? `${identity.gitName} ` : ""}<${identity.gitEmail}> will be blocked.${pushLine}\n\nThis uses local Git hooks, so it applies in every terminal, Git GUI and AI agent, even with VS Code closed. Repository: ${entry.ref.repoRoot}`,
-      { modal: true },
-      current ? "Change Identity" : "Lock Repository",
-    );
-    if (!confirm) return;
-
-    // A foreign hook already in a slot the lock needs is never touched
-    // silently: chaining it is an explicit choice.
-    let chainForeignHooks = false;
-    if (entry.status) {
-      const chain = await confirmChainingForeignHooks(entry.status);
-      if (chain === undefined) return;
-      chainForeignHooks = chain;
-    }
-
-    const result = await withRepoLock(entry.ref.repoKey, () =>
-      lockService.assign(entry.ref, identity, { chainForeignHooks, identities: getIdentities() }),
-    );
-    showOperationResult(result);
-    await scan();
-    if (!result.ok) return;
-
-    const effective = await getEffectiveAuthorIdent(entry.ref.repoRoot).catch(() => ({ email: undefined }));
-    if ((effective.email ?? "").trim().toLowerCase() !== identity.gitEmail.trim().toLowerCase()) {
-      const choice = await vscode.window.showWarningMessage(
-        `Git currently commits here as ${effective.email ?? "an unknown identity"}, so commits will be blocked until this repository uses ${identity.gitEmail}.`,
-        "Use Assigned Identity in Git Config",
-      );
-      if (choice) await applyIdentityToGitConfig(repos.find((repo) => repo.id === entry.id) ?? entry);
-    }
-    if (identity.expectedGitHubLogin && (identity.trustedSshHostAliases ?? []).length > 0) {
-      await checkLock({ quietWhenVerified: true, target: repos.find((repo) => repo.id === entry.id) ?? entry });
-    }
-  }
-
   /**
    * A lock governs every hook slot (commit AND push). A foreign hook in any
-   * of them is never touched silently: chaining it is an explicit choice.
-   * Returns false when there is nothing to chain, true when the user chose
-   * to chain, and undefined when they declined (abort).
+   * of them is never touched silently: chaining it is an explicit choice —
+   * see this file's top doc comment on why this native dialog is kept for
+   * BOTH the Command Palette and the webview path.
    */
   async function confirmChainingForeignHooks(status: LockStatus): Promise<boolean | undefined> {
     const foreign = status.inspection.hooks.filter((hook) => hook.ownership === "foreign");
@@ -456,51 +389,142 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return chain ? true : undefined;
   }
 
-  async function unlockRepository(target: RepoEntry | undefined = commandTarget()): Promise<void> {
+  /**
+   * Assigns/changes the identity for `target`. `opts.silent` is set by the
+   * webview path: it already showed its OWN confirmation screen (see
+   * "ASSIGNMENT CONFIRMATION"), so the big native confirm dialog below is
+   * skipped — Workspace Trust and foreign-hook-chaining are not. Always
+   * returns a result; the Command Palette path additionally shows native
+   * notifications (`showOperationResult`) the webview path does not need
+   * (its own screen already reflects the outcome).
+   */
+  async function assignIdentity(
+    identityId: string | undefined,
+    mode: "assign" | "change",
+    target: RepoEntry | undefined = commandTarget(),
+    opts: { silent?: boolean } = {},
+  ): Promise<LockOperationResult> {
     const entry = target;
     if (!entry) {
-      await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
-      return;
+      if (!opts.silent) await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
+      return { ok: false, message: "Open a Git repository first.", details: [] };
     }
-    if (!entry.status?.enforcement.unlockAvailable) {
-      await vscode.window.showInformationMessage(`${entry.repoName} is not locked.`);
-      return;
+    const current = entry.status?.assignmentView;
+    if (mode === "change" && !current) {
+      if (!opts.silent) await vscode.window.showInformationMessage("This repository has no assigned identity yet — use Assign Identity instead.");
+      return { ok: false, message: "This repository has no assigned identity yet.", details: [] };
     }
-    if (!(await requireTrust("unlock this repository"))) return;
-    const label = entry.status.assignmentView?.identityLabel;
-    const confirm = await vscode.window.showWarningMessage(
-      `Unlock ${entry.repoName}${label ? ` (currently locked to "${label}")` : ""}?\n\nRepo Identity Guard removes its hooks (restoring any hook it chained), and Git is no longer restricted in this repository. Your notes are kept.`,
-      { modal: true },
-      "Unlock",
+    const identity = identityId ? getIdentities().find((candidate) => candidate.id === identityId) : await pickIdentity(current?.identityId);
+    if (!identity) {
+      if (identityId && !opts.silent) await vscode.window.showErrorMessage("That identity no longer exists in settings.");
+      return { ok: false, message: "That identity no longer exists in settings.", details: [] };
+    }
+    if (!(await requireTrust("lock this repository", !opts.silent))) {
+      return { ok: false, message: "This workspace isn't trusted, so Repo Identity Guard can't lock this repository.", details: [] };
+    }
+
+    if (!opts.silent) {
+      const pushLine = identity.expectedGitHubLogin
+        ? (identity.trustedSshHostAliases ?? []).length > 0
+          ? ` Pushes must authenticate to GitHub as ${identity.expectedGitHubLogin} through one of: ${(identity.trustedSshHostAliases ?? []).join(", ")}.`
+          : ` WARNING: ${identity.label} expects GitHub user ${identity.expectedGitHubLogin} but lists no trusted SSH host alias, so every push will be blocked until one is added.`
+        : ` WARNING: ${identity.label} has no GitHub account configured for push verification, so every push will be blocked until one is configured.`;
+      const confirm = await vscode.window.showWarningMessage(
+        `${current ? `Change ${entry.repoName} from "${current.identityLabel}" to` : `Lock ${entry.repoName} to`} "${identity.label}"?\n\nCommits whose author or committer is not ${identity.gitName ? `${identity.gitName} ` : ""}<${identity.gitEmail}> will be blocked.${pushLine}\n\nThis uses local Git hooks, so it applies in every terminal, Git GUI and AI agent, even with VS Code closed. Repository: ${entry.ref.repoRoot}`,
+        { modal: true },
+        current ? "Change Identity" : "Lock Repository",
+      );
+      if (!confirm) return { ok: false, message: "Cancelled.", details: [] };
+    }
+
+    // A foreign hook already in a slot the lock needs is never touched
+    // silently: chaining it is an explicit choice, in BOTH paths.
+    let chainForeignHooks = false;
+    if (entry.status) {
+      const chain = await confirmChainingForeignHooks(entry.status);
+      if (chain === undefined) return { ok: false, message: "Cancelled.", details: [] };
+      chainForeignHooks = chain;
+    }
+
+    const result = await withRepoLock(entry.ref.repoKey, () =>
+      lockService.assign(entry.ref, identity, { chainForeignHooks, identities: getIdentities() }),
     );
-    if (!confirm) return;
-    const result = await withRepoLock(entry.ref.repoKey, () => lockService.unlock(entry.ref, getIdentities()));
-    showOperationResult(result);
+    if (!opts.silent) showOperationResult(result);
     await scan();
+    if (!result.ok) return result;
+
+    if (!opts.silent) {
+      // These native-dialog nudges are only useful alongside native
+      // notifications; the webview path instead reflects the SAME
+      // underlying facts declaratively (Needs Attention / git_identity_mismatch,
+      // push_identity_incomplete) via the next `state` push.
+      const effective = await getEffectiveAuthorIdent(entry.ref.repoRoot).catch(() => ({ email: undefined }));
+      if ((effective.email ?? "").trim().toLowerCase() !== identity.gitEmail.trim().toLowerCase()) {
+        const choice = await vscode.window.showWarningMessage(
+          `Git currently commits here as ${effective.email ?? "an unknown identity"}, so commits will be blocked until this repository uses ${identity.gitEmail}.`,
+          "Use Assigned Identity in Git Config",
+        );
+        if (choice) await applyIdentityToGitConfig(repos.find((repo) => repo.id === entry.id) ?? entry);
+      }
+      if (identity.expectedGitHubLogin && (identity.trustedSshHostAliases ?? []).length > 0) {
+        await checkLock({ quietWhenVerified: true, target: repos.find((repo) => repo.id === entry.id) ?? entry });
+      }
+    }
+    return result;
   }
 
-  async function repairLock(target: RepoEntry | undefined = commandTarget()): Promise<void> {
+  async function unlockRepository(target: RepoEntry | undefined = commandTarget(), opts: { silent?: boolean } = {}): Promise<LockOperationResult> {
     const entry = target;
     if (!entry) {
-      await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
-      return;
+      if (!opts.silent) await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
+      return { ok: false, message: "Open a Git repository first.", details: [] };
     }
-    if (!(await requireTrust("repair the identity lock"))) return;
+    if (!entry.status?.enforcement.unlockAvailable) {
+      if (!opts.silent) await vscode.window.showInformationMessage(`${entry.repoName} is not locked.`);
+      return { ok: false, message: `${entry.repoName} is not locked.`, details: [] };
+    }
+    if (!(await requireTrust("unlock this repository", !opts.silent))) {
+      return { ok: false, message: "This workspace isn't trusted, so Repo Identity Guard can't unlock this repository.", details: [] };
+    }
+    if (!opts.silent) {
+      const label = entry.status.assignmentView?.identityLabel;
+      const confirm = await vscode.window.showWarningMessage(
+        `Unlock ${entry.repoName}${label ? ` (currently locked to "${label}")` : ""}?\n\nRepo Identity Guard removes its hooks (restoring any hook it chained), and Git is no longer restricted in this repository. Your notes are kept.`,
+        { modal: true },
+        "Unlock",
+      );
+      if (!confirm) return { ok: false, message: "Cancelled.", details: [] };
+    }
+    const result = await withRepoLock(entry.ref.repoKey, () => lockService.unlock(entry.ref, getIdentities()));
+    if (!opts.silent) showOperationResult(result);
+    await scan();
+    return result;
+  }
+
+  async function repairLock(target: RepoEntry | undefined = commandTarget(), opts: { silent?: boolean } = {}): Promise<LockOperationResult> {
+    const entry = target;
+    if (!entry) {
+      if (!opts.silent) await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
+      return { ok: false, message: "Open a Git repository first.", details: [] };
+    }
+    if (!(await requireTrust("repair the identity lock", !opts.silent))) {
+      return { ok: false, message: "This workspace isn't trusted, so Repo Identity Guard can't repair this repository's identity lock.", details: [] };
+    }
     const identities = getIdentities();
     if (entry.status?.legacy) {
       notifiedMigrations.delete(entry.ref.repoKey);
-      await migrateLegacyInstallation(entry.ref, identities, entry.status);
+      const status = await migrateLegacyInstallation(entry.ref, identities, entry.status);
       await scan();
-      return;
+      return { ok: status.enforcement.state !== "unavailable", message: "Legacy installation migrated.", details: [], status };
     }
     // Repair re-installs every hook slot; a foreign hook now occupying one
-    // (e.g. a pre-push hook next to a lock from an earlier version that did
-    // not need that slot) is only ever chained with explicit consent.
+    // is only ever chained with explicit consent.
     const chainForeignHooks = entry.status ? await confirmChainingForeignHooks(entry.status) : false;
-    if (chainForeignHooks === undefined) return;
+    if (chainForeignHooks === undefined) return { ok: false, message: "Cancelled.", details: [] };
     const result = await withRepoLock(entry.ref.repoKey, () => lockService.repair(entry.ref, identities, { chainForeignHooks }));
-    showOperationResult(result);
+    if (!opts.silent) showOperationResult(result);
     await scan();
+    return result;
   }
 
   /**
@@ -508,22 +532,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
    * that makes a network connection: it verifies the push account over the
    * real SSH route, exactly as the pre-push hook would.
    */
-  async function checkLock(options: { quietWhenVerified?: boolean; target?: RepoEntry } = {}): Promise<void> {
+  async function checkLock(options: { quietWhenVerified?: boolean; target?: RepoEntry; silent?: boolean } = {}): Promise<{ ok: boolean; message: string }> {
     const entry = options.target ?? commandTarget();
     if (!entry) {
-      await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
-      return;
+      if (!options.silent) await vscode.window.showInformationMessage("Open a folder inside a Git repository first.");
+      return { ok: false, message: "Open a Git repository first." };
     }
     const identities = getIdentities();
     const status = await lockService.getStatus(entry.ref, identities);
     const view = status.assignmentView;
     if (!view) {
-      await vscode.window.showInformationMessage(
+      const message =
         status.enforcement.state === "unassigned"
           ? `${entry.repoName} is not locked; Repo Identity Guard does not restrict Git here.`
-          : `${entry.repoName}: ${status.enforcement.reason ?? "the identity lock needs attention."}`,
-      );
-      return;
+          : `${entry.repoName}: ${status.enforcement.reason ?? "the identity lock needs attention."}`;
+      if (!options.silent) await vscode.window.showInformationMessage(message);
+      return { ok: false, message };
     }
     const snapshot = status.inspection.policySnapshot;
     const identity: Identity = {
@@ -534,52 +558,67 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       expectedGitHubLogin: view.expectedGitHubLogin,
       trustedSshHostAliases: snapshot?.trustedSshHostAliases,
     };
-    const push = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: "Repo Identity Guard: checking the push account…" },
-      () => lockService.checkPushAccount(entry.ref, identity),
-    );
+    const push = options.silent
+      ? await lockService.checkPushAccount(entry.ref, identity)
+      : await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Repo Identity Guard: checking the push account…" }, () =>
+          lockService.checkPushAccount(entry.ref, identity),
+        );
     const lockLine =
       status.enforcement.state === "active"
         ? `${entry.repoName} is locked to "${view.identityLabel}".`
         : `${entry.repoName} (locked to "${view.identityLabel}") needs attention: ${status.enforcement.reason ?? ""}`;
     const message = `${lockLine} ${push.message}`;
-    if (status.enforcement.state === "active" && push.status === "verified") {
-      if (!options.quietWhenVerified) await vscode.window.showInformationMessage(message);
-    } else {
-      await vscode.window.showWarningMessage(message);
+    const verified = status.enforcement.state === "active" && push.status === "verified";
+    if (!options.silent) {
+      if (verified) {
+        if (!options.quietWhenVerified) await vscode.window.showInformationMessage(message);
+      } else {
+        await vscode.window.showWarningMessage(message);
+      }
     }
+    return { ok: verified, message };
   }
 
-  async function applyIdentityToGitConfig(target: RepoEntry | undefined = commandTarget()): Promise<void> {
+  async function applyIdentityToGitConfig(target: RepoEntry | undefined = commandTarget(), opts: { silent?: boolean } = {}): Promise<{ ok: boolean; message: string }> {
     const entry = target;
     const view = entry?.status?.assignmentView;
     if (!entry || !view) {
-      await vscode.window.showInformationMessage("This repository has no assigned identity.");
-      return;
+      if (!opts.silent) await vscode.window.showInformationMessage("This repository has no assigned identity.");
+      return { ok: false, message: "This repository has no assigned identity." };
     }
-    if (!(await requireTrust("change this repository's Git config"))) return;
+    if (!(await requireTrust("change this repository's Git config", !opts.silent))) {
+      return { ok: false, message: "This workspace isn't trusted, so Repo Identity Guard can't change this repository's Git config." };
+    }
     const scope = resolveIdentityConfigScope(await getWorktreeConfigEnabled(entry.ref.repoRoot).catch(() => null));
-    const confirm = await vscode.window.showWarningMessage(
-      `Set ${entry.repoName}'s Git identity to ${view.gitName ? `${view.gitName} ` : ""}<${view.gitEmail}>? This writes user.${view.gitName ? "name/user." : ""}email with "git config --${scope}" for this repository only; your global Git config is never touched.`,
-      { modal: true },
-      "Set Git Identity",
-    );
-    if (!confirm) return;
+    if (!opts.silent) {
+      const confirm = await vscode.window.showWarningMessage(
+        `Set ${entry.repoName}'s Git identity to ${view.gitName ? `${view.gitName} ` : ""}<${view.gitEmail}>? This writes user.${view.gitName ? "name/user." : ""}email with "git config --${scope}" for this repository only; your global Git config is never touched.`,
+        { modal: true },
+        "Set Git Identity",
+      );
+      if (!confirm) return { ok: false, message: "Cancelled." };
+    }
     try {
       await safeActionRunner.setLocalIdentity(entry.ref.repoRoot, view.gitName, view.gitEmail, scope);
     } catch (error) {
-      await vscode.window.showErrorMessage(`Could not set the Git identity: ${errorMessage(error)}`);
-      return;
+      const message = `Could not set the Git identity: ${errorMessage(error)}`;
+      if (!opts.silent) await vscode.window.showErrorMessage(message);
+      return { ok: false, message };
     }
     const effective = await getEffectiveAuthorIdent(entry.ref.repoRoot).catch(() => ({ email: undefined }));
+    let message: string;
+    let ok: boolean;
     if ((effective.email ?? "").trim().toLowerCase() === view.gitEmail.trim().toLowerCase()) {
-      await vscode.window.showInformationMessage(`${entry.repoName} now commits as ${view.gitEmail}.`);
+      message = `${entry.repoName} now commits as ${view.gitEmail}.`;
+      ok = true;
+      if (!opts.silent) await vscode.window.showInformationMessage(message);
     } else {
-      await vscode.window.showWarningMessage(
-        `Git config was updated, but Git still resolves ${effective.email ?? "a different identity"} here — an environment variable (GIT_AUTHOR_EMAIL, GIT_COMMITTER_EMAIL, EMAIL) is overriding it in VS Code's environment.`,
-      );
+      message = `Git config was updated, but Git still resolves ${effective.email ?? "a different identity"} here — an environment variable (GIT_AUTHOR_EMAIL, GIT_COMMITTER_EMAIL, EMAIL) is overriding it in VS Code's environment.`;
+      ok = false;
+      if (!opts.silent) await vscode.window.showWarningMessage(message);
     }
     await scan();
+    return { ok, message };
   }
 
   async function editIdentities(): Promise<void> {
@@ -588,15 +627,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // ==================== notes actions (no Workspace Trust needed: local data only, never executed) ====================
 
-  async function noteMutation(mutate: (keys: MemoryKeys) => Promise<unknown>): Promise<NoteMutationResult> {
-    const entry = selectedEntry();
-    if (!entry) return { ok: false, error: "Open a Git repository first." };
+  async function noteMutation(mutate: (keys: MemoryKeys) => Promise<unknown>): Promise<OperationResult> {
+    const entry = commandTarget();
+    if (!entry) return { ok: false, message: "Open a Git repository first." };
     try {
       await mutate(entry.memoryKeys);
     } catch (error) {
       const message = error instanceof MemoryLimitError ? error.message : "Something went wrong saving the note.";
-      await vscode.window.showWarningMessage(message);
-      return { ok: false, error: message };
+      return { ok: false, message };
     }
     refreshViews();
     return { ok: true };
@@ -632,13 +670,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       return;
     }
-    const entry = selectedEntry();
+    const entry = commandTarget();
     if (!entry) return;
     await writeExport(memoryStore.exportMemory(entry.memoryKeys, entry.repoName), `repo-notes-${entry.repoName.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 60) || "repo"}.json`);
   }
 
   async function importNotes(): Promise<void> {
-    const entry = selectedEntry();
+    const entry = commandTarget();
     if (!entry) return;
     const uris = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { "Repo Notes export": ["json"] }, title: "Import Repo Notes" });
     if (!uris || uris.length === 0) return;
@@ -688,6 +726,83 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     refreshViews();
     await vscode.window.showInformationMessage("Notes imported.");
+  }
+
+  // ==================== production webview actions ====================
+
+  function toOperationResult(result: LockOperationResult): OperationResult {
+    return { ok: result.ok, message: result.message, details: result.details.length ? result.details : undefined };
+  }
+
+  /**
+   * `saveIdentity` is settings-only (no Git mutation), so it needs no
+   * Workspace Trust — see `operationRequiresTrust` in `src/ui/protocol.ts`.
+   */
+  async function webviewSaveIdentity(raw: unknown): Promise<OperationResult> {
+    const draft = raw as IdentityDraft;
+    const result = draft.id ? await updateIdentitySetting(draft) : await createIdentitySetting(draft);
+    if (!result.ok) return { ok: false, code: result.code, message: result.errors.join(" "), details: result.errors.length > 1 ? result.errors : undefined };
+    await scan();
+    return { ok: true, message: `Saved "${result.identity.label}".` };
+  }
+
+  async function webviewDeleteIdentity(identityId: string): Promise<OperationResult> {
+    const openAssignments = repos
+      .filter((entry) => entry.status?.assignmentView?.identityId === identityId)
+      .map((entry) => ({ repoName: entry.repoName }));
+    const result = await deleteIdentitySetting(identityId, openAssignments);
+    if (!result.ok) {
+      return {
+        ok: false,
+        code: result.code,
+        message: result.errors.join(" "),
+        details: result.code === "identity_in_use" ? result.repoNames : undefined,
+      };
+    }
+    await scan();
+    return { ok: true, message: "Identity deleted." };
+  }
+
+  function buildProductionActions(): ProductionSidebarActions {
+    return {
+      getState: () => buildProductionState(),
+      assignIdentity: async (identityId) => toOperationResult(await assignIdentity(identityId, "assign", commandTarget(), { silent: true })),
+      changeIdentity: async (identityId) => toOperationResult(await assignIdentity(identityId, "change", commandTarget(), { silent: true })),
+      unlockRepository: async () => toOperationResult(await unlockRepository(commandTarget(), { silent: true })),
+      repairLock: async () => toOperationResult(await repairLock(commandTarget(), { silent: true })),
+      verifyLock: async () => {
+        const result = await checkLock({ silent: true, target: commandTarget() });
+        return { ok: result.ok, message: result.message };
+      },
+      applyAssignedIdentity: async () => {
+        const result = await applyIdentityToGitConfig(commandTarget(), { silent: true });
+        return { ok: result.ok, message: result.message };
+      },
+      saveIdentity: (identity) => webviewSaveIdentity(identity),
+      deleteIdentity: (identityId) => webviewDeleteIdentity(identityId),
+      addNote: (text) => noteMutation((keys) => memoryStore.addNote(keys, text)),
+      updateNote: (noteId, text) => noteMutation((keys) => memoryStore.updateNote(keys, noteId, text)),
+      deleteNote: (noteId) => noteMutation((keys) => memoryStore.removeNote(keys, noteId)),
+      togglePinNote: (noteId) => noteMutation((keys) => memoryStore.togglePin(keys, noteId)),
+      copyNote: async (noteId) => {
+        const entry = commandTarget();
+        if (!entry) return;
+        const text = memoryStore.getNoteText(entry.memoryKeys, noteId);
+        if (text === undefined) return;
+        try {
+          await vscode.env.clipboard.writeText(text);
+        } catch (error) {
+          // copyNote is fire-and-forget in the protocol (no requestId/ack) —
+          // a concise, non-modal fallback is the best available feedback.
+          vscode.window.setStatusBarMessage(`Repo Identity Guard: couldn't copy the note (${errorMessage(error)}).`, 4000);
+        }
+      },
+      importNotes: () => importNotes(),
+      exportNotes: () => exportNotes(false),
+      openFolder: async () => {
+        await vscode.commands.executeCommand("vscode.openFolder");
+      },
+    };
   }
 
   // ==================== registration ====================
